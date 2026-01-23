@@ -4,7 +4,7 @@
 
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import PIL.Image
 import torch
@@ -186,3 +186,98 @@ class OmniDiffusionRequest:
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
+
+
+
+
+@dataclass
+class DiffusionRequestState:
+    """Per-request state for continuous batching.
+
+    This contains request-level config plus mutable generation state
+    (step index, per-request scheduler/sampler state, RoPE cache, etc.).
+    """
+    
+    # Identity + source request
+    req_id: str
+    req: OmniDiffusionRequest
+    
+    # Encoded prompts (computed once in prepare phase)
+    prompt_embeds: torch.Tensor | None = None  # [B, seq_len, hidden_dim]
+    prompt_embeds_mask: torch.Tensor | None = None
+    negative_prompt_embeds: torch.Tensor | None = None
+    negative_prompt_embeds_mask: torch.Tensor | None = None
+    
+    # I2V mode
+    latent_condition: torch.Tensor | None = None  # encoded image condition
+    first_frame_mask: torch.Tensor | None = None  # mask for I2V blending
+    
+    # Timestep scheduling (mutable)
+    timesteps: torch.Tensor | None = None  # all timesteps for this request
+    boundary_timestep: float | None = None  # for dual-model switching
+    step_index: int = 0
+    timestep: torch.Tensor | float | int | None = None
+    
+    # Latent state
+    latents: torch.Tensor | None = None
+
+    # Generator state (for reproducibility)
+    generator: torch.Generator | None = None
+
+    # Per-request scheduler/sampler state
+    scheduler: Any | None = None
+    sampler: Any | None = None
+    sampler_state: dict[str, Any] = field(default_factory=dict)
+
+    # CFG / guidance
+    do_true_cfg: bool = False
+    guidance: torch.Tensor | None = None
+    true_cfg_scale: float = 1.0
+
+    # Per-request RoPE metadata/cache (for per-sample RoPE in future)
+    img_shapes: list[list[tuple[int, int, int]]] | None = None
+    txt_seq_lens: list[int] | None = None
+    negative_txt_seq_lens: list[int] | None = None
+    rope_state: dict[str, Any] = field(default_factory=dict)
+    
+    # Callback hooks
+    callback_on_step_end: Callable | None = None
+    
+    @property
+    def latent_shape(self) -> tuple[int, int, int, int, int]:
+        """[B, C, T, H, W] for video latents"""
+        if self.latents is None:
+            raise ValueError("Latents not initialized.")
+        return tuple(self.latents.shape)  # type: ignore[return-value]
+
+    @property
+    def total_steps(self) -> int:
+        if self.timesteps is not None:
+            return len(self.timesteps)
+        return int(self.req.num_inference_steps)
+
+    @property
+    def is_complete(self) -> bool:
+        return self.step_index >= self.total_steps
+
+    @property
+    def current_timestep(self) -> torch.Tensor | None:
+        if self.timesteps is None:
+            return None
+        return self.timesteps[self.step_index]
+
+    @property
+    def img_seq_len(self) -> int:
+        if self.latents is None:
+            return 0
+        return int(self.latents.shape[0])
+
+    @property
+    def txt_seq_len(self) -> int:
+        if self.prompt_embeds is None:
+            return 0
+        if self.prompt_embeds.ndim == 3:
+            return int(self.prompt_embeds.shape[1])
+        if self.prompt_embeds.ndim == 2:
+            return int(self.prompt_embeds.shape[0])
+        return 0

@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+import torch
+
+from vllm_omni.diffusion.request import DiffusionRequestState
+
+
+@dataclass
+class StepBatch:
+    """Batch of DiffusionRequestState for a single denoising step.
+
+    Continuous batching can accept heterogeneous timesteps, but enforces
+    same resolution in this version.
+    """
+
+    req_ids: list[str]
+    requests: list[DiffusionRequestState]
+    latents: torch.Tensor
+    prompt_embeds: torch.Tensor
+    prompt_embeds_mask: torch.Tensor | None
+    negative_prompt_embeds: torch.Tensor | None
+    negative_prompt_embeds_mask: torch.Tensor | None
+    timesteps: torch.Tensor
+    img_shapes: list[list[tuple[int, int, int]]] | None = None
+    txt_seq_lens: list[int] | None = None
+    negative_txt_seq_lens: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.req_ids) != len(self.requests):
+            raise ValueError("`req_ids` and `requests` must be the same length.")
+        for rid, state in zip(self.req_ids, self.requests):
+            if rid != state.req_id:
+                raise ValueError("`req_ids` order must match `requests` order.")
+        # NOTE: Resolution/CFG validation is delegated to BatchBuilder implementations
+        # (e.g., FixedResolutionBatchBuilder for v1). This allows StepBatch to remain
+        # a generic data structure for v2 which may support heterogeneous resolutions.
+
+    @classmethod
+    def from_requests(cls, requests: list[DiffusionRequestState]) -> "StepBatch":
+        if not requests:
+            raise ValueError("Cannot build StepBatch from empty request list.")
+
+        req_ids = [r.req_id for r in requests]
+        latents_list = [r.latents for r in requests]
+        if any(l is None for l in latents_list):
+            raise ValueError("All requests must have `latents` initialized.")
+        latents = torch.cat([l for l in latents_list if l is not None], dim=0)
+
+        if any(r.prompt_embeds is None for r in requests):
+            raise ValueError("All requests must have `prompt_embeds` initialized.")
+        prompt_embeds = torch.cat([r.prompt_embeds for r in requests if r.prompt_embeds is not None], dim=0)
+
+        prompt_masks = [r.prompt_embeds_mask for r in requests]
+        if any(m is None for m in prompt_masks):
+            if any(m is not None for m in prompt_masks):
+                raise ValueError("Mixed prompt_embeds_mask in batch.")
+            prompt_embeds_mask = None
+        else:
+            prompt_embeds_mask = torch.cat([m for m in prompt_masks if m is not None], dim=0)
+
+        negative_prompt_embeds = None
+        if all(r.negative_prompt_embeds is not None for r in requests):
+            negative_prompt_embeds = torch.cat(
+                [r.negative_prompt_embeds for r in requests if r.negative_prompt_embeds is not None],
+                dim=0,
+            )
+
+        negative_masks = [r.negative_prompt_embeds_mask for r in requests]
+        if any(m is None for m in negative_masks):
+            if any(m is not None for m in negative_masks):
+                raise ValueError("Mixed negative_prompt_embeds_mask in batch.")
+            negative_prompt_embeds_mask = None
+        else:
+            negative_prompt_embeds_mask = torch.cat([m for m in negative_masks if m is not None], dim=0)
+
+        if any(r.current_timestep is None for r in requests):
+            raise ValueError("All requests must have `timesteps` initialized.")
+        timesteps = torch.stack([r.current_timestep for r in requests], dim=0)
+
+        # img_shapes: each request has shape [batch=1][frames] -> flatten to [requests][frames]
+        img_shapes = None
+        if any(r.img_shapes is not None for r in requests):
+            img_shapes = [r.img_shapes[0] if r.img_shapes else [] for r in requests]
+
+        # txt_seq_lens: prefer field (mask-based) over property (shape-based)
+        txt_seq_lens = [
+            r.txt_seq_lens[0] if r.txt_seq_lens else r.txt_seq_len
+            for r in requests
+        ]
+
+        # negative_txt_seq_lens: same logic
+        negative_txt_seq_lens = None
+        if any(r.negative_txt_seq_lens is not None for r in requests):
+            negative_txt_seq_lens = [
+                r.negative_txt_seq_lens[0] if r.negative_txt_seq_lens else 0
+                for r in requests
+            ]
+
+        return cls(
+            req_ids=req_ids,
+            requests=requests,
+            latents=latents,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_prompt_embeds_mask=negative_prompt_embeds_mask,
+            timesteps=timesteps,
+            img_shapes=img_shapes,
+            txt_seq_lens=txt_seq_lens,
+            negative_txt_seq_lens=negative_txt_seq_lens,
+        )
+
+
+
+@dataclass
+class StepOutput:
+    """Output of a single denoising step for a request."""
+
+    req_id: str
+    step_index: int
+    timestep: torch.Tensor | float | int | None
+    latents: torch.Tensor
+    noise_pred: torch.Tensor | None = None
+    is_complete: bool = False
+
+
+
+@dataclass
+class StepSchedulerOutput:
+    """Single-step scheduling output."""
+
+    step_id: int
+    req_stats: list[DiffusionRequestState] = field(default_factory=list)
+
+
+@dataclass
+class StepRunnerOutput:
+    """Runner output for a single scheduled step."""
+
+    step_id: int
+    step_outputs: list[StepOutput] = field(default_factory=list)
+    decoded: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+class BatchBuilder(ABC):
+    """Build a StepBatch from denoising request states."""
+
+    @abstractmethod
+    def build(self, states: list[DiffusionRequestState]) -> StepBatch | None:
+        """Build a batch for denoising."""
+        raise NotImplementedError
+
+
+class FixedResolutionBatchBuilder(BatchBuilder):
+    """v1: fixed resolution + consistent CFG config.
+
+    Validates that all requests in the batch have:
+    - Same height/width
+    - Same do_true_cfg and true_cfg_scale
+    - Same guidance values (if present)
+
+    For v2 heterogeneous batching, implement a different BatchBuilder subclass.
+    """
+
+    def build(self, states: list[DiffusionRequestState]) -> StepBatch | None:
+        if not states:
+            return None
+
+        base = states[0]
+        for state in states[1:]:
+            # Resolution check
+            if state.req.height != base.req.height or state.req.width != base.req.width:
+                raise ValueError(
+                    "FixedResolutionBatchBuilder: resolution mismatch "
+                    f"({state.req.height}x{state.req.width} vs {base.req.height}x{base.req.width})"
+                )
+            # CFG config check
+            if state.do_true_cfg != base.do_true_cfg:
+                raise ValueError("FixedResolutionBatchBuilder: mixed do_true_cfg in batch.")
+            if float(state.true_cfg_scale) != float(base.true_cfg_scale):
+                raise ValueError("FixedResolutionBatchBuilder: mixed true_cfg_scale in batch.")
+            # Guidance check
+            if base.guidance is None:
+                if state.guidance is not None:
+                    raise ValueError("FixedResolutionBatchBuilder: mixed guidance (None vs tensor).")
+            else:
+                if state.guidance is None:
+                    raise ValueError("FixedResolutionBatchBuilder: mixed guidance (tensor vs None).")
+                if base.guidance.numel() != state.guidance.numel():
+                    raise ValueError("FixedResolutionBatchBuilder: mixed guidance shape.")
+                if not torch.allclose(base.guidance, state.guidance):
+                    raise ValueError("FixedResolutionBatchBuilder: mixed guidance values.")
+
+        return StepBatch.from_requests(states)
