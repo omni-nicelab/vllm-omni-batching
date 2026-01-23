@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 import torch
 
 from vllm_omni.diffusion.request import DiffusionRequestState
+
+if TYPE_CHECKING:
+    pass
 
 
 @dataclass
@@ -36,6 +40,18 @@ class StepBatch:
         # NOTE: Resolution/CFG validation is delegated to BatchBuilder implementations
         # (e.g., FixedResolutionBatchBuilder for v1). This allows StepBatch to remain
         # a generic data structure for v2 which may support heterogeneous resolutions.
+
+    def update_dynamic(self) -> None:
+        """Update dynamic tensors (latents, timesteps) from request states.
+
+        Call this instead of rebuilding the entire batch when only latents/timesteps change.
+        This avoids torch.cat overhead by using in-place copy.
+        """
+        for i, state in enumerate(self.requests):
+            if state.latents is not None:
+                self.latents[i : i + 1].copy_(state.latents)
+            if state.current_timestep is not None:
+                self.timesteps[i] = state.current_timestep
 
     @classmethod
     def from_requests(cls, requests: list[DiffusionRequestState]) -> "StepBatch":
@@ -152,21 +168,38 @@ class BatchBuilder(ABC):
         """Build a batch for denoising."""
         raise NotImplementedError
 
+    def reset(self) -> None:
+        """Reset any cached state. Called when batch composition changes."""
+        pass
+
 
 class FixedResolutionBatchBuilder(BatchBuilder):
-    """v1: fixed resolution + consistent CFG config.
+    """v1: fixed resolution + consistent CFG config with batch caching.
 
     Validates that all requests in the batch have:
     - Same height/width
     - Same do_true_cfg and true_cfg_scale
     - Same guidance values (if present)
 
+    Optimization: Caches the batch when request composition is unchanged,
+    only updating dynamic tensors (latents, timesteps) via in-place copy.
+
     For v2 heterogeneous batching, implement a different BatchBuilder subclass.
     """
 
-    def build(self, states: list[DiffusionRequestState]) -> StepBatch | None:
+    def __init__(self) -> None:
+        self._cached_batch: StepBatch | None = None
+        self._cached_req_ids: tuple[str, ...] | None = None
+
+    def reset(self) -> None:
+        """Clear cached batch."""
+        self._cached_batch = None
+        self._cached_req_ids = None
+
+    def _validate_states(self, states: list[DiffusionRequestState]) -> None:
+        """Validate batch constraints (resolution, CFG config)."""
         if not states:
-            return None
+            return
 
         base = states[0]
         for state in states[1:]:
@@ -193,4 +226,26 @@ class FixedResolutionBatchBuilder(BatchBuilder):
                 if not torch.allclose(base.guidance, state.guidance):
                     raise ValueError("FixedResolutionBatchBuilder: mixed guidance values.")
 
-        return StepBatch.from_requests(states)
+    def build(self, states: list[DiffusionRequestState]) -> StepBatch | None:
+        if not states:
+            self.reset()
+            return None
+
+        self._validate_states(states)
+
+        # Check if we can reuse cached batch
+        current_req_ids = tuple(s.req_id for s in states)
+        if (
+            self._cached_batch is not None
+            and self._cached_req_ids == current_req_ids
+        ):
+            # Same requests - update dynamic tensors in place
+            self._cached_batch.requests = states
+            self._cached_batch.update_dynamic()
+            return self._cached_batch
+
+        # Request composition changed - rebuild full batch
+        batch = StepBatch.from_requests(states)
+        self._cached_batch = batch
+        self._cached_req_ids = current_req_ids
+        return batch

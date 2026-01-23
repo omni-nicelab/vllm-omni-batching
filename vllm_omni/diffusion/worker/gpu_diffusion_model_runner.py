@@ -186,7 +186,8 @@ class GPUDiffusionModelRunner:
 
         states = scheduler_output.req_stats
         to_encode = [state for state in states if self._needs_prepare(state)]
-        self._batch_encode(to_encode)
+        if to_encode:
+            self._batch_encode(to_encode)
 
         step_outputs: list[StepOutput] = []
         denoise_states = [state for state in states if not state.is_complete]
@@ -199,7 +200,6 @@ class GPUDiffusionModelRunner:
         decode_states = [state for state in states if state.is_complete]
         if decode_states:
             decoded = self._batch_decode(decode_states)
-
         return StepRunnerOutput(
             step_id=scheduler_output.step_id,
             step_outputs=step_outputs,
@@ -313,15 +313,6 @@ class GPUDiffusionModelRunner:
                 base.guidance,
                 base.true_cfg_scale,
             )
-
-        # cfg_parallel_ready = base.do_true_cfg and get_classifier_free_guidance_world_size() > 1
-        # if noise_pred is None:
-        #     if not cfg_parallel_ready:
-        #         raise RuntimeError("denoise_step returned None.")
-        #     if get_classifier_free_guidance_rank() == 0:
-        #         raise RuntimeError("denoise_step returned None on CFG rank 0.")
-        # elif cfg_parallel_ready and get_classifier_free_guidance_rank() != 0:
-        #     raise RuntimeError("denoise_step returned output on non-zero CFG rank.")
 
         outputs: list[StepOutput] = []
         for bi, state in enumerate(batch.requests):
