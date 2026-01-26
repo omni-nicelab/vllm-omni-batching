@@ -1,8 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""
+Step-level batch structures for continuous batching of diffusion requests.
+
+This module defines the data structures used for step-level scheduling:
+- StepBatch: Batch of requests for a single denoising step
+- StepOutput: Output from processing one request in a step
+- StepSchedulerOutput: Scheduler's output (batch + metadata)
+- StepRunnerOutput: Runner's output (step results + decoded images)
+- BatchBuilder: Interface for building batches with constraints
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
 import torch
 
 from vllm_omni.diffusion.request import DiffusionRequestState
@@ -16,7 +31,7 @@ class StepBatch:
     """Batch of DiffusionRequestState for a single denoising step.
 
     Continuous batching can accept heterogeneous timesteps, but enforces
-    same resolution in this version.
+    same resolution in this version (v1).
     """
 
     req_ids: list[str]
@@ -129,7 +144,6 @@ class StepBatch:
         )
 
 
-
 @dataclass
 class StepOutput:
     """Output of a single denoising step for a request."""
@@ -142,18 +156,39 @@ class StepOutput:
     is_complete: bool = False
 
 
-
 @dataclass
 class StepSchedulerOutput:
-    """Single-step scheduling output."""
+    """Scheduler output for a single step.
 
+    This is returned by DiffusionStepScheduler.schedule() and consumed by
+    the worker/runner.
+    """
+
+    # Step ID for tracking
     step_id: int
+
+    # Request states scheduled in this step
     req_stats: list[DiffusionRequestState] = field(default_factory=list)
+
+    # Request IDs that finished in this scheduling cycle
+    finished_req_ids: set[str] = field(default_factory=set)
+
+    # Request IDs that were preempted in this scheduling cycle
+    preempted_req_ids: set[str] = field(default_factory=set)
+
+    # Total number of requests currently running
+    num_running_reqs: int = 0
+
+    # Total number of requests waiting
+    num_waiting_reqs: int = 0
 
 
 @dataclass
 class StepRunnerOutput:
-    """Runner output for a single scheduled step."""
+    """Runner output for a single scheduled step.
+
+    This is returned by the worker/runner after executing a StepSchedulerOutput.
+    """
 
     step_id: int
     step_outputs: list[StepOutput] = field(default_factory=list)

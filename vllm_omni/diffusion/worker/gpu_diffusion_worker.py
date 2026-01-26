@@ -5,6 +5,11 @@ Diffusion Worker for vLLM-Omni.
 
 Handles GPU infrastructure initialization and delegates model operations
 to GPUDiffusionModelRunner.
+
+Architecture (Scheduler:Worker = 1:N):
+    - Scheduler: Manages request states, dispatches StepSchedulerOutput
+    - Worker: Pure execution unit, receives scheduler output, returns runner output
+    - Minimal granularity: Single denoising step
 """
 
 import multiprocessing as mp
@@ -29,8 +34,12 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.profiler import CurrentProfiler
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import DiffusionRequestState, OmniDiffusionRequest
 from vllm_omni.diffusion.worker.gpu_diffusion_model_runner import GPUDiffusionModelRunner
+from vllm_omni.diffusion.worker.step_batch import (
+    StepRunnerOutput,
+    StepSchedulerOutput,
+)
 
 logger = init_logger(__name__)
 
@@ -46,6 +55,11 @@ class GPUDiffusionWorker:
 
     All model-related operations (loading, compilation, execution) are
     delegated to GPUDiffusionModelRunner.
+
+    Step-Level Execution:
+        The primary interface is `execute_step(scheduler_output)` which receives
+        a StepSchedulerOutput containing DiffusionRequestState objects and returns
+        a StepRunnerOutput. This enables continuous batching at step granularity.
     """
 
     def __init__(
@@ -112,8 +126,38 @@ class GPUDiffusionWorker:
         )
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
+    # ========================================================================
+    # Core Step-Level Execution Interface
+    # ========================================================================
+
+    def execute_step(self, scheduler_output: StepSchedulerOutput) -> StepRunnerOutput:
+        """
+        Execute a single scheduled diffusion step.
+
+        This is the primary interface for step-level continuous batching.
+        The scheduler dispatches StepSchedulerOutput containing request states,
+        and the worker delegates to model_runner.execute_step().
+
+        Args:
+            scheduler_output: Contains step_id and list of DiffusionRequestState
+
+        Returns:
+            StepRunnerOutput with step outputs and decoded results
+        """
+        assert self.model_runner is not None, "Model runner not initialized"
+        return self.model_runner.execute_step(scheduler_output)
+
+    # ========================================================================
+    # Legacy Interface (for backward compatibility)
+    # ========================================================================
+
     def generate(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
-        """Generate output for the given requests."""
+        """
+        Generate output for the given requests.
+
+        This method provides backward compatibility. For new code, prefer using
+        execute_step() with proper scheduler integration.
+        """
         return self.execute_model(requests, self.od_config)
 
     @classmethod
@@ -310,6 +354,22 @@ class WorkerProc:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
                         self.return_result({"status": "error", "error": str(e)})
+
+            elif isinstance(msg, dict) and msg.get("type") == "execute_step":
+                # Step-level execution: receive StepSchedulerOutput, return StepRunnerOutput
+                try:
+                    scheduler_output = msg.get("scheduler_output")
+                    if scheduler_output is None:
+                        raise ValueError("Missing scheduler_output in execute_step message")
+                    result = self.worker.execute_step(scheduler_output)
+                    self.return_result(result)
+                except Exception as e:
+                    logger.error(f"Error executing step: {e}", exc_info=True)
+                    self.return_result(StepRunnerOutput(
+                        step_id=msg.get("step_id", -1),
+                        step_outputs=[],
+                        decoded={},
+                    ))
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

@@ -4,10 +4,30 @@
 
 import pprint
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Callable
 
 import PIL.Image
 import torch
+
+
+class DiffusionRequestStatus(str, Enum):
+    """Request status in the scheduler."""
+
+    WAITING = "waiting"  # In waiting queue, not yet started
+    RUNNING = "running"  # Currently being processed
+    PREEMPTED = "preempted"  # Preempted and moved back to waiting
+    FINISHED_COMPLETED = "finished_completed"  # All steps completed
+    FINISHED_ABORTED = "finished_aborted"  # Aborted by user
+    FINISHED_ERROR = "finished_error"  # Error during processing
+
+    @staticmethod
+    def is_finished(status: "DiffusionRequestStatus") -> bool:
+        return status in (
+            DiffusionRequestStatus.FINISHED_COMPLETED,
+            DiffusionRequestStatus.FINISHED_ABORTED,
+            DiffusionRequestStatus.FINISHED_ERROR,
+        )
 
 
 @dataclass
