@@ -146,12 +146,17 @@ class StepBatch:
 
 @dataclass
 class StepOutput:
-    """Output of a single denoising step for a request."""
+    """Output of a single denoising step for a request.
+
+    NOTE: `latents` may be None when returned through IPC to avoid
+    serialization overhead. The actual latents are kept in Worker's
+    _request_state_cache.
+    """
 
     req_id: str
     step_index: int
     timestep: torch.Tensor | float | int | None
-    latents: torch.Tensor
+    latents: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
     is_complete: bool = False
 

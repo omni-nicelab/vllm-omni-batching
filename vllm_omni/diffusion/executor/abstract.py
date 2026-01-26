@@ -5,6 +5,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.step_batch import StepRunnerOutput, StepSchedulerOutput
 
 
 class DiffusionExecutor(ABC):
@@ -61,6 +62,15 @@ class DiffusionExecutor(ABC):
     @abstractmethod
     def add_req(self, requests: list[OmniDiffusionRequest]):
         """Add requests to the execution queue."""
+        pass
+
+    @abstractmethod
+    def execute_step(
+        self,
+        scheduler_output: StepSchedulerOutput,
+        timeout: float | None = None,
+    ) -> StepRunnerOutput:
+        """Execute a single scheduled diffusion step."""
         pass
 
     @abstractmethod

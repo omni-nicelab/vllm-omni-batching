@@ -73,6 +73,7 @@ class GPUDiffusionModelRunner:
         self.pipeline = None
         self.cache_backend = None
         self.batch_builder = batch_builder or FixedResolutionBatchBuilder()
+        self._request_state_cache: dict[str, DiffusionRequestState] = {}
 
     def load_model(
         self,
@@ -179,12 +180,13 @@ class GPUDiffusionModelRunner:
                 output = self.pipeline.forward(req)
 
         return output
-
+    
+    @torch.inference_mode()
     def execute_step(self, scheduler_output: StepSchedulerOutput) -> StepRunnerOutput:
         """Execute a single scheduled diffusion step."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
 
-        states = scheduler_output.req_stats
+        states = self._resolve_states(scheduler_output)
         to_encode = [state for state in states if self._needs_prepare(state)]
         if to_encode:
             self._batch_encode(to_encode)
@@ -200,11 +202,40 @@ class GPUDiffusionModelRunner:
         decode_states = [state for state in states if state.is_complete]
         if decode_states:
             decoded = self._batch_decode(decode_states)
-        return StepRunnerOutput(
+
+        output = StepRunnerOutput(
             step_id=scheduler_output.step_id,
             step_outputs=step_outputs,
             decoded=decoded,
         )
+
+        # Clear large tensors from step_outputs before returning.
+        # This avoids expensive IPC serialization overhead when using multiproc.
+        # The actual latents are preserved in _request_state_cache.
+        for out in output.step_outputs:
+            out.latents = None
+            out.noise_pred = None
+
+        self._evict_finished_states(states)
+        return output
+
+    def _resolve_states(self, scheduler_output: StepSchedulerOutput) -> list[DiffusionRequestState]:
+        """Map scheduler output to cached request states using req_id."""
+        resolved: list[DiffusionRequestState] = []
+        for state in scheduler_output.req_stats:
+            cached = self._request_state_cache.get(state.req_id)
+            if cached is None:
+                cached = DiffusionRequestState(req_id=state.req_id, req=state.req)
+                self._request_state_cache[state.req_id] = cached
+            else:
+                cached.req = state.req
+            resolved.append(cached)
+        return resolved
+
+    def _evict_finished_states(self, states: list[DiffusionRequestState]) -> None:
+        for state in states:
+            if state.is_complete:
+                self._request_state_cache.pop(state.req_id, None)
 
     def _needs_prepare(self, state: DiffusionRequestState) -> bool:
         if state.latents is None or state.timesteps is None:
