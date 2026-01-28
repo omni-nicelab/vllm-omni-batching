@@ -23,10 +23,6 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.parallel_state import (
-    get_classifier_free_guidance_rank,
-    get_classifier_free_guidance_world_size,
-)
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.offload import apply_offload_hooks
@@ -180,7 +176,7 @@ class GPUDiffusionModelRunner:
                 output = self.pipeline.forward(req)
 
         return output
-    
+
     @torch.inference_mode()
     def execute_step(self, scheduler_output: StepSchedulerOutput) -> StepRunnerOutput:
         """Execute a single scheduled diffusion step."""

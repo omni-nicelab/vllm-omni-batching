@@ -36,14 +36,14 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.step_batch import StepOutput
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
+from vllm_omni.diffusion.worker.step_batch import StepOutput
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
-from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
 
 def get_qwen_image_post_process_func(
     od_config: OmniDiffusionConfig,

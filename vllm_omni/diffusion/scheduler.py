@@ -13,7 +13,6 @@ from vllm_omni.diffusion.worker.step_batch import StepRunnerOutput, StepSchedule
 logger = init_logger(__name__)
 
 
-
 class DiffusionScheduleState(str, Enum):
     """Scheduler-only lifecycle state for diffusion requests."""
 
@@ -31,10 +30,12 @@ class DiffusionStepScheduler:
     - Select requests per step and build StepSchedulerOutput
     - Update internal state from StepRunnerOutput
     """
+
     def initialize(self, od_config: OmniDiffusionConfig):
         self.od_config = od_config
 
         # Step-level scheduling state
+        # req_id -> DiffusionRequestState
         self._request_states: dict[str, DiffusionRequestState] = {}
         self._schedule_states: dict[str, DiffusionScheduleState] = {}
         self._waiting: deque[str] = deque()

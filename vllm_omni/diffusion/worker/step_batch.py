@@ -69,15 +69,15 @@ class StepBatch:
                 self.timesteps[i] = state.current_timestep
 
     @classmethod
-    def from_requests(cls, requests: list[DiffusionRequestState]) -> "StepBatch":
+    def from_requests(cls, requests: list[DiffusionRequestState]) -> StepBatch:
         if not requests:
             raise ValueError("Cannot build StepBatch from empty request list.")
 
         req_ids = [r.req_id for r in requests]
         latents_list = [r.latents for r in requests]
-        if any(l is None for l in latents_list):
+        if any(lat is None for lat in latents_list):
             raise ValueError("All requests must have `latents` initialized.")
-        latents = torch.cat([l for l in latents_list if l is not None], dim=0)
+        latents = torch.cat([lat for lat in latents_list if lat is not None], dim=0)
 
         if any(r.prompt_embeds is None for r in requests):
             raise ValueError("All requests must have `prompt_embeds` initialized.")
@@ -116,18 +116,12 @@ class StepBatch:
             img_shapes = [r.img_shapes[0] if r.img_shapes else [] for r in requests]
 
         # txt_seq_lens: prefer field (mask-based) over property (shape-based)
-        txt_seq_lens = [
-            r.txt_seq_lens[0] if r.txt_seq_lens else r.txt_seq_len
-            for r in requests
-        ]
+        txt_seq_lens = [r.txt_seq_lens[0] if r.txt_seq_lens else r.txt_seq_len for r in requests]
 
         # negative_txt_seq_lens: same logic
         negative_txt_seq_lens = None
         if any(r.negative_txt_seq_lens is not None for r in requests):
-            negative_txt_seq_lens = [
-                r.negative_txt_seq_lens[0] if r.negative_txt_seq_lens else 0
-                for r in requests
-            ]
+            negative_txt_seq_lens = [r.negative_txt_seq_lens[0] if r.negative_txt_seq_lens else 0 for r in requests]
 
         return cls(
             req_ids=req_ids,
@@ -275,10 +269,7 @@ class FixedResolutionBatchBuilder(BatchBuilder):
 
         # Check if we can reuse cached batch
         current_req_ids = tuple(s.req_id for s in states)
-        if (
-            self._cached_batch is not None
-            and self._cached_req_ids == current_req_ids
-        ):
+        if self._cached_batch is not None and self._cached_req_ids == current_req_ids:
             # Same requests - update dynamic tensors in place
             self._cached_batch.requests = states
             self._cached_batch.update_dynamic()

@@ -3,9 +3,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pprint
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 import PIL.Image
 import torch
@@ -208,8 +209,6 @@ class OmniDiffusionRequest:
         return pprint.pformat(asdict(self), indent=2, width=120)
 
 
-
-
 @dataclass
 class DiffusionRequestState:
     """Per-request state for continuous batching.
@@ -217,27 +216,27 @@ class DiffusionRequestState:
     This contains request-level config plus mutable generation state
     (step index, per-request scheduler/sampler state, RoPE cache, etc.).
     """
-    
+
     # Identity + source request
     req_id: str
     req: OmniDiffusionRequest
-    
+
     # Encoded prompts (computed once in prepare phase)
     prompt_embeds: torch.Tensor | None = None  # [B, seq_len, hidden_dim]
     prompt_embeds_mask: torch.Tensor | None = None
     negative_prompt_embeds: torch.Tensor | None = None
     negative_prompt_embeds_mask: torch.Tensor | None = None
-    
+
     # I2V mode
     latent_condition: torch.Tensor | None = None  # encoded image condition
     first_frame_mask: torch.Tensor | None = None  # mask for I2V blending
-    
+
     # Timestep scheduling (mutable)
     timesteps: torch.Tensor | None = None  # all timesteps for this request
     boundary_timestep: float | None = None  # for dual-model switching
     step_index: int = 0
     timestep: torch.Tensor | float | int | None = None
-    
+
     # Latent state
     latents: torch.Tensor | None = None
 
@@ -259,10 +258,10 @@ class DiffusionRequestState:
     txt_seq_lens: list[int] | None = None
     negative_txt_seq_lens: list[int] | None = None
     rope_state: dict[str, Any] = field(default_factory=dict)
-    
+
     # Callback hooks
     callback_on_step_end: Callable | None = None
-    
+
     @property
     def latent_shape(self) -> tuple[int, int, int, int, int]:
         """[B, C, T, H, W] for video latents"""

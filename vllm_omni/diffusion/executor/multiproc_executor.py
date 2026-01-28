@@ -163,9 +163,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         return processes, result_handle
 
     def add_req(self, requests: list[OmniDiffusionRequest]):
-        raise NotImplementedError(
-            "Synchronous generate is deprecated. Use step-level scheduling with execute_step()."
-        )
+        raise NotImplementedError("Synchronous generate is deprecated. Use step-level scheduling with execute_step().")
 
     def execute_step(
         self,

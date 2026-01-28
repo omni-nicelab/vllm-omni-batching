@@ -7,8 +7,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from PIL import Image
 import torch
+from PIL import Image
 
 
 class DiffusionRequestType(Enum):

@@ -34,7 +34,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.profiler import CurrentProfiler
-from vllm_omni.diffusion.request import DiffusionRequestState, OmniDiffusionRequest
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.gpu_diffusion_model_runner import GPUDiffusionModelRunner
 from vllm_omni.diffusion.worker.step_batch import (
     StepRunnerOutput,
@@ -365,11 +365,13 @@ class WorkerProc:
                     self.return_result(result)
                 except Exception as e:
                     logger.error(f"Error executing step: {e}", exc_info=True)
-                    self.return_result(StepRunnerOutput(
-                        step_id=msg.get("step_id", -1),
-                        step_outputs=[],
-                        decoded={},
-                    ))
+                    self.return_result(
+                        StepRunnerOutput(
+                            step_id=msg.get("step_id", -1),
+                            step_outputs=[],
+                            decoded={},
+                        )
+                    )
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)

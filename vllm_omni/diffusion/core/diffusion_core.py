@@ -12,8 +12,8 @@ import PIL.Image
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.core.outputs import DiffusionCoreOutput, DiffusionRequestType
-from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
