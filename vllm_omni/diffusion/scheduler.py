@@ -19,6 +19,7 @@ class DiffusionScheduleState(str, Enum):
     WAITING = "waiting"
     RUNNING = "running"
     SUSPENDED = "suspended"
+    PREEMPTED = "preempted"
     FINISHED = "finished"
 
 
@@ -71,9 +72,8 @@ class DiffusionStepScheduler:
 
         Returns a StepSchedulerOutput containing the active request states.
         """
-        finished_req_ids = set(self._finished_req_ids)
+        # TODO: preempt schedule
         self._finished_req_ids.clear()
-        preempted_req_ids = set(self._preempted_req_ids)
         self._preempted_req_ids.clear()
 
         # Fill running slots from waiting queue
@@ -84,26 +84,18 @@ class DiffusionStepScheduler:
             self._schedule_states[req_id] = DiffusionScheduleState.RUNNING
             self._running.append(req_id)
 
-        # Filter out completed requests from running
+        # Build output with current running requests
         running_states: list[DiffusionRequestState] = []
-        still_running: list[str] = []
         for req_id in self._running:
             state = self._request_states.get(req_id)
-            if state is None:
-                continue
-            if state.is_complete:
-                self._mark_finished(req_id)
-                finished_req_ids.add(req_id)
-                continue
-            running_states.append(state)
-            still_running.append(req_id)
-        self._running = still_running
+            if state is not None:
+                running_states.append(state)
 
         scheduler_output = StepSchedulerOutput(
             step_id=self._step_id,
-            req_stats=running_states,
-            finished_req_ids=finished_req_ids,
-            preempted_req_ids=preempted_req_ids,
+            req_states=running_states,
+            finished_req_ids=self._finished_req_ids,
+            preempted_req_ids=self._preempted_req_ids,
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
         )
@@ -117,7 +109,20 @@ class DiffusionStepScheduler:
         The latents are kept in the Worker's _request_state_cache to avoid
         expensive IPC serialization of large tensors on every step.
         """
-        finished_this_step: set[str] = set()
+        # Update running requests and mark finished ones
+        still_running: list[str] = []
+        for req_id in self._running:
+            state = self._request_states.get(req_id)
+            if state is None:
+                continue
+            if state.denoise_complete:
+                self._mark_finished(req_id)
+                self._finished_req_ids.add(req_id)
+                continue
+            still_running.append(req_id)
+        self._running = still_running
+
+        finished_req_ids: set[str] = set()
         for out in runner_output.step_outputs:
             state = self._request_states.get(out.req_id)
             if state is None:
@@ -126,21 +131,21 @@ class DiffusionStepScheduler:
             state.step_index = out.step_index + 1
             state.timestep = out.timestep
             if out.is_complete:
-                finished_this_step.add(out.req_id)
+                finished_req_ids.add(out.req_id)
 
         # Record decoded outputs
         for req_id, decoded in runner_output.decoded.items():
             state = self._request_states.get(req_id)
             if state is not None:
                 state.req.output = decoded
-                finished_this_step.add(req_id)
+                finished_req_ids.add(req_id)
 
-        for req_id in finished_this_step:
+        for req_id in finished_req_ids:
             self._mark_finished(req_id)
 
-        if finished_this_step:
-            self._finished_req_ids |= finished_this_step
-        return finished_this_step
+        if finished_req_ids:
+            self._finished_req_ids |= finished_req_ids
+        return finished_req_ids
 
     def abort_request(self, req_id: str) -> bool:
         """Abort a request and mark it finished."""

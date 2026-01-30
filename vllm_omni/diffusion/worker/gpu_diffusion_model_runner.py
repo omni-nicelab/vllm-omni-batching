@@ -182,20 +182,20 @@ class GPUDiffusionModelRunner:
         """Execute a single scheduled diffusion step."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
 
-        states = self._resolve_states(scheduler_output)
+        states = self._get_cached_request_states(scheduler_output)
         to_encode = [state for state in states if self._needs_prepare(state)]
         if to_encode:
             self._batch_encode(to_encode)
 
         step_outputs: list[StepOutput] = []
-        denoise_states = [state for state in states if not state.is_complete]
+        denoise_states = [state for state in states if not state.denoise_complete]
         if denoise_states:
             batch = self.batch_builder.build(denoise_states)
             if batch is not None:
                 step_outputs = self._denoise_batch(batch)
 
         decoded = {}
-        decode_states = [state for state in states if state.is_complete]
+        decode_states = [state for state in states if state.denoise_complete]
         if decode_states:
             decoded = self._batch_decode(decode_states)
 
@@ -215,10 +215,10 @@ class GPUDiffusionModelRunner:
         self._evict_finished_states(states)
         return output
 
-    def _resolve_states(self, scheduler_output: StepSchedulerOutput) -> list[DiffusionRequestState]:
+    def _get_cached_request_states(self, scheduler_output: StepSchedulerOutput) -> list[DiffusionRequestState]:
         """Map scheduler output to cached request states using req_id."""
         resolved: list[DiffusionRequestState] = []
-        for state in scheduler_output.req_stats:
+        for state in scheduler_output.req_states:
             cached = self._request_state_cache.get(state.req_id)
             if cached is None:
                 cached = DiffusionRequestState(req_id=state.req_id, req=state.req)
@@ -230,7 +230,7 @@ class GPUDiffusionModelRunner:
 
     def _evict_finished_states(self, states: list[DiffusionRequestState]) -> None:
         for state in states:
-            if state.is_complete:
+            if state.denoise_complete:
                 self._request_state_cache.pop(state.req_id, None)
 
     def _needs_prepare(self, state: DiffusionRequestState) -> bool:

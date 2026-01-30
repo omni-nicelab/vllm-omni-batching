@@ -276,7 +276,7 @@ class DiffusionRequestState:
         return int(self.req.num_inference_steps)
 
     @property
-    def is_complete(self) -> bool:
+    def denoise_complete(self) -> bool:
         return self.step_index >= self.total_steps
 
     @property

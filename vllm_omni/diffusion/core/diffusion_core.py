@@ -58,7 +58,7 @@ class DiffusionCore:
 
     def step(self) -> tuple[list[DiffusionCoreOutput], bool]:
         sched_output = self.step_scheduler.schedule()
-        if not sched_output.req_stats:
+        if not sched_output.req_states:
             return [], False
 
         runner_output = self.executor.execute_step(sched_output)

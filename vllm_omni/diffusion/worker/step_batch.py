@@ -167,7 +167,7 @@ class StepSchedulerOutput:
     step_id: int
 
     # Request states scheduled in this step
-    req_stats: list[DiffusionRequestState] = field(default_factory=list)
+    req_states: list[DiffusionRequestState] = field(default_factory=list)
 
     # Request IDs that finished in this scheduling cycle
     finished_req_ids: set[str] = field(default_factory=set)
