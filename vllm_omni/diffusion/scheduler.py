@@ -109,22 +109,10 @@ class DiffusionStepScheduler:
         The latents are kept in the Worker's _request_state_cache to avoid
         expensive IPC serialization of large tensors on every step.
         """
-        # Update running requests and mark finished ones
-        still_running: list[str] = []
-        for req_id in self._running:
-            state = self._request_states.get(req_id)
-            if state is None:
-                continue
-            if state.denoise_complete:
-                self._mark_finished(req_id)
-                self._finished_req_ids.add(req_id)
-                continue
-            still_running.append(req_id)
-        self._running = still_running
-
+        request_states = self._request_states
         finished_req_ids: set[str] = set()
         for out in runner_output.step_outputs:
-            state = self._request_states.get(out.req_id)
+            state = request_states.get(out.req_id)
             if state is None:
                 continue
             # Only update metadata, NOT latents (kept in Worker cache)
@@ -135,10 +123,22 @@ class DiffusionStepScheduler:
 
         # Record decoded outputs
         for req_id, decoded in runner_output.decoded.items():
-            state = self._request_states.get(req_id)
+            state = request_states.get(req_id)
             if state is not None:
                 state.req.output = decoded
                 finished_req_ids.add(req_id)
+
+        if self._running:
+            still_running: list[str] = []
+            for req_id in self._running:
+                state = request_states.get(req_id)
+                if state is None:
+                    continue
+                if req_id in finished_req_ids or state.is_completed:
+                    finished_req_ids.add(req_id)
+                    continue
+                still_running.append(req_id)
+            self._running = still_running
 
         for req_id in finished_req_ids:
             self._mark_finished(req_id)

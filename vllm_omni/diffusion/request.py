@@ -276,8 +276,17 @@ class DiffusionRequestState:
         return int(self.req.num_inference_steps)
 
     @property
-    def denoise_complete(self) -> bool:
+    def denoise_completed(self) -> bool:
         return self.step_index >= self.total_steps
+
+    @property
+    def is_completed(self) -> bool:
+        """
+        NOTE:
+        Under the current design, completion of the denoise stage
+        implicitly indicates completion of the decode stage.
+        """
+        return self.denoise_completed
 
     @property
     def current_timestep(self) -> torch.Tensor | None:

@@ -188,14 +188,14 @@ class GPUDiffusionModelRunner:
             self._batch_encode(to_encode)
 
         step_outputs: list[StepOutput] = []
-        denoise_states = [state for state in states if not state.denoise_complete]
+        denoise_states = [state for state in states if not state.denoise_completed]
         if denoise_states:
             batch = self.batch_builder.build(denoise_states)
             if batch is not None:
                 step_outputs = self._denoise_batch(batch)
 
         decoded = {}
-        decode_states = [state for state in states if state.denoise_complete]
+        decode_states = [state for state in states if state.denoise_completed]
         if decode_states:
             decoded = self._batch_decode(decode_states)
 
@@ -230,7 +230,7 @@ class GPUDiffusionModelRunner:
 
     def _evict_finished_states(self, states: list[DiffusionRequestState]) -> None:
         for state in states:
-            if state.denoise_complete:
+            if state.is_completed:
                 self._request_state_cache.pop(state.req_id, None)
 
     def _needs_prepare(self, state: DiffusionRequestState) -> bool:
