@@ -2,25 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections import deque
-from enum import Enum
 
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.request import DiffusionRequestState, OmniDiffusionRequest
+from vllm_omni.diffusion.request import DiffusionRequestState, DiffusionRequestStatus, OmniDiffusionRequest
 from vllm_omni.diffusion.worker.step_batch import StepRunnerOutput, StepSchedulerOutput
 
 logger = init_logger(__name__)
-
-
-class DiffusionScheduleState(str, Enum):
-    """Scheduler-only lifecycle state for diffusion requests."""
-
-    WAITING = "waiting"
-    RUNNING = "running"
-    SUSPENDED = "suspended"
-    PREEMPTED = "preempted"
-    FINISHED = "finished"
 
 
 class DiffusionStepScheduler:
@@ -38,7 +27,6 @@ class DiffusionStepScheduler:
         # Step-level scheduling state
         # req_id -> DiffusionRequestState
         self._request_states: dict[str, DiffusionRequestState] = {}
-        self._schedule_states: dict[str, DiffusionScheduleState] = {}
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._finished_req_ids: set[str] = set()
@@ -59,7 +47,6 @@ class DiffusionStepScheduler:
 
         state = DiffusionRequestState(req_id=req_id, req=request)
         self._request_states[req_id] = state
-        self._schedule_states[req_id] = DiffusionScheduleState.WAITING
         self._waiting.append(req_id)
         logger.debug("Scheduler add_request: %s (waiting=%d)", req_id, len(self._waiting))
         return req_id
@@ -73,15 +60,13 @@ class DiffusionStepScheduler:
         Returns a StepSchedulerOutput containing the active request states.
         """
         # TODO: preempt schedule
-        self._finished_req_ids.clear()
-        self._preempted_req_ids.clear()
 
         # Fill running slots from waiting queue
         while self._waiting and len(self._running) < self._max_batch_size:
             req_id = self._waiting.popleft()
             if req_id not in self._request_states:
                 continue
-            self._schedule_states[req_id] = DiffusionScheduleState.RUNNING
+            self._request_states[req_id].req.status = DiffusionRequestStatus.RUNNING
             self._running.append(req_id)
 
         # Build output with current running requests
@@ -99,10 +84,14 @@ class DiffusionStepScheduler:
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
         )
+
+        # update after schedule
         self._step_id += 1
+        self._finished_req_ids = set()
+        self._preempted_req_ids = set()
         return scheduler_output
 
-    def update_from_step(self, runner_output: StepRunnerOutput) -> set[str]:
+    def update_from_step(self, sched_output: StepSchedulerOutput, runner_output: StepRunnerOutput) -> set[str]:
         """Update request states based on the runner output.
 
         NOTE: We intentionally do NOT store latents in the scheduler's state.
@@ -110,48 +99,65 @@ class DiffusionStepScheduler:
         expensive IPC serialization of large tensors on every step.
         """
         request_states = self._request_states
-        finished_req_ids: set[str] = set()
+        scheduled_req_ids = {s.req_id for s in sched_output.req_states}
+
+        # Abnormal finish ids: runner returned results for non-scheduled req_ids,
+        # or the scheduler no longer has state for the req_id.
+        unexpected_finished_ids: set[str] = set()
+
+        # StepOutput advances denoising only; "normal completion" is determined by decoded
+        # (Currently, the decode stage and the last denoise step are executed in the same scheduling cycle).
         for out in runner_output.step_outputs:
+            if out.req_id not in scheduled_req_ids:
+                unexpected_finished_ids.add(out.req_id)
             state = request_states.get(out.req_id)
             if state is None:
+                unexpected_finished_ids.add(out.req_id)
                 continue
             # Only update metadata, NOT latents (kept in Worker cache)
             state.step_index = out.step_index + 1
             state.timestep = out.timestep
-            if out.is_complete:
-                finished_req_ids.add(out.req_id)
 
-        # Record decoded outputs
+        completed_req_ids: set[str] = set()
         for req_id, decoded in runner_output.decoded.items():
+            if req_id not in scheduled_req_ids:
+                unexpected_finished_ids.add(req_id)
             state = request_states.get(req_id)
-            if state is not None:
-                state.req.output = decoded
-                finished_req_ids.add(req_id)
+            if state is None:
+                unexpected_finished_ids.add(req_id)
+                continue
+            state.req.output = decoded
+            state.req.status = DiffusionRequestStatus.FINISHED_COMPLETED
+            completed_req_ids.add(req_id)
 
-        if self._running:
-            still_running: list[str] = []
+        # clean _running (drop completed + drop missing).
+        if completed_req_ids or unexpected_finished_ids:
+            new_running: list[str] = []
             for req_id in self._running:
-                state = request_states.get(req_id)
-                if state is None:
+                if req_id in completed_req_ids:
                     continue
-                if req_id in finished_req_ids or state.is_completed:
-                    finished_req_ids.add(req_id)
+                if req_id not in request_states:
+                    unexpected_finished_ids.add(req_id)
                     continue
-                still_running.append(req_id)
-            self._running = still_running
+                new_running.append(req_id)
+            self._running = new_running
 
-        for req_id in finished_req_ids:
-            self._mark_finished(req_id)
+        # Be defensive: a finished request should not be schedulable again.
+        for req_id in completed_req_ids:
+            try:
+                self._waiting.remove(req_id)
+            except ValueError:
+                pass
 
-        if finished_req_ids:
-            self._finished_req_ids |= finished_req_ids
-        return finished_req_ids
+        if unexpected_finished_ids:
+            self._finished_req_ids |= unexpected_finished_ids
+        return completed_req_ids
 
     def abort_request(self, req_id: str) -> bool:
         """Abort a request and mark it finished."""
         if req_id not in self._request_states:
             return False
-        self._mark_finished(req_id)
+        self.finish_request(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
         self._finished_req_ids.add(req_id)
         return True
 
@@ -164,7 +170,6 @@ class DiffusionStepScheduler:
 
     def pop_request_state(self, req_id: str) -> DiffusionRequestState | None:
         state = self._request_states.pop(req_id, None)
-        self._schedule_states.pop(req_id, None)
         return state
 
     def preempt_request(self, req_id: str) -> bool:
@@ -174,13 +179,19 @@ class DiffusionStepScheduler:
         if req_id in self._running:
             self._running.remove(req_id)
             self._waiting.appendleft(req_id)
-            self._schedule_states[req_id] = DiffusionScheduleState.SUSPENDED
+            self._request_states[req_id].req.status = DiffusionRequestStatus.PREEMPTED
             self._preempted_req_ids.add(req_id)
             return True
         return False
 
-    def _mark_finished(self, req_id: str) -> None:
-        self._schedule_states[req_id] = DiffusionScheduleState.FINISHED
+    def finish_request(self, req_id: str, status: DiffusionRequestStatus) -> None:
+        """Handles the finish signal from outside the scheduler.
+
+        For example, the API server can abort a request when the client
+        disconnects.
+        """
+        assert DiffusionRequestStatus.is_finished(status)
+        self._request_states[req_id].req.status = status
         if req_id in self._running:
             self._running.remove(req_id)
         try:

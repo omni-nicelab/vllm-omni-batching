@@ -62,7 +62,7 @@ class DiffusionCore:
             return [], False
 
         runner_output = self.executor.execute_step(sched_output)
-        finished_ids = self.step_scheduler.update_from_step(runner_output)
+        finished_ids = self.step_scheduler.update_from_step(sched_output, runner_output)
         outputs = self._build_outputs(finished_ids, runner_output)
         return outputs, True
 

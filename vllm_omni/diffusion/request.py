@@ -2,33 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 import pprint
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from enum import Enum
 from typing import Any
 
 import PIL.Image
 import torch
 
 
-class DiffusionRequestStatus(str, Enum):
+class DiffusionRequestStatus(enum.IntEnum):
     """Request status in the scheduler."""
 
-    WAITING = "waiting"  # In waiting queue, not yet started
-    RUNNING = "running"  # Currently being processed
-    PREEMPTED = "preempted"  # Preempted and moved back to waiting
-    FINISHED_COMPLETED = "finished_completed"  # All steps completed
-    FINISHED_ABORTED = "finished_aborted"  # Aborted by user
-    FINISHED_ERROR = "finished_error"  # Error during processing
+    WAITING = enum.auto()  # In waiting queue, not yet started
+    RUNNING = enum.auto()  # Currently being processed
+    PREEMPTED = enum.auto()  # Preempted and moved back to waiting
+
+    # if any status is after PREEMPTED, it is considered finished
+    FINISHED_COMPLETED = enum.auto()  # All steps completed
+    FINISHED_ABORTED = enum.auto()  # Aborted by user
+    FINISHED_ERROR = enum.auto()  # Error during processing
 
     @staticmethod
     def is_finished(status: "DiffusionRequestStatus") -> bool:
-        return status in (
-            DiffusionRequestStatus.FINISHED_COMPLETED,
-            DiffusionRequestStatus.FINISHED_ABORTED,
-            DiffusionRequestStatus.FINISHED_ERROR,
-        )
+        return status > DiffusionRequestStatus.PREEMPTED
 
 
 @dataclass
@@ -47,6 +45,8 @@ class OmniDiffusionRequest:
     # data_type: DataType
 
     request_id: str | None = None
+
+    status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
