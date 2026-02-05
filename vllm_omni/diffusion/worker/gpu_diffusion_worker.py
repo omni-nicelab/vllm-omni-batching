@@ -291,7 +291,7 @@ class WorkerProc:
             od_config=od_config,
         )
 
-    def return_result(self, output: DiffusionOutput):
+    def return_result(self, output: DiffusionOutput | StepRunnerOutput):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
             self.result_mq.enqueue(output)

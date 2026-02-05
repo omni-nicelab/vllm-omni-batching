@@ -12,9 +12,9 @@ from PIL import Image
 
 
 class DiffusionRequestType(Enum):
-    ADD = b"ADD"
-    ABORT = b"ABORT"
-    UTILITY = b"UTILITY"
+    ADD = b"\x00"
+    ABORT = b"\x01"
+    UTILITY = b"\x02"
 
 
 @dataclass

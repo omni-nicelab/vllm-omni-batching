@@ -190,7 +190,9 @@ class StepRunnerOutput:
     """
 
     step_id: int
+    # [num_reqs]
     step_outputs: list[StepOutput] = field(default_factory=list)
+    # req_id -> decoded tensors
     decoded: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
