@@ -32,7 +32,26 @@ class DiffusionStepScheduler:
         self._finished_req_ids: set[str] = set()
         self._preempted_req_ids: set[str] = set()
         self._step_id: int = 0
+
+        # scheduling constraints
+        # NOTE: for Qwen-Image, axes_dims_rope: [16,56,56]
+        # TODO: better defaults values
         self._max_batch_size: int = int(getattr(od_config, "max_batch_size", 2))
+        self._max_model_len: int = int(getattr(od_config, "max_model_len", 56 * 56))
+        # NOTE: this is an "image token" budget (i.e. tokens), not pixel-space units.
+        self._max_num_scheduled_tokens: int = int(getattr(od_config, "max_num_batched_dit_tokens", 4 * 56 * 56))
+
+        # Validate scheduling constraints following vLLM design
+        if self._max_num_scheduled_tokens > self._max_batch_size * self._max_model_len:
+            logger.warning(
+                "max_num_scheduled_tokens (%d) exceeds max_batch_size * max_model_len (%d * %d = %d). "
+                "This may cause memory issues.",
+                self._max_num_scheduled_tokens,
+                self._max_batch_size,
+                self._max_model_len,
+                self._max_batch_size * self._max_model_len,
+            )
+            self._max_num_scheduled_tokens = self._max_batch_size * self._max_model_len
 
     # ======================================================================
     # Step-level scheduling API
@@ -60,14 +79,34 @@ class DiffusionStepScheduler:
         Returns a StepSchedulerOutput containing the active request states.
         """
         # TODO: preempt schedule
+        token_budget = self._max_num_scheduled_tokens
 
-        # Fill running slots from waiting queue
-        while self._waiting and len(self._running) < self._max_batch_size:
+        # Schedule running requests first
+        # (Currently, preemption is not supported)
+        token_budget -= self._calculate_current_tokens()
+
+        # Schedule waiting requests
+        while self._waiting and len(self._running) < self._max_batch_size and token_budget > 0:
             req_id = self._waiting.popleft()
             if req_id not in self._request_states:
                 continue
+
+            # Check if adding this request would exceed tokens budget
+            req_tokens = self._get_request_tokens(req_id)
+            if req_tokens > token_budget:
+                # Put request back to front of queue and break
+                self._waiting.appendleft(req_id)
+                logger.debug(
+                    "Cannot schedule request %s: requires tokens=%d but only tokens=%d available",
+                    req_id,
+                    req_tokens,
+                    token_budget,
+                )
+                break
+
             self._request_states[req_id].req.status = DiffusionRequestStatus.RUNNING
             self._running.append(req_id)
+            token_budget -= req_tokens
 
         # Build output with current running requests
         running_states: list[DiffusionRequestState] = []
@@ -198,3 +237,102 @@ class DiffusionStepScheduler:
             self._waiting.remove(req_id)
         except ValueError:
             pass
+
+    def _calculate_current_tokens(self) -> int:
+        """Calculate total tokens (image token count) for all currently running requests."""
+        total_tokens = 0
+        for req_id in self._running:
+            total_tokens += self._get_request_tokens(req_id)
+        return total_tokens
+
+    def _get_request_tokens(self, req_id: str) -> int:
+        """Get tokens (image token count) for a specific request."""
+        state = self._request_states.get(req_id)
+        if state is None:
+            return 0
+        req = state.req
+
+        # NOTE: tokens here refers to the *image token* budget consumed by a request.
+        # For Qwen-Image, the effective pixel-space token size is:
+        #   token_px = vae_scale_factor * 2
+        # because latents are 8x downsampled by VAE (typically) and then packed into 2x2 tokens.
+        # In the pipeline this corresponds to `latents.shape[1]`.
+        # TODO: save token size in OmniDiffusionRequest/DiffusionRequestState?
+
+        req_batch_size = int(getattr(req, "batch_size", 1) or 1)
+        num_frames = self._to_int(getattr(req, "num_frames", 1), default=1) or 1
+        num_frames = max(1, num_frames)
+
+        # Prefer latent-space dimensions if the request already carries them.
+        height_latents = self._to_int(getattr(req, "height_latents", None))
+        width_latents = self._to_int(getattr(req, "width_latents", None))
+        if height_latents is not None and width_latents is not None and height_latents > 0 and width_latents > 0:
+            # Latents are packed in 2x2 blocks -> tokens is (H_lat/2)*(W_lat/2) per frame.
+            tokens_per_frame = (height_latents // 2) * (width_latents // 2)
+            tokens_per_sample = max(1, tokens_per_frame) * num_frames
+            return tokens_per_sample * req_batch_size
+
+        # Fallback to pixel-space dimensions.
+        height = self._to_int(getattr(req, "height", None))
+        width = self._to_int(getattr(req, "width", None))
+        if height is None or width is None:
+            # Qwen-image commonly uses square bucket resolutions; use that if provided.
+            resolution = self._to_int(getattr(req, "resolution", None))
+            if resolution is not None and resolution > 0:
+                height = height or resolution
+                width = width or resolution
+
+        if height is None or width is None:
+            # Last-resort fallback to configured defaults.
+            vae_scale_factor = int(getattr(self.od_config, "vae_scale_factor", 8) or 8)
+            default_sample_size = int(getattr(self.od_config, "default_sample_size", 128) or 128)
+            height = height or default_sample_size * vae_scale_factor
+            width = width or default_sample_size * vae_scale_factor
+
+        # Determine effective token size in pixel space.
+        token_size_px = self._get_effective_token_size_px()
+        token_size_px = max(1, int(token_size_px))
+
+        tokens_h = max(1, int(height) // token_size_px)
+        tokens_w = max(1, int(width) // token_size_px)
+        tokens_per_sample = (tokens_h * tokens_w) * num_frames
+
+        return tokens_per_sample * req_batch_size
+
+    @staticmethod
+    def _to_int(value, default: int | None = None) -> int | None:
+        if value is None:
+            return default
+        if isinstance(value, list):
+            if not value:
+                return default
+            value = value[0]
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _get_effective_token_size_px(self) -> int:
+        """Return pixel-space token size used for scheduler token budgeting.
+
+        For Qwen-Image, effective token size is `vae_scale_factor * 2`.
+        This method allows overriding via config without loading the model.
+        """
+        # Explicit override if user knows exact tokenization.
+        override = self._to_int(getattr(self.od_config, "scheduler_token_size_px", None))
+        if override is not None and override > 0:
+            return override
+
+        model_class = (getattr(self.od_config, "model_class_name", None) or "").lower()
+        model_name = (getattr(self.od_config, "model", None) or "").lower()
+        is_qwen_image = ("qwen" in model_class and "image" in model_class) or (
+            "qwen" in model_name and "image" in model_name
+        )
+
+        if is_qwen_image:
+            vae_scale_factor = int(getattr(self.od_config, "vae_scale_factor", 8) or 8)
+            return vae_scale_factor * 2
+
+        # Generic default: treat one visual token as 16px for image models unless configured.
+        default_token_size_px = getattr(self.od_config, "default_token_size_px", 16)
+        return int(default_token_size_px or 16)
