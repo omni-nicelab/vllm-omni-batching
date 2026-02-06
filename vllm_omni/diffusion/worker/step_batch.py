@@ -73,6 +73,43 @@ class StepBatch:
         if not requests:
             raise ValueError("Cannot build StepBatch from empty request list.")
 
+        def _normalize_prompt_embeds(x: torch.Tensor) -> torch.Tensor:
+            # Accept both [seq, hidden] and [batch, seq, hidden] and normalize to 3D.
+            if x.ndim == 2:
+                return x.unsqueeze(0)
+            if x.ndim == 3:
+                return x
+            raise ValueError(f"prompt_embeds must be 2D or 3D, got shape={tuple(x.shape)}")
+
+        def _normalize_mask(x: torch.Tensor) -> torch.Tensor:
+            # Accept both [seq] and [batch, seq] and normalize to 2D.
+            if x.ndim == 1:
+                x = x.unsqueeze(0)
+            elif x.ndim != 2:
+                raise ValueError(f"prompt_embeds_mask must be 1D or 2D, got shape={tuple(x.shape)}")
+            # Attention backends expect boolean masks (True=valid, False=padding).
+            if x.dtype != torch.bool:
+                x = x != 0
+            return x
+
+        def _pad_prompt_embeds(x: torch.Tensor, target_seq_len: int) -> torch.Tensor:
+            x = _normalize_prompt_embeds(x)
+            bsz, seq_len, hidden = x.shape
+            if seq_len == target_seq_len:
+                return x
+            out = x.new_zeros((bsz, target_seq_len, hidden))
+            out[:, :seq_len] = x
+            return out
+
+        def _pad_mask(x: torch.Tensor, target_seq_len: int) -> torch.Tensor:
+            x = _normalize_mask(x)
+            bsz, seq_len = x.shape
+            if seq_len == target_seq_len:
+                return x
+            out = torch.zeros((bsz, target_seq_len), dtype=torch.bool, device=x.device)
+            out[:, :seq_len] = x
+            return out
+
         req_ids = [r.req_id for r in requests]
         latents_list = [r.latents for r in requests]
         if any(lat is None for lat in latents_list):
@@ -81,30 +118,61 @@ class StepBatch:
 
         if any(r.prompt_embeds is None for r in requests):
             raise ValueError("All requests must have `prompt_embeds` initialized.")
-        prompt_embeds = torch.cat([r.prompt_embeds for r in requests if r.prompt_embeds is not None], dim=0)
+        prompt_embeds_list = [
+            _normalize_prompt_embeds(r.prompt_embeds) for r in requests if r.prompt_embeds is not None
+        ]
+        prompt_max_seq_len = max(t.shape[1] for t in prompt_embeds_list)
 
         prompt_masks = [r.prompt_embeds_mask for r in requests]
         if any(m is None for m in prompt_masks):
             if any(m is not None for m in prompt_masks):
                 raise ValueError("Mixed prompt_embeds_mask in batch.")
+            # Without a mask, we cannot safely pad variable-length prompt_embeds.
+            if any(t.shape[1] != prompt_max_seq_len for t in prompt_embeds_list):
+                raise ValueError(
+                    "Variable-length prompt_embeds in batch but prompt_embeds_mask is None. "
+                    "Provide masks or ensure prompt_embeds have the same seq_len."
+                )
+            prompt_embeds = torch.cat(prompt_embeds_list, dim=0)
             prompt_embeds_mask = None
         else:
-            prompt_embeds_mask = torch.cat([m for m in prompt_masks if m is not None], dim=0)
-
-        negative_prompt_embeds = None
-        if all(r.negative_prompt_embeds is not None for r in requests):
-            negative_prompt_embeds = torch.cat(
-                [r.negative_prompt_embeds for r in requests if r.negative_prompt_embeds is not None],
+            prompt_embeds = torch.cat([_pad_prompt_embeds(t, prompt_max_seq_len) for t in prompt_embeds_list], dim=0)
+            prompt_embeds_mask = torch.cat(
+                [_pad_mask(m, prompt_max_seq_len) for m in prompt_masks if m is not None],
                 dim=0,
             )
 
-        negative_masks = [r.negative_prompt_embeds_mask for r in requests]
-        if any(m is None for m in negative_masks):
-            if any(m is not None for m in negative_masks):
-                raise ValueError("Mixed negative_prompt_embeds_mask in batch.")
-            negative_prompt_embeds_mask = None
+        negative_prompt_embeds = None
+        if all(r.negative_prompt_embeds is not None for r in requests):
+            neg_list = [
+                _normalize_prompt_embeds(r.negative_prompt_embeds)
+                for r in requests
+                if r.negative_prompt_embeds is not None
+            ]
+            neg_max_seq_len = max(t.shape[1] for t in neg_list) if neg_list else 0
+
+            negative_masks = [r.negative_prompt_embeds_mask for r in requests]
+            if any(m is None for m in negative_masks):
+                if any(m is not None for m in negative_masks):
+                    raise ValueError("Mixed negative_prompt_embeds_mask in batch.")
+                if any(t.shape[1] != neg_max_seq_len for t in neg_list):
+                    raise ValueError(
+                        "Variable-length negative_prompt_embeds in batch but negative_prompt_embeds_mask is None. "
+                        "Provide masks or ensure negative_prompt_embeds have the same seq_len."
+                    )
+                negative_prompt_embeds = torch.cat(neg_list, dim=0)
+                negative_prompt_embeds_mask = None
+            else:
+                negative_prompt_embeds = torch.cat(
+                    [_pad_prompt_embeds(t, neg_max_seq_len) for t in neg_list],
+                    dim=0,
+                )
+                negative_prompt_embeds_mask = torch.cat(
+                    [_pad_mask(m, neg_max_seq_len) for m in negative_masks if m is not None],
+                    dim=0,
+                )
         else:
-            negative_prompt_embeds_mask = torch.cat([m for m in negative_masks if m is not None], dim=0)
+            negative_prompt_embeds_mask = None
 
         if any(r.current_timestep is None for r in requests):
             raise ValueError("All requests must have `timesteps` initialized.")
