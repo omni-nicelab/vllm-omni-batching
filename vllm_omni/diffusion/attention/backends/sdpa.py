@@ -77,8 +77,14 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        # Normalize mask before permuting q/k/v.
+        # _maybe_reshape_attn_mask expects sequence length on dim=1.
+        attention_mask = None
+        if attn_metadata:
+            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask)
+            setattr(attn_metadata, "attn_mask", attention_mask)
+
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
-        attention_mask = attn_metadata.attn_mask if attn_metadata else None
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
             key,
@@ -116,7 +122,4 @@ class SDPAImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if attn_metadata:
-            attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask)
-            setattr(attn_metadata, "attn_mask", attention_mask)
         return self.forward_cuda(query, key, value, attn_metadata)
