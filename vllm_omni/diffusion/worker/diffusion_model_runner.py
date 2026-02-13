@@ -26,12 +26,14 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportsStepExecution
 from vllm_omni.diffusion.offload import apply_offload_hooks
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
 
 
 class DiffusionModelRunner:
@@ -176,10 +178,36 @@ class DiffusionModelRunner:
 
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             with record_function("pipeline_forward"):
-                output = self.pipeline.forward(req)
+                if isinstance(self.pipeline, SupportsStepExecution):
+                    output = self.execute_stepwise(req)
+                else:
+                    output = self.pipeline.forward(req)
 
             # NOTE:
             if self.od_config.cache_backend == "cache_dit" and self.od_config.enable_cache_dit_summary:
                 cache_summary(self.pipeline, details=True)
 
         return output
+
+    def execute_stepwise(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Execute via step-level Protocol: prepare_encode → denoise × N → post_decode."""
+        (
+            prompt_embeds, prompt_embeds_mask,
+            negative_prompt_embeds, negative_prompt_embeds_mask,
+            latents, img_shapes, txt_seq_lens, negative_txt_seq_lens,
+            timesteps, do_true_cfg, guidance, true_cfg_scale,
+            height, width, scheduler,
+        ) = self.pipeline.prepare_encode(req=req)
+
+        for _i, t in enumerate(timesteps):
+            noise_pred = self.pipeline.denoise_step(
+                prompt_embeds, prompt_embeds_mask,
+                negative_prompt_embeds, negative_prompt_embeds_mask,
+                latents, img_shapes, txt_seq_lens, negative_txt_seq_lens,
+                t, do_true_cfg, guidance, true_cfg_scale,
+            )
+            latents = self.pipeline.step_scheduler(
+                noise_pred, t, latents, do_true_cfg, scheduler,
+            )
+
+        return self.pipeline.post_decode(latents, height, width)
