@@ -182,7 +182,13 @@ class CFGParallelMixin(metaclass=ABCMeta):
         """
         raise NotImplementedError("Subclasses must implement diffuse")
 
-    def scheduler_step(self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
+    def scheduler_step(
+        self,
+        noise_pred: torch.Tensor,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        scheduler: Any | None = None,
+    ) -> torch.Tensor:
         """
         Step the scheduler.
 
@@ -190,14 +196,22 @@ class CFGParallelMixin(metaclass=ABCMeta):
             noise_pred: Predicted noise
             t: Current timestep
             latents: Current latents
+            scheduler: Explicit scheduler instance.  Falls back to
+                ``self.scheduler`` when ``None`` (backward compatible).
 
         Returns:
             Updated latents after scheduler step
         """
-        return self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        sched = scheduler if scheduler is not None else self.scheduler
+        return sched.step(noise_pred, t, latents, return_dict=False)[0]
 
     def scheduler_step_maybe_with_cfg(
-        self, noise_pred: torch.Tensor, t: torch.Tensor, latents: torch.Tensor, do_true_cfg: bool
+        self,
+        noise_pred: torch.Tensor,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        do_true_cfg: bool,
+        scheduler: Any | None = None,
     ) -> torch.Tensor:
         """
         Step the scheduler with (maybe) automatic CFG parallel synchronization.
@@ -210,6 +224,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
             t: Current timestep
             latents: Current latents
             do_true_cfg: Whether CFG is enabled
+            scheduler: Explicit scheduler instance.  Falls back to
+                ``self.scheduler`` when ``None`` (backward compatible).
 
         Returns:
             Updated latents (synchronized across all CFG ranks)
@@ -223,13 +239,13 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
             # Only rank 0 computes the scheduler step
             if cfg_rank == 0:
-                latents = self.scheduler_step(noise_pred, t, latents)
+                latents = self.scheduler_step(noise_pred, t, latents, scheduler=scheduler)
 
             # Broadcast the updated latents to all ranks
             latents = latents.contiguous()
             cfg_group.broadcast(latents, src=0)
         else:
             # No CFG parallel: directly compute scheduler step
-            latents = self.scheduler_step(noise_pred, t, latents)
+            latents = self.scheduler_step(noise_pred, t, latents, scheduler=scheduler)
 
         return latents
