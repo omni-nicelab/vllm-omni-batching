@@ -82,7 +82,6 @@ class SDPAImpl(AttentionImpl):
         attention_mask = None
         if attn_metadata:
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask)
-            setattr(attn_metadata, "attn_mask", attention_mask)
 
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         output = torch.nn.functional.scaled_dot_product_attention(
