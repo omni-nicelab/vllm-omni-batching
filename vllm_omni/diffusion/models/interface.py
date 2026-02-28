@@ -11,8 +11,10 @@ from typing import (
 )
 
 if TYPE_CHECKING:
+    import torch
+
     from vllm_omni.diffusion.data import DiffusionOutput
-    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
 @runtime_checkable
@@ -28,24 +30,20 @@ class SupportAudioOutput(Protocol):
 
 @runtime_checkable
 class SupportsStepExecution(Protocol):
-    """Step-level execution protocol for diffusion pipelines.
-
-    This protocol intentionally keeps method signatures permissive to support
-    both state-based and argument-based implementations.
-    """
+    """State-driven step-level execution protocol for diffusion pipelines."""
 
     supports_step_execution: ClassVar[bool] = True
 
-    def prepare_encode(self, req: "OmniDiffusionRequest", **kwargs: Any) -> Any:
-        """Prepare request-level inputs before denoise steps."""
+    def prepare_encode(self, state: "DiffusionRequestState", **kwargs: Any) -> "DiffusionRequestState":
+        """Prepare request-level inputs and return initialized state."""
 
-    def denoise_step(self, *args: Any, **kwargs: Any) -> Any:
+    def denoise_step(self, state: "DiffusionRequestState", **kwargs: Any) -> "torch.Tensor | None":
         """Run one denoise step."""
 
-    def step_scheduler(self, *args: Any, **kwargs: Any) -> Any:
+    def step_scheduler(self, state: "DiffusionRequestState", noise_pred: "torch.Tensor", **kwargs: Any) -> None:
         """Run one scheduler step."""
 
-    def post_decode(self, *args: Any, **kwargs: Any) -> "DiffusionOutput | Any":
+    def post_decode(self, state: "DiffusionRequestState", **kwargs: Any) -> "DiffusionOutput":
         """Decode output after denoise loop."""
 
 
