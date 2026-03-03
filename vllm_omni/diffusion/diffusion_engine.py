@@ -449,7 +449,9 @@ class DiffusionEngine:
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        self.add_req_and_wait_for_response(request)
+        output = self.add_req_and_wait_for_response(request)
+        if output.error:
+            raise RuntimeError(f"Dummy run failed: {output.error}")
 
     def collective_rpc(
         self,
