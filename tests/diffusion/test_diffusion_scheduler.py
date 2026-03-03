@@ -147,3 +147,13 @@ def test_engine_add_req_and_wait_for_response_single_path() -> None:
 
     assert output is expected
     engine.executor.add_req.assert_called_once_with(request)
+
+
+def test_engine_dummy_run_raises_on_output_error() -> None:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = Mock(model_class_name="mock_model")
+    engine.pre_process_func = None
+    engine.add_req_and_wait_for_response = Mock(return_value=DiffusionOutput(error="boom"))
+
+    with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
+        engine._dummy_run()
