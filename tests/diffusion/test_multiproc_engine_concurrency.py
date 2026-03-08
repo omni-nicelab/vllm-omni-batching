@@ -11,7 +11,7 @@ import torch
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
-from vllm_omni.diffusion.scheduler import Scheduler
+from vllm_omni.diffusion.sched import RequestScheduler
 
 pytestmark = [pytest.mark.diffusion]
 
@@ -62,7 +62,7 @@ def _make_engine(num_gpus: int = 1):
     """Create a lightweight ``DiffusionEngine`` wired to mocked executor."""
     executor, req_q, res_q = _make_executor(num_gpus)
     engine = DiffusionEngine.__new__(DiffusionEngine)
-    sched = Scheduler()
+    sched = RequestScheduler()
     sched.initialize(Mock())
     engine.scheduler = sched
     engine.executor = executor

@@ -2,21 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.scheduler import DiffusionRequestStatus, Scheduler
+from vllm_omni.diffusion.sched import DiffusionRequestStatus, RequestScheduler, Scheduler, SchedulerInterface
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
 
 
-def _make_scheduler() -> Scheduler:
-    scheduler = Scheduler()
+def _make_scheduler() -> RequestScheduler:
+    scheduler = RequestScheduler()
     scheduler.initialize(Mock())
     return scheduler
 
@@ -147,6 +147,102 @@ def test_engine_add_req_and_wait_for_response_single_path() -> None:
 
     assert output is expected
     engine.executor.add_req.assert_called_once_with(request)
+
+
+class _StubScheduler(SchedulerInterface):
+    def __init__(self, request: OmniDiffusionRequest, output: DiffusionOutput) -> None:
+        self._request = request
+        self._output = output
+        self.initialized_with = None
+        self._req_id = request.request_ids[0]
+        self._state = None
+        self._scheduled = False
+
+    def initialize(self, od_config) -> None:
+        self.initialized_with = od_config
+
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        assert request is self._request
+        self._state = Mock(req_id=self._req_id, req=request)
+        return self._req_id
+
+    def schedule(self):
+        if self._scheduled or self._state is None:
+            return Mock(req_states=[])
+        self._scheduled = True
+        return Mock(req_states=[self._state])
+
+    def update_from_output(self, sched_output, output: DiffusionOutput) -> set[str]:
+        assert output is self._output
+        return {self._req_id}
+
+    def abort_request(self, req_id: str) -> bool:
+        return False
+
+    def has_requests(self) -> bool:
+        return not self._scheduled
+
+    def get_request_state(self, req_id: str):
+        return self._state
+
+    def pop_request_state(self, req_id: str):
+        return self._state
+
+    def preempt_request(self, req_id: str) -> bool:
+        return False
+
+    def finish_request(self, req_id: str, status) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def test_engine_supports_scheduler_interface_injection() -> None:
+    request = _make_request("engine_iface")
+    expected = DiffusionOutput(output=None)
+    scheduler = _StubScheduler(request, expected)
+
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.scheduler = scheduler
+    engine.executor = Mock()
+    engine.executor.add_req.return_value = expected
+    engine._rpc_lock = threading.Lock()
+
+    output = engine.add_req_and_wait_for_response(request)
+
+    assert output is expected
+    engine.executor.add_req.assert_called_once_with(request)
+
+
+def test_diffusion_engine_initializes_injected_scheduler() -> None:
+    request = _make_request("init")
+    scheduler = _StubScheduler(request, DiffusionOutput(output=None))
+    od_config = Mock(model_class_name="mock_model")
+    fake_executor_cls = Mock(return_value=Mock())
+
+    with (
+        patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func", return_value=None),
+        patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func", return_value=None),
+        patch("vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class", return_value=fake_executor_cls),
+        patch.object(DiffusionEngine, "_dummy_run", return_value=None),
+    ):
+        DiffusionEngine(od_config, scheduler=scheduler)
+
+    assert scheduler.initialized_with is od_config
+    fake_executor_cls.assert_called_once_with(od_config)
+
+
+def test_scheduler_alias_keeps_default_request_scheduler() -> None:
+    scheduler = Scheduler()
+    scheduler.initialize(Mock())
+
+    req_id = scheduler.add_request(_make_request("alias"))
+    sched_output = scheduler.schedule()
+    finished = scheduler.update_from_output(sched_output, DiffusionOutput(output=None))
+
+    assert req_id in finished
+    assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
 
 
 def test_engine_dummy_run_raises_on_output_error() -> None:

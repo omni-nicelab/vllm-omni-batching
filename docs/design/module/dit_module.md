@@ -127,80 +127,83 @@ def step(self, requests: list[OmniDiffusionRequest]):
 
 ## 2. Scheduler
 
-**Location**: `vllm_omni/diffusion/scheduler.py`
+**Location**: `vllm_omni/diffusion/sched/interface.py`, `vllm_omni/diffusion/sched/request_scheduler.py`
 
 ### Architecture
 
-The `Scheduler` is implemented as a **Singleton** pattern to ensure a single coordination point across the system, i.e., only one scheduler instance exists for coordination.
+The diffusion scheduler is a **stateful engine-local component** owned by `DiffusionEngine`. It is responsible only for request lifecycle transitions such as waiting, running, preempted, and finished. IPC, worker broadcast, and result collection are handled by the executor layer rather than the scheduler itself.
 
 ### Key Components
 
-#### 2.1 Message Queue System
+#### 2.1 Scheduler Interface
 
 ```python
-class Scheduler:
-    def initialize(self, od_config: OmniDiffusionConfig):
-        # Broadcast queue: scheduler -> all workers
-        self.mq = MessageQueue(
-            n_reader=od_config.num_gpus,
-            n_local_reader=od_config.num_gpus,
-            local_reader_ranks=list(range(od_config.num_gpus)),
-        )
-
-        # Result queue: rank 0 worker -> scheduler
-        self.result_mq = None  # Initialized later
+class SchedulerInterface(ABC):
+    def initialize(self, od_config: OmniDiffusionConfig) -> None: ...
+    def add_request(self, request: OmniDiffusionRequest) -> str: ...
+    def schedule(self) -> DiffusionSchedulerOutput: ...
+    def update_from_output(
+        self,
+        sched_output: DiffusionSchedulerOutput,
+        output: DiffusionOutput,
+    ) -> set[str]: ...
 ```
 
-**Communication Pattern**:
+**Responsibilities**:
 
-- **Broadcast Queue**: One-to-many communication (scheduler → all workers)
+- **Request Ownership**: Tracks scheduler-owned `req_id` and request state
 
-- **Result Queue**: One-to-one communication (rank 0 → scheduler)
+- **Scheduling Decision**: Selects which request becomes runnable next
 
-- **Shared Memory**: Uses `MessageQueue` (ZMQ-based) for efficient IPC
+- **Lifecycle Update**: Applies executor results back onto scheduler state
 
-#### 2.2 Request Distribution
+- **Implementation Boundary**: Allows additional schedulers, such as future step-level schedulers, behind the same engine contract
+
+#### 2.2 Default RequestScheduler
 
 ```python
-def add_req(self, requests: list[OmniDiffusionRequest]) -> DiffusionOutput:
-    # Broadcast request to all workers
-    self.mq.enqueue(requests)
+class RequestScheduler(SchedulerInterface):
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        state = DiffusionRequestState(req_id=req_id, req=request)
+        self._waiting.append(req_id)
+        return req_id
 
-    # Wait for result from Rank 0
-    output = self.result_mq.dequeue()
-    return output
+    def schedule(self) -> DiffusionSchedulerOutput:
+        if not self._running and self._waiting:
+            req_id = self._waiting.popleft()
+            self._running.append(req_id)
+        return DiffusionSchedulerOutput(...)
+
+    def update_from_output(...) -> set[str]:
+        # Current default semantics: one executor response finishes the request
+        ...
 ```
 
 **Design Features**:
 
-- **Broadcast Model**: All workers receive the same request (for tensor parallelism)
+- **FIFO Request Scheduling**: Requests enter `_waiting` and are promoted to `_running`
 
-- **Single Response**: Only rank 0 sends results back (avoids duplicate outputs)
+- **Single Running Request**: Current default implementation schedules one request at a time
 
-- **Synchronous**: Blocks until result is received (can be made async)
+- **Pluggable Policy**: Future schedulers can reuse the same interface with different completion semantics
 
-#### 2.3 Singleton Pattern
+#### 2.3 Relationship with DiffusionEngine and Executor
 
 ```python
-class Scheduler:
-    _instance = None
-
-    def __new__(cls, *args, **kwargs):
-        if not cls._instance:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-# Global singleton instance
-scheduler = Scheduler()
+class DiffusionEngine:
+    def __init__(self, od_config, scheduler: SchedulerInterface | None = None):
+        self.executor = executor_class(od_config)
+        self.scheduler = scheduler or RequestScheduler()
+        self.scheduler.initialize(od_config)
 ```
 
-**Benefits**:
+**Separation of Concerns**:
 
-- **Single Point of Control**: Ensures consistent state
+- **Scheduler**: Owns request queues and state transitions
 
-- **Easy Access**: Global `scheduler` instance accessible everywhere
+- **Executor**: Owns `MessageQueue`, worker RPC, and result collection
 
-- **Resource Management**: Centralized queue management
+- **Engine**: Orchestrates `add_request → schedule → executor.add_req → update_from_output`
 
 ---
 
@@ -880,8 +883,9 @@ def initialize_model_parallel(
        └─> Model-specific transformations
 
 3. Scheduling
-   └─> scheduler.add_req(requests)
-       └─> Broadcast via MessageQueue to all workers
+   └─> engine.scheduler.add_request(request)
+       └─> engine.scheduler.schedule()
+           └─> engine.executor.add_req(req_state.req)
 
 4. Worker Execution
    └─> WorkerProc.worker_busy_loop()
@@ -896,7 +900,8 @@ def initialize_model_parallel(
 
 5. Result Collection
    └─> Rank 0 sends DiffusionOutput via result queue
-       └─> Scheduler receives and returns
+       └─> executor returns output to engine
+           └─> engine.scheduler.update_from_output(...)
 
 6. Post-processing
    └─> post_process_func(output)

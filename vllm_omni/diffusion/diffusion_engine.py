@@ -18,7 +18,7 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.scheduler import Scheduler
+from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -47,7 +47,11 @@ def supports_audio_output(model_class_name: str) -> bool:
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(
+        self,
+        od_config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ):
         """Initialize the diffusion engine.
 
         Args:
@@ -60,7 +64,7 @@ class DiffusionEngine:
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.scheduler = Scheduler()
+        self.scheduler: SchedulerInterface = scheduler or RequestScheduler()
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.Lock()
 
@@ -185,7 +189,10 @@ class DiffusionEngine:
             return results
 
     @staticmethod
-    def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
+    def make_engine(
+        config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ) -> "DiffusionEngine":
         """Factory method to create a DiffusionEngine instance.
 
         Args:
@@ -194,7 +201,7 @@ class DiffusionEngine:
         Returns:
             An instance of DiffusionEngine.
         """
-        return DiffusionEngine(config)
+        return DiffusionEngine(config, scheduler=scheduler)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
