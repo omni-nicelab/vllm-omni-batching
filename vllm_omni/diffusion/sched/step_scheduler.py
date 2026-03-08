@@ -40,6 +40,10 @@ class StepScheduler(SchedulerInterface):
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._finished_req_ids: set[str] = set()
+        # currently used by vllm_omni/entrypoints/omni_stage.py,
+        # can't be used for real multi-step scheduling without proper architectural changes,
+        # so we keep it fixed at 1 for now.
+        self._max_batch_size: int = 1
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
@@ -78,7 +82,8 @@ class StepScheduler(SchedulerInterface):
         return req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
-        if not self._running and self._waiting:
+        # Schedule waiting requests
+        while self._waiting and len(self._running) < self._max_batch_size:
             req_id = self._waiting.popleft()
             state = self._request_states.get(req_id)
             if state is not None:

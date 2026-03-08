@@ -251,6 +251,7 @@ class TestStepScheduler:
     def setup_method(self) -> None:
         self.scheduler: StepScheduler = StepScheduler()
         self.scheduler.initialize(Mock())
+        self.scheduler._max_batch_size = 1
 
     def test_requires_multiple_success_updates_to_finish(self) -> None:
         request = OmniDiffusionRequest(
@@ -274,6 +275,7 @@ class TestStepScheduler:
         assert request.sampling_params.step_index == 2
 
         third = self.scheduler.schedule()
+        assert [s.req_id for s in third.req_states] == [req_id]
         assert self.scheduler.update_from_output(third, DiffusionOutput(output=None)) == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
         assert request.sampling_params.step_index == 3
@@ -311,6 +313,39 @@ class TestStepScheduler:
         assert [s.req_id for s in fourth.req_states] == [req_id_b]
         assert self.scheduler.update_from_output(fourth, DiffusionOutput(output=None)) == {req_id_b}
 
+    def test_schedule_returns_at_most_one_request_when_multiple_requests_waiting(self) -> None:
+        req_id_a = self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_a"],
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+                request_ids=["a"],
+            )
+        )
+        self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_b"],
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+                request_ids=["b"],
+            )
+        )
+        self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_c"],
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+                request_ids=["c"],
+            )
+        )
+
+        sched_output = self.scheduler.schedule()
+
+        # Current upstream request is already pre-batched, so StepScheduler must
+        # not co-batch multiple requests here. Revisit this assertion if the
+        # upper-layer request shape is refactored for real continuous batching.
+        assert len(sched_output.req_states) <= 1
+        assert sched_output.num_running_reqs <= 1
+        assert [s.req_id for s in sched_output.req_states] == [req_id_a]
+        assert sched_output.num_waiting_reqs == 2
+
     def test_error_output_marks_finished_error(self) -> None:
         req_id = self.scheduler.add_request(
             OmniDiffusionRequest(
@@ -321,6 +356,7 @@ class TestStepScheduler:
         )
 
         sched_output = self.scheduler.schedule()
+        assert [s.req_id for s in sched_output.req_states] == [req_id]
         finished = self.scheduler.update_from_output(sched_output, DiffusionOutput(error="worker failed"))
 
         assert finished == {req_id}
@@ -413,9 +449,11 @@ class TestStepScheduler:
 
         for _ in range(expected_steps - 1):
             sched_output = self.scheduler.schedule()
+            assert [s.req_id for s in sched_output.req_states] == [req_id]
             assert self.scheduler.update_from_output(sched_output, DiffusionOutput(output=None)) == set()
 
         final_output = self.scheduler.schedule()
+        assert [s.req_id for s in final_output.req_states] == [req_id]
         assert self.scheduler.update_from_output(final_output, DiffusionOutput(output=None)) == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
 
