@@ -309,6 +309,7 @@ class DiffusionCacheConfig:
 
 @dataclass
 class OmniDiffusionConfig:
+    max_nuim_reqs: int = 1
     # Model and path configuration (for convenience)
     model: str | None = None
 
@@ -618,6 +619,12 @@ class DiffusionOutput:
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+
+@dataclass
+class StepDiffusionOutput(DiffusionOutput):
+    stimesteps: torch.Tensor | None = None
+    req_id:str = ""
 
 
 class AttentionBackendEnum(enum.Enum):

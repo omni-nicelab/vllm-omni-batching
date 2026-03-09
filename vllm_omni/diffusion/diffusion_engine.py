@@ -10,7 +10,7 @@ from typing import Any
 import PIL.Image
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, StepDiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
@@ -195,6 +195,26 @@ class DiffusionEngine:
             An instance of DiffusionEngine.
         """
         return DiffusionEngine(config)
+
+    def add_req(self, request: OmniDiffusionRequest) -> str:
+        """producer"""
+        target_req_id = self.scheduler.add_request(request)
+        logger.info(f"Request {target_req_id} queued.")
+        return target_req_id
+
+    def wait_for_reponse(self) -> list[DiffusionOutput]:
+        """consumer"""
+        output_list: list[DiffusionOutput] = []
+
+        while not output_list:
+            sched_output = self.scheduler.schedule()
+            if sched_output.req_states: # if have sched_output
+                outputs: list[StepDiffusionOutput] = self.executor.add_req(
+                    [req_stat.req for req_stat in sched_output.req_states]
+                )  # return single-step results
+                finished_req_ids, finished_reqs = self.scheduler.update_from_output(sched_output, outputs)
+                output_list.extend(finished_reqs)
+        return output_list
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:

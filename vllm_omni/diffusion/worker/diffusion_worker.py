@@ -27,6 +27,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     OmniDiffusionConfig,
+    StepDiffusionOutput,
 )
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -176,7 +177,9 @@ class DiffusionWorker:
         """Stop profiling and return the result dictionary."""
         return CurrentProfiler.stop()
 
-    def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self, req: OmniDiffusionRequest | list[OmniDiffusionRequest], od_config: OmniDiffusionConfig
+    ) -> DiffusionOutput | list[StepDiffusionOutput]:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
@@ -370,7 +373,7 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: DiffusionOutput):
+    def return_result(self, output: DiffusionOutput | list[StepDiffusionOutput]):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
             self.result_mq.enqueue(output)

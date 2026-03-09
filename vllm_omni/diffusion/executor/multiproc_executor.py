@@ -164,20 +164,22 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         return processes, result_handle
 
-    def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+    def add_req(
+        self, requests: OmniDiffusionRequest | list[OmniDiffusionRequest]
+    ) -> DiffusionOutput | list[DiffusionOutput]:
         self._ensure_open()
         deadline = None
-        rpc_request = {
+        rpc_requests = {
             "type": "rpc",
             "method": "generate",
-            "args": (request,),
+            "args": (requests,),
             "kwargs": {},
             "output_rank": 0,
             "exec_all_ranks": True,
         }
 
         try:
-            self._broadcast_mq.enqueue(rpc_request)
+            self._broadcast_mq.enqueue(rpc_requests)
 
             try:
                 response = self._result_mq.dequeue(timeout=deadline)

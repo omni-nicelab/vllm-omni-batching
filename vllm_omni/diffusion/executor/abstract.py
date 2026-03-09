@@ -59,7 +59,9 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
-    def add_req(self, requests: OmniDiffusionRequest) -> DiffusionOutput:
+    def add_req(
+        self, requests: OmniDiffusionRequest | list[OmniDiffusionRequest]
+    ) -> DiffusionOutput | list[DiffusionOutput]:
         """Add requests to the execution queue."""
         pass
 
