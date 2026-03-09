@@ -17,6 +17,7 @@ from vllm_omni.diffusion.sched import (
     SchedulerInterface,
     StepScheduler,
 )
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion]
@@ -27,6 +28,21 @@ def _make_request(req_id: str) -> OmniDiffusionRequest:
         prompts=[f"prompt_{req_id}"],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
         request_ids=[req_id],
+    )
+
+
+def _make_step_output(
+    req_id: str,
+    step_index: int,
+    *,
+    finished: bool = False,
+    error: str | None = None,
+) -> RunnerOutput:
+    return RunnerOutput(
+        req_id=req_id,
+        step_index=step_index,
+        finished=finished,
+        result=DiffusionOutput(error=error) if error is not None else None,
     )
 
 
@@ -264,19 +280,22 @@ class TestStepScheduler:
 
         first = self.scheduler.schedule()
         assert [s.req_id for s in first.req_states] == [req_id]
-        assert self.scheduler.update_from_output(first, DiffusionOutput(output=None)) == set()
+        assert self.scheduler.update_from_output(first, _make_step_output(req_id, step_index=1)) == set()
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.RUNNING
         assert request.sampling_params.step_index == 1
         assert self.scheduler.has_requests() is True
 
         second = self.scheduler.schedule()
         assert [s.req_id for s in second.req_states] == [req_id]
-        assert self.scheduler.update_from_output(second, DiffusionOutput(output=None)) == set()
+        assert self.scheduler.update_from_output(second, _make_step_output(req_id, step_index=2)) == set()
         assert request.sampling_params.step_index == 2
 
         third = self.scheduler.schedule()
         assert [s.req_id for s in third.req_states] == [req_id]
-        assert self.scheduler.update_from_output(third, DiffusionOutput(output=None)) == {req_id}
+        assert self.scheduler.update_from_output(
+            third,
+            _make_step_output(req_id, step_index=3, finished=True),
+        ) == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
         assert request.sampling_params.step_index == 3
         assert self.scheduler.has_requests() is False
@@ -299,19 +318,25 @@ class TestStepScheduler:
 
         first = self.scheduler.schedule()
         assert [s.req_id for s in first.req_states] == [req_id_a]
-        assert self.scheduler.update_from_output(first, DiffusionOutput(output=None)) == set()
+        assert self.scheduler.update_from_output(first, _make_step_output(req_id_a, step_index=1)) == set()
 
         second = self.scheduler.schedule()
         assert [s.req_id for s in second.req_states] == [req_id_b]
-        assert self.scheduler.update_from_output(second, DiffusionOutput(output=None)) == set()
+        assert self.scheduler.update_from_output(second, _make_step_output(req_id_b, step_index=1)) == set()
 
         third = self.scheduler.schedule()
         assert [s.req_id for s in third.req_states] == [req_id_a]
-        assert self.scheduler.update_from_output(third, DiffusionOutput(output=None)) == {req_id_a}
+        assert self.scheduler.update_from_output(
+            third,
+            _make_step_output(req_id_a, step_index=2, finished=True),
+        ) == {req_id_a}
 
         fourth = self.scheduler.schedule()
         assert [s.req_id for s in fourth.req_states] == [req_id_b]
-        assert self.scheduler.update_from_output(fourth, DiffusionOutput(output=None)) == {req_id_b}
+        assert self.scheduler.update_from_output(
+            fourth,
+            _make_step_output(req_id_b, step_index=2, finished=True),
+        ) == {req_id_b}
 
     def test_schedule_returns_at_most_one_request_when_multiple_requests_waiting(self) -> None:
         req_id_a = self.scheduler.add_request(
@@ -357,7 +382,10 @@ class TestStepScheduler:
 
         sched_output = self.scheduler.schedule()
         assert [s.req_id for s in sched_output.req_states] == [req_id]
-        finished = self.scheduler.update_from_output(sched_output, DiffusionOutput(error="worker failed"))
+        finished = self.scheduler.update_from_output(
+            sched_output,
+            _make_step_output(req_id, step_index=0, finished=True, error="worker failed"),
+        )
 
         assert finished == {req_id}
         state = self.scheduler.get_request_state(req_id)
@@ -400,7 +428,7 @@ class TestStepScheduler:
         req_id = self.scheduler.add_request(request)
 
         first = self.scheduler.schedule()
-        assert self.scheduler.update_from_output(first, DiffusionOutput(output=None)) == set()
+        assert self.scheduler.update_from_output(first, _make_step_output(req_id, step_index=1)) == set()
         assert request.sampling_params.step_index == 1
 
         second = self.scheduler.schedule()
@@ -450,11 +478,21 @@ class TestStepScheduler:
         for _ in range(expected_steps - 1):
             sched_output = self.scheduler.schedule()
             assert [s.req_id for s in sched_output.req_states] == [req_id]
-            assert self.scheduler.update_from_output(sched_output, DiffusionOutput(output=None)) == set()
+            next_step = request.sampling_params.step_index + 1
+            assert (
+                self.scheduler.update_from_output(
+                    sched_output,
+                    _make_step_output(req_id, step_index=next_step),
+                )
+                == set()
+            )
 
         final_output = self.scheduler.schedule()
         assert [s.req_id for s in final_output.req_states] == [req_id]
-        assert self.scheduler.update_from_output(final_output, DiffusionOutput(output=None)) == {req_id}
+        assert self.scheduler.update_from_output(
+            final_output,
+            _make_step_output(req_id, step_index=expected_steps, finished=True),
+        ) == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
 
     @pytest.mark.parametrize(

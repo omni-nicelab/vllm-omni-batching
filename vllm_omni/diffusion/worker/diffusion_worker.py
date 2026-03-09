@@ -37,7 +37,9 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.profiler import CurrentProfiler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
@@ -187,6 +189,19 @@ class DiffusionWorker:
                     raise
                 logger.warning("LoRA activation skipped: %s", exc)
         return self.model_runner.execute_model(req)
+
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one diffusion step by delegating to the model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        if self.lora_manager is not None:
+            # Step mode does not support LoRA yet. Clear any previously active
+            # adapter first so worker-local LoRA state cannot leak in.
+            self.lora_manager.set_active_adapter(None)
+
+        if any(req_state.req.sampling_params.lora_request is not None for req_state in scheduler_output.req_states):
+            raise ValueError("Step mode does not support LoRA yet.")
+
+        return self.model_runner.execute_stepwise(scheduler_output)
 
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
@@ -370,7 +385,7 @@ class WorkerProc:
         )
         return wrapper
 
-    def return_result(self, output: DiffusionOutput):
+    def return_result(self, output: object):
         """Reply to client, only on rank 0."""
         if self.result_mq is not None:
             self.result_mq.enqueue(output)
@@ -607,6 +622,10 @@ class WorkerWrapperBase:
             DiffusionOutput with generated results
         """
         return self.worker.execute_model(reqs, od_config)
+
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one diffusion step."""
+        return self.worker.execute_stepwise(scheduler_output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """

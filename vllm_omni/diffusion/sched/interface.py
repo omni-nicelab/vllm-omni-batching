@@ -7,8 +7,9 @@ import enum
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -65,7 +66,7 @@ class SchedulerInterface(ABC):
         """Run one scheduling cycle."""
 
     @abstractmethod
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         """Update scheduler state from executor output."""
 
     @abstractmethod

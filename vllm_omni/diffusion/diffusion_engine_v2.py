@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import PIL.Image
@@ -20,12 +21,36 @@ from vllm_omni.diffusion.registry import (
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+_ENGINE_EVENT_ADD = "ADD"
+_ENGINE_EVENT_ABORT = "ABORT"
+_ENGINE_EVENT_SHUTDOWN = "SHUTDOWN"
+
+_ENGINE_OUTPUT_PROGRESS = "PROGRESS"
+_ENGINE_OUTPUT_FINAL = "FINAL"
+_ENGINE_OUTPUT_ABORTED = "ABORTED"
+_ENGINE_OUTPUT_ERROR = "ERROR"
+
+
+@dataclass
+class DiffusionEngineInput:
+    event_type: str
+    request_id: str | None = None
+    request: OmniDiffusionRequest | None = None
+
+
+@dataclass
+class DiffusionEngineOutput:
+    event_type: str
+    request_id: str
+    request: OmniDiffusionRequest | None = None
+    runner_output: RunnerOutput | None = None
+    error: str | None = None
 
 
 def supports_image_input(model_class_name: str) -> bool:
@@ -67,18 +92,18 @@ class DiffusionEngine:
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.step_execution = bool(getattr(od_config, "step_execution", False))
         self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
+            StepScheduler() if od_config.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.RLock()
+        self.execute = self.executor.execute_step if od_config.step_execution else self.executor.execute_request
+
+        self.input_queue: queue.Queue[DiffusionEngineInput] = queue.Queue()
+        self.output_queue: queue.Queue[DiffusionEngineOutput] = queue.Queue()
         self.abort_queue: queue.Queue[str] = queue.Queue()
-        self.execute_fn = (
-            self.executor.execute_step
-            if self.step_execution
-            else self.executor.execute_request
-        )
+        self._shutdown = threading.Event()
+        self._busyloop_thread: threading.Thread | None = None
 
         try:
             self._dummy_run()
@@ -215,42 +240,163 @@ class DiffusionEngine:
         """
         return DiffusionEngine(config, scheduler=scheduler)
 
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        if self.pre_process_func is not None:
+            request = self.pre_process_func(request)
+
+        request_id = self._get_request_id(request)
+        self.input_queue.put(
+            DiffusionEngineInput(
+                event_type=_ENGINE_EVENT_ADD,
+                request_id=request_id,
+                request=request,
+            )
+        )
+        return request_id
+
+    def get_output(self, timeout: float | None = None) -> DiffusionEngineOutput:
+        if timeout is None:
+            return self.output_queue.get()
+        return self.output_queue.get(timeout=timeout)
+
+    def start_background_loop(self) -> None:
+        if self._busyloop_thread is not None and self._busyloop_thread.is_alive():
+            return
+
+        self._shutdown.clear()
+        self._busyloop_thread = threading.Thread(
+            target=self.run_busy_loop,
+            name="DiffusionEngineCore",
+            daemon=True,
+        )
+        self._busyloop_thread.start()
+
+    def run_busy_loop(self) -> None:
+        while True:
+            self._drain_abort_queue()
+            self._drain_input_queue()
+
+            if self._shutdown.is_set() and not self.scheduler.has_requests():
+                break
+
+            if not self.scheduler.has_requests():
+                time.sleep(0.001)
+                continue
+
+            sched_output = self.scheduler.schedule()
+            if not sched_output.req_states:
+                if self._shutdown.is_set() and not self.scheduler.has_requests():
+                    break
+                time.sleep(0.001)
+                continue
+
+            runner_output = self._execute_scheduler_output(sched_output)
+            finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+            self._publish_output_events(sched_output, runner_output, finished_req_ids)
+
+    def _drain_input_queue(self) -> None:
+        while True:
+            try:
+                item = self.input_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            if item.event_type == _ENGINE_EVENT_ADD and item.request is not None:
+                self.scheduler.add_request(item.request)
+            elif item.event_type == _ENGINE_EVENT_SHUTDOWN:
+                self._shutdown.set()
+
+    def _drain_abort_queue(self) -> None:
+        while True:
+            try:
+                request_id = self.abort_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            req_state = self.scheduler.get_request_state(request_id)
+            if req_state is None:
+                continue
+
+            if self.scheduler.abort_request(request_id):
+                self.output_queue.put(
+                    DiffusionEngineOutput(
+                        event_type=_ENGINE_OUTPUT_ABORTED,
+                        request_id=request_id,
+                        request=req_state.req,
+                    )
+                )
+                self.scheduler.pop_request_state(request_id)
+
+    def _execute_scheduler_output(self, sched_output) -> RunnerOutput:
+        try:
+            with self._rpc_lock:
+                runner_output = self.execute(sched_output)
+        except Exception as exc:
+            req_id = sched_output.req_states[0].req_id if sched_output.req_states else ""
+            logger.error("Execution failed for diffusion request %s", req_id, exc_info=True)
+            runner_output = RunnerOutput(
+                req_id=req_id,
+                finished=True,
+                result=DiffusionOutput(error=str(exc)),
+            )
+
+        runner_output.error = runner_output.result.error if runner_output.result is not None else None
+        return runner_output
+
+    def _publish_output_events(
+        self,
+        sched_output,
+        runner_output: RunnerOutput,
+        finished_req_ids: set[str],
+    ) -> None:
+        for req_state in sched_output.req_states:
+            request_id = req_state.req_id
+            event_type = _ENGINE_OUTPUT_PROGRESS
+            error = getattr(runner_output, "error", None)
+
+            if error is not None:
+                event_type = _ENGINE_OUTPUT_ERROR
+            elif request_id in finished_req_ids or runner_output.finished:
+                event_type = _ENGINE_OUTPUT_FINAL
+
+            self.output_queue.put(
+                DiffusionEngineOutput(
+                    event_type=event_type,
+                    request_id=request_id,
+                    request=req_state.req,
+                    runner_output=runner_output,
+                    error=error,
+                )
+            )
+
+            if event_type in {_ENGINE_OUTPUT_FINAL, _ENGINE_OUTPUT_ERROR}:
+                self.scheduler.pop_request_state(request_id)
+
+    @staticmethod
+    def _get_request_id(request: OmniDiffusionRequest) -> str:
+        if request.request_ids:
+            return request.request_ids[0]
+        request_id = f"req_{int(time.time() * 1_000_000)}"
+        request.request_ids = [request_id]
+        return request_id
+
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
             target_req_id = self.scheduler.add_request(request)
 
             while True:
-                # check abort queue
-                self._process_aborts_queue()
                 sched_output = self.scheduler.schedule()
                 if not sched_output.req_states:
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
 
-                req_state = sched_output.req_states[0]
-                try:
-                    output = self.execute_fn(sched_output)
-                except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", req_state.req_id, exc_info=True)
-                    output = RunnerOutput(
-                        req_id=req_state.req_id,
-                        step_index=None,
-                        finished=True,
-                        result=DiffusionOutput(error=str(exc)),
-                    )
-                    
-                # check abort queue
-                self._process_aborts_queue()
-
-                finished_req_ids = self.scheduler.update_from_output(sched_output, output)
+                runner_output = self._execute_scheduler_output(sched_output)
+                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
                 if target_req_id in finished_req_ids:
-                    state = self.scheduler.get_request_state(target_req_id)
                     self.scheduler.pop_request_state(target_req_id)
-                    if state is not None and state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-                        return DiffusionOutput(error=f"Request {target_req_id} aborted.")
-                    if output.result is not None:
-                        return output.result
+                    if runner_output.result is not None:
+                        return runner_output.result
                     return DiffusionOutput(error="Diffusion execution finished without a final output.")
 
     def start_profile(self, trace_filename: str | None = None) -> None:
@@ -453,6 +599,10 @@ class DiffusionEngine:
                 self._rpc_lock.release()
 
     def close(self) -> None:
+        self._shutdown.set()
+        self.input_queue.put(DiffusionEngineInput(event_type=_ENGINE_EVENT_SHUTDOWN))
+        if self._busyloop_thread is not None and self._busyloop_thread.is_alive():
+            self._busyloop_thread.join(timeout=1.0)
         if hasattr(self, "scheduler"):
             self.scheduler.close()
         if hasattr(self, "executor"):
@@ -466,17 +616,3 @@ class DiffusionEngine:
 
         for req_id in request_ids:
             self.abort_queue.put(req_id)
-
-    def _process_aborts_queue(self):
-        if not self.abort_queue.empty():
-            request_ids = []
-            while not self.abort_queue.empty():
-                ids = self.abort_queue.get_nowait()
-                # Should be a list here, but also handle string just in case.
-                request_ids.extend((ids,) if isinstance(ids, str) else ids)
-            # More efficient to abort all as a single batch.
-            self._abort_requests(request_ids)
-    
-    def _abort_requests(self, request_id):
-        # TODO:support finish_request function
-        self.scheduler.abort_request(request_id, DiffusionRequestStatus.FINISHED_ABORTED)

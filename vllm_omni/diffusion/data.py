@@ -453,6 +453,9 @@ class OmniDiffusionConfig:
     # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)
     quantization: str | None = None
     quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
+    
+    # step mode settings
+    step_execution: bool = False
 
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """

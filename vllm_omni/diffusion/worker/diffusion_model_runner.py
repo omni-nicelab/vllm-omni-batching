@@ -31,7 +31,8 @@ from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.utils import DiffusionRequestState
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 
@@ -68,10 +69,8 @@ class DiffusionModelRunner:
         self.cache_backend = None
         self.offload_backend = None
 
-        # Cache for per-batch stepwise state.
-        # In current full-run mode entries are transient, but this cache is
-        # kept to simplify migration to continuous batching.
-        self.state_cache: dict[tuple[str, ...], DiffusionRequestState] = {}
+        # Cache for per-request stepwise state.
+        self.state_cache: dict[str, DiffusionRequestState] = {}
 
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
@@ -224,10 +223,7 @@ class DiffusionModelRunner:
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
-                    if supports_step_execution(self.pipeline):
-                        output = self.execute_stepwise(req)
-                    else:
-                        output = self.pipeline.forward(req)
+                    output = self.pipeline.forward(req)
 
             # NOTE:
             if (
@@ -244,50 +240,98 @@ class DiffusionModelRunner:
     # Step-wise execution
     # ------------------------------------------------------------------
 
-    def _update_states(self, req: OmniDiffusionRequest) -> tuple[tuple[str, ...], DiffusionRequestState]:
-        """Create a fresh shared DiffusionRequestState for the current batch."""
-        request_ids = req.request_ids or [f"diffusion-{id(req)}-{i}" for i in range(len(req.prompts))]
+    def supports_step_mode(self) -> bool:
+        """Return whether current pipeline supports step execution."""
+        return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> DiffusionRequestState:
+        """Step-before update: cleanup finished requests and get/create one running state."""
+        for req_id in scheduler_output.finished_req_ids:
+            self.state_cache.pop(req_id, None)
+
+        req_states = scheduler_output.req_states
+        if len(req_states) != 1:
+            raise ValueError(f"Step mode currently supports batch_size=1, but got {len(req_states)} req_states.")
+
+        # TODO: remove req state from SchedulerOutput
+        # Stepwise mode currently trusts runner-owned cached state more than
+        # re-validating scheduler-provided request content on every step.
+        sched_req_state = req_states[0]
+        req_id = sched_req_state.req_id
+        if req_id in self.state_cache:
+            return self.state_cache[req_id]
+
+        req = sched_req_state.req
+        request_ids = req.request_ids or [req_id]
         if len(request_ids) != len(req.prompts):
             raise ValueError(
                 f"request_ids length ({len(request_ids)}) does not match prompts length ({len(req.prompts)})"
             )
 
-        # Key by all request IDs to avoid collisions for different batches.
-        batch_key = tuple(request_ids)
-
-        # Full-run mode has no resumable in-flight states; clear stale cache.
-        # TODO: reuse cached state by batch_key.
-        self.state_cache.clear()
-
         state = DiffusionRequestState(
-            req_id=request_ids[0],
+            req_id=req_id,
             sampling=copy.deepcopy(req.sampling_params),
             prompts=req.prompts,
         )
-        self.state_cache[batch_key] = state
-        return batch_key, state
+        self.state_cache[req_id] = state
+        return state
 
-    def _update_states_after(self, batch_key: tuple[str, ...]) -> None:
-        """Post-execution bookkeeping for full-run mode."""
-        # TODO: evict only finished/aborted states.
-        self.state_cache.pop(batch_key, None)
+    def _update_states_after(self, state: DiffusionRequestState, finished: bool) -> None:
+        """Step-after update: clear cached state for completed request."""
+        if finished:
+            self.state_cache.pop(state.req_id, None)
 
-    def execute_stepwise(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        """Execute stepwise inference with a shared batch state."""
-        batch_key, state = self._update_states(req)
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one step for one scheduled request and return runner output."""
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not self.supports_step_mode():
+            raise ValueError("Current pipeline does not support step execution.")
+        # Stepwise mode only supports the basic state-driven denoise path for now.
+        # Request-mode extras such as cache backends, KV transfer, editing inputs,
+        # and similar features are not supported here yet.
+        if self.od_config.cache_backend not in (None, "none"):
+            raise ValueError("Step mode does not support cache_backend yet.")
 
-        try:
-            self.pipeline.prepare_encode(state)
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            state = self._update_states(scheduler_output)
 
-            for _i, _t in enumerate(state.timesteps):
+            if state.new_request:
+                # TODO: support kv manager recv
+                # TODO: support cache backend
+                if state.sampling.generator is None and state.sampling.seed is not None:
+                    if state.sampling.generator_device is not None:
+                        gen_device = state.sampling.generator_device
+                    elif self.device.type == "cpu":
+                        gen_device = "cpu"
+                    else:
+                        gen_device = self.device
+                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+
+            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                # step0/new request: encode
+                if state.new_request:
+                    self.pipeline.prepare_encode(state)
+
                 noise_pred = self.pipeline.denoise_step(state)
+                finished = False
+                if noise_pred is None:
+                    finished = True
+                    result = DiffusionOutput(error="stepwise denoise returned None")
+                else:
+                    self.pipeline.step_scheduler(state, noise_pred)
+                    finished = state.denoise_completed
+                    if finished:
+                        result = self.pipeline.post_decode(state)
+                    else:
+                        result = None
 
-                # TODO: continuous batching should step per-request state.
-                self.pipeline.step_scheduler(state, noise_pred)
+                self._update_states_after(state, finished)
 
-            output = self.pipeline.post_decode(state)
-        finally:
-            self._update_states_after(batch_key)
-
-        return output
+                return RunnerOutput(
+                    req_id=state.req_id,
+                    step_index=state.step_index,
+                    finished=finished,
+                    result=result,
+                )

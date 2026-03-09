@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -87,3 +88,24 @@ class DiffusionRequestState:
         if total_steps == 0:
             return False
         return self.step_index >= total_steps
+
+    @property
+    def new_request(self) -> bool:
+        # TODO: this is only an approximation for current stepwise mode.
+        # A real "new request" signal should eventually come from scheduler/runner state transitions.
+        return self.step_index == 0 or self.timesteps is None
+
+
+@dataclass
+class RunnerOutput:
+    """Output of a single denoising step for a request.
+
+    NOTE: `latents` may be None when returned through IPC to avoid
+    serialization overhead. The actual latents are kept in Worker's
+    _request_state_cache.
+    """
+
+    req_id: str
+    step_index: int | None = None
+    finished: bool = False
+    result: DiffusionOutput | None = None
