@@ -251,10 +251,7 @@ class DiffusionModelRunner:
 
         req_states = scheduler_output.req_states
         if len(req_states) != 1:
-            raise ValueError(
-                "Step mode currently supports batch_size=1, "
-                f"but got {len(req_states)} req_states."
-            )
+            raise ValueError(f"Step mode currently supports batch_size=1, but got {len(req_states)} req_states.")
 
         # TODO: remove req state from SchedulerOutput
         # Stepwise mode currently trusts runner-owned cached state more than
@@ -295,15 +292,14 @@ class DiffusionModelRunner:
         if self.od_config.cache_backend not in (None, "none"):
             raise ValueError("Step mode does not support cache_backend yet.")
 
-
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
             state = self._update_states(scheduler_output)
-            
+
             if state.new_request:
-                # TODO: support kv manager recv 
-                # TODO: support cache backend 
+                # TODO: support kv manager recv
+                # TODO: support cache backend
                 if state.sampling.generator is None and state.sampling.seed is not None:
                     if state.sampling.generator_device is not None:
                         gen_device = state.sampling.generator_device

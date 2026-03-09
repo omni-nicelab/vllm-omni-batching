@@ -10,7 +10,7 @@ from typing import Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestState,
@@ -18,6 +18,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     SchedulerInterface,
 )
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
@@ -109,32 +110,41 @@ class StepScheduler(SchedulerInterface):
         self._finished_req_ids.clear()
         return scheduler_output
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_req_ids = {state.req_id for state in sched_output.req_states}
         if not scheduled_req_ids:
             return set()
 
         completed_req_ids: set[str] = set()
+        output_error = output.result.error if output.result is not None else None
         for req_id in scheduled_req_ids:
             state = self._request_states.get(req_id)
             progress = self._request_progress.get(req_id)
             if state is None or progress is None:
                 continue
 
-            if output.error:
+            if output_error is not None:
                 state.status = DiffusionRequestStatus.FINISHED_ERROR
-                state.error = output.error
+                state.error = output_error
                 completed_req_ids.add(req_id)
                 continue
 
-            progress.current_step += 1
-            state.req.sampling_params.step_index = progress.current_step
-            state.error = None
+            if output.step_index is None:
+                logger.warning("Received RunnerOutput with no step_index for request %s, treating as error", req_id)
+                state.status = DiffusionRequestStatus.FINISHED_ERROR
+                state.error = "Missing step_index in RunnerOutput"
+                completed_req_ids.add(req_id)
+                continue
 
             # We assume that the decoding stage is executed immediately after the denoising stage completes.
-            if progress.current_step >= progress.total_steps:
+            progress.current_step = output.step_index
+            state.req.sampling_params.step_index = output.step_index
+            if output.finished:
                 state.status = DiffusionRequestStatus.FINISHED_COMPLETED
+                state.error = None
                 completed_req_ids.add(req_id)
+            else:
+                state.error = None
 
         if completed_req_ids:
             self._finished_req_ids |= completed_req_ids
