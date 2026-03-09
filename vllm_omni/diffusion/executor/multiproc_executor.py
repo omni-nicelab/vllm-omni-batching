@@ -11,7 +11,9 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker import WorkerProc
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
@@ -198,6 +200,62 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             logger.error(f"Generate call failed: {e}")
             raise
 
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Adapt request-mode scheduler output to worker execute_model RPC."""
+        self._ensure_open()
+        if len(scheduler_output.req_states) != 1:
+            raise ValueError(
+                "Request mode currently supports batch_size=1, "
+                f"but got {len(scheduler_output.req_states)} req_states."
+            )
+
+        req_state = scheduler_output.req_states[0]
+        result = self.collective_rpc(
+            "execute_model",
+            args=(req_state.req, self.od_config),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, DiffusionOutput):
+            raise RuntimeError(
+                f"Unexpected response type for execute_request: {type(result)!r}"
+            )
+
+        return RunnerOutput(
+            req_id=req_state.req_id,
+            step_index=None,
+            finished=True,
+            result=result,
+        )
+
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Forward step-mode scheduler output to worker execute_stepwise RPC."""
+        self._ensure_open()
+        result = self.collective_rpc(
+            "execute_stepwise",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+
+        if isinstance(result, RunnerOutput):
+            return result
+        # TODO: Remove this fallback; DiffusionOutput cannot faithfully represent
+        # failed multi-request step batches.
+        if isinstance(result, DiffusionOutput):
+            req_states = scheduler_output.req_states
+            req_id = req_states[0].req_id if req_states else ""
+            return RunnerOutput(
+                req_id=req_id,
+                step_index=None,
+                finished=True,
+                result=result,
+            )
+        else:
+            raise RuntimeError(
+                f"Unexpected response type for execute_step: {type(result)!r}"
+            )
+
     def collective_rpc(
         self,
         method: str,
@@ -205,6 +263,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         self._ensure_open()
 
@@ -218,6 +277,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "args": args,
             "kwargs": kwargs,
             "output_rank": unique_reply_rank,
+            "exec_all_ranks": exec_all_ranks,
         }
 
         try:

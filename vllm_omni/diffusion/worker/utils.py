@@ -105,7 +105,7 @@ class RunnerOutput:
     """
 
     req_id: str
-    step_index: int
+    step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
     
