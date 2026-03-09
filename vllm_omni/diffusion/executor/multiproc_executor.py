@@ -166,7 +166,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         self._ensure_open()
-        deadline = None
         rpc_request = {
             "type": "rpc",
             "method": "generate",
@@ -178,13 +177,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         try:
             self._broadcast_mq.enqueue(rpc_request)
-
-            try:
-                response = self._result_mq.dequeue(timeout=deadline)
-            except zmq.error.Again as exc:
-                raise TimeoutError("Generate call timed out.") from exc
-            except TimeoutError as exc:
-                raise TimeoutError("Generate call timed out.") from exc
+            response = self._result_mq.dequeue()
 
             if isinstance(response, dict) and response.get("status") == "error":
                 raise RuntimeError(
