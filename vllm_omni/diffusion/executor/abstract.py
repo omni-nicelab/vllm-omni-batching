@@ -66,16 +66,12 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
-    def execute_request(
-        self, scheduler_output: DiffusionSchedulerOutput
-    ) -> RunnerOutput:
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
         """Execute request-mode work from a scheduler output."""
         pass
 
     @abstractmethod
-    def execute_step(
-        self, scheduler_output: DiffusionSchedulerOutput
-    ) -> RunnerOutput:
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
         """Execute step-mode work from a scheduler output."""
         pass
 
