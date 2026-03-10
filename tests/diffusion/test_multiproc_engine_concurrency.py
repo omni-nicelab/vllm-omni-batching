@@ -66,7 +66,7 @@ def _make_engine(num_gpus: int = 1):
     sched.initialize(Mock())
     engine.scheduler = sched
     engine.executor = executor
-    engine._rpc_lock = threading.Lock()
+    engine._rpc_lock = threading.RLock()
     return engine, executor, req_q, res_q
 
 

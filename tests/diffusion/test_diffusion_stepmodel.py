@@ -102,7 +102,7 @@ def _make_runner():
 def _make_scheduler_output(req, req_id="req-1", step_id=0, finished_req_ids=None):
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        req_states=[SchedulerRequestState(req_id=req_id, req=req)],
+        req_states=[SchedulerRequestState(sched_req_id=req_id, req=req)],
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
         num_running_reqs=1,
         num_waiting_reqs=0,
@@ -140,7 +140,7 @@ class _AbortAwareScheduler(SchedulerInterface):
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         req_id = request.request_ids[0]
-        self._state = SchedulerRequestState(req_id=req_id, req=request)
+        self._state = SchedulerRequestState(sched_req_id=req_id, req=request)
         self._scheduled = False
         return req_id
 
@@ -167,12 +167,12 @@ class _AbortAwareScheduler(SchedulerInterface):
         if self._state is None:
             return set()
         if self._state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-            self._finished_req_ids.add(self._state.req_id)
-            return {self._state.req_id}
+            self._finished_req_ids.add(self._state.sched_req_id)
+            return {self._state.sched_req_id}
         return set()
 
     def abort_request(self, req_id: str) -> bool:
-        if self._state is None or self._state.req_id != req_id:
+        if self._state is None or self._state.sched_req_id != req_id:
             return False
         self._state.status = DiffusionRequestStatus.FINISHED_ABORTED
         self._finished_req_ids.add(req_id)
@@ -182,12 +182,12 @@ class _AbortAwareScheduler(SchedulerInterface):
         return self._state is not None and self._state.status < DiffusionRequestStatus.FINISHED_COMPLETED
 
     def get_request_state(self, req_id: str):
-        if self._state is not None and self._state.req_id == req_id:
+        if self._state is not None and self._state.sched_req_id == req_id:
             return self._state
         return None
 
     def pop_request_state(self, req_id: str):
-        if self._state is not None and self._state.req_id == req_id:
+        if self._state is not None and self._state.sched_req_id == req_id:
             state, self._state = self._state, None
             return state
         return None

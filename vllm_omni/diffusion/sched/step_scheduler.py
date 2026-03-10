@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -56,7 +55,7 @@ class StepScheduler(SchedulerInterface):
         self._finished_req_ids.clear()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
-        req_id = self._make_req_id(request)
+        req_id = self._make_sched_req_id(request)
         total_steps = self._get_total_steps(request)
         if total_steps <= 0:
             raise ValueError(f"Diffusion request {req_id} must have positive total_steps, got {total_steps}")
@@ -69,7 +68,7 @@ class StepScheduler(SchedulerInterface):
             )
 
         request.sampling_params.step_index = current_step
-        state = DiffusionRequestState(req_id=req_id, req=request)
+        state = DiffusionRequestState(sched_req_id=req_id, req=request)
         self._request_states[req_id] = state
         self._request_progress[req_id] = _StepProgress(current_step=current_step, total_steps=total_steps)
         self._waiting.append(req_id)
@@ -111,7 +110,7 @@ class StepScheduler(SchedulerInterface):
         return scheduler_output
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
-        scheduled_req_ids = {state.req_id for state in sched_output.req_states}
+        scheduled_req_ids = {state.sched_req_id for state in sched_output.req_states}
         if not scheduled_req_ids:
             return set()
 
@@ -212,19 +211,6 @@ class StepScheduler(SchedulerInterface):
         self._waiting.clear()
         self._running.clear()
         self._finished_req_ids.clear()
-
-    def _make_req_id(self, request: OmniDiffusionRequest) -> str:
-        if request.request_ids:
-            base = request.request_ids[0]
-        else:
-            base = f"req_{uuid.uuid4().hex[:8]}"
-
-        req_id = base
-        suffix = 1
-        while req_id in self._request_states:
-            req_id = f"{base}#{suffix}"
-            suffix += 1
-        return req_id
 
     def _get_total_steps(self, request: OmniDiffusionRequest) -> int:
         sampling = request.sampling_params

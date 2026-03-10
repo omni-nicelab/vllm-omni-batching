@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import uuid
 from collections import deque
 
 from vllm.logger import init_logger
@@ -41,8 +40,8 @@ class RequestScheduler(SchedulerInterface):
         self._finished_req_ids.clear()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
-        req_id = self._make_req_id(request)
-        state = DiffusionRequestState(req_id=req_id, req=request)
+        req_id = self._make_sched_req_id(request)
+        state = DiffusionRequestState(sched_req_id=req_id, req=request)
         self._request_states[req_id] = state
         self._waiting.append(req_id)
         logger.debug("Scheduler add_request: %s (waiting=%d)", req_id, len(self._waiting))
@@ -75,7 +74,7 @@ class RequestScheduler(SchedulerInterface):
         return scheduler_output
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
-        scheduled_req_ids = {state.req_id for state in sched_output.req_states}
+        scheduled_req_ids = {state.sched_req_id for state in sched_output.req_states}
         if not scheduled_req_ids:
             return set()
 
@@ -151,16 +150,3 @@ class RequestScheduler(SchedulerInterface):
         self._waiting.clear()
         self._running.clear()
         self._finished_req_ids.clear()
-
-    def _make_req_id(self, request: OmniDiffusionRequest) -> str:
-        if request.request_ids:
-            base = request.request_ids[0]
-        else:
-            base = f"req_{uuid.uuid4().hex[:8]}"
-
-        req_id = base
-        suffix = 1
-        while req_id in self._request_states:
-            req_id = f"{base}#{suffix}"
-            suffix += 1
-        return req_id

@@ -332,7 +332,7 @@ class DiffusionEngine:
             with self._rpc_lock:
                 runner_output = self.execute(sched_output)
         except Exception as exc:
-            req_id = sched_output.req_states[0].req_id if sched_output.req_states else ""
+            req_id = sched_output.req_states[0].sched_req_id if sched_output.req_states else ""
             logger.error("Execution failed for diffusion request %s", req_id, exc_info=True)
             runner_output = RunnerOutput(
                 req_id=req_id,
@@ -350,7 +350,7 @@ class DiffusionEngine:
         finished_req_ids: set[str],
     ) -> None:
         for req_state in sched_output.req_states:
-            request_id = req_state.req_id
+            request_id = req_state.sched_req_id
             event_type = _ENGINE_OUTPUT_PROGRESS
             error = getattr(runner_output, "error", None)
 

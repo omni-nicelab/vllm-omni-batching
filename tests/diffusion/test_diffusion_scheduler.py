@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import queue
 import threading
 from unittest.mock import Mock, patch
 
@@ -46,6 +47,14 @@ def _make_step_output(
     )
 
 
+def _make_request_output(req_id: str, *, error: str | None = None) -> RunnerOutput:
+    return RunnerOutput(
+        req_id=req_id,
+        finished=True,
+        result=DiffusionOutput(output=None, error=error),
+    )
+
+
 class _StubScheduler(SchedulerInterface):
     def __init__(self, request: OmniDiffusionRequest, output: DiffusionOutput) -> None:
         self._request = request
@@ -60,7 +69,7 @@ class _StubScheduler(SchedulerInterface):
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         assert request is self._request
-        self._state = Mock(req_id=self._req_id, req=request)
+        self._state = Mock(sched_req_id=self._req_id, req=request)
         return self._req_id
 
     def schedule(self):
@@ -69,8 +78,8 @@ class _StubScheduler(SchedulerInterface):
         self._scheduled = True
         return Mock(req_states=[self._state])
 
-    def update_from_output(self, sched_output, output: DiffusionOutput) -> set[str]:
-        assert output is self._output
+    def update_from_output(self, sched_output, output: RunnerOutput) -> set[str]:
+        assert output.result is self._output
         return {self._req_id}
 
     def abort_request(self, req_id: str) -> bool:
@@ -106,11 +115,11 @@ class TestRequestScheduler:
 
         sched_output = self.scheduler.schedule()
         assert len(sched_output.req_states) == 1
-        assert sched_output.req_states[0].req_id == req_id
+        assert sched_output.req_states[0].sched_req_id == req_id
         assert sched_output.num_running_reqs == 1
         assert sched_output.num_waiting_reqs == 0
 
-        finished = self.scheduler.update_from_output(sched_output, DiffusionOutput(output=None))
+        finished = self.scheduler.update_from_output(sched_output, _make_request_output(req_id))
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
         assert self.scheduler.has_requests() is False
@@ -119,7 +128,10 @@ class TestRequestScheduler:
         req_id = self.scheduler.add_request(_make_request("err"))
 
         sched_output = self.scheduler.schedule()
-        finished = self.scheduler.update_from_output(sched_output, DiffusionOutput(error="worker failed"))
+        finished = self.scheduler.update_from_output(
+            sched_output,
+            _make_request_output(req_id, error="worker failed"),
+        )
 
         assert finished == {req_id}
         state = self.scheduler.get_request_state(req_id)
@@ -130,7 +142,7 @@ class TestRequestScheduler:
         req_id = self.scheduler.add_request(_make_request("empty"))
 
         sched_output = self.scheduler.schedule()
-        finished = self.scheduler.update_from_output(sched_output, DiffusionOutput(output=None, error=None))
+        finished = self.scheduler.update_from_output(sched_output, _make_request_output(req_id))
 
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
@@ -140,20 +152,20 @@ class TestRequestScheduler:
         req_id_b = self.scheduler.add_request(_make_request("b"))
 
         first = self.scheduler.schedule()
-        assert [s.req_id for s in first.req_states] == [req_id_a]
+        assert [s.sched_req_id for s in first.req_states] == [req_id_a]
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
         # Request A is still running; scheduling again should not pull B.
         second = self.scheduler.schedule()
-        assert [s.req_id for s in second.req_states] == [req_id_a]
+        assert [s.sched_req_id for s in second.req_states] == [req_id_a]
         assert second.num_running_reqs == 1
         assert second.num_waiting_reqs == 1
 
-        self.scheduler.update_from_output(first, DiffusionOutput(output=None))
+        self.scheduler.update_from_output(first, _make_request_output(req_id_a))
 
         third = self.scheduler.schedule()
-        assert [s.req_id for s in third.req_states] == [req_id_b]
+        assert [s.sched_req_id for s in third.req_states] == [req_id_b]
         assert third.num_running_reqs == 1
         assert third.num_waiting_reqs == 0
 
@@ -168,7 +180,7 @@ class TestRequestScheduler:
 
         # A should still run normally.
         output_a = self.scheduler.schedule()
-        assert [s.req_id for s in output_a.req_states] == [req_id_a]
+        assert [s.sched_req_id for s in output_a.req_states] == [req_id_a]
 
         # Abort running request.
         assert self.scheduler.abort_request(req_id_a) is True
@@ -187,7 +199,7 @@ class TestRequestScheduler:
         sched_output = self.scheduler.schedule()
         assert self.scheduler.has_requests() is True
 
-        self.scheduler.update_from_output(sched_output, DiffusionOutput(output=None))
+        self.scheduler.update_from_output(sched_output, _make_request_output(req_id))
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
         assert self.scheduler.has_requests() is False
 
@@ -197,17 +209,19 @@ class TestDiffusionEngine:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(Mock())
-        engine.executor = Mock()
+        engine.execute_fn = Mock()
         engine._rpc_lock = threading.Lock()
+        engine.abort_queue = queue.Queue()
 
         request = _make_request("engine")
         expected = DiffusionOutput(output=None)
-        engine.executor.add_req.return_value = expected
+        engine.execute_fn.return_value = _make_request_output("engine", error=None)
+        engine.execute_fn.return_value.result = expected
 
         output = engine.add_req_and_wait_for_response(request)
 
         assert output is expected
-        engine.executor.add_req.assert_called_once_with(request)
+        engine.execute_fn.assert_called_once()
 
     def test_supports_scheduler_interface_injection(self) -> None:
         request = _make_request("engine_iface")
@@ -216,14 +230,15 @@ class TestDiffusionEngine:
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = scheduler
-        engine.executor = Mock()
-        engine.executor.add_req.return_value = expected
+        engine.execute_fn = Mock(return_value=_make_request_output("engine_iface"))
+        engine.execute_fn.return_value.result = expected
         engine._rpc_lock = threading.Lock()
+        engine.abort_queue = queue.Queue()
 
         output = engine.add_req_and_wait_for_response(request)
 
         assert output is expected
-        engine.executor.add_req.assert_called_once_with(request)
+        engine.execute_fn.assert_called_once()
 
     def test_initializes_injected_scheduler(self) -> None:
         request = _make_request("init")
@@ -248,7 +263,7 @@ class TestDiffusionEngine:
 
         req_id = scheduler.add_request(_make_request("alias"))
         sched_output = scheduler.schedule()
-        finished = scheduler.update_from_output(sched_output, DiffusionOutput(output=None))
+        finished = scheduler.update_from_output(sched_output, _make_request_output(req_id))
 
         assert req_id in finished
         assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
@@ -279,19 +294,19 @@ class TestStepScheduler:
         req_id = self.scheduler.add_request(request)
 
         first = self.scheduler.schedule()
-        assert [s.req_id for s in first.req_states] == [req_id]
+        assert [s.sched_req_id for s in first.req_states] == [req_id]
         assert self.scheduler.update_from_output(first, _make_step_output(req_id, step_index=1)) == set()
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.RUNNING
         assert request.sampling_params.step_index == 1
         assert self.scheduler.has_requests() is True
 
         second = self.scheduler.schedule()
-        assert [s.req_id for s in second.req_states] == [req_id]
+        assert [s.sched_req_id for s in second.req_states] == [req_id]
         assert self.scheduler.update_from_output(second, _make_step_output(req_id, step_index=2)) == set()
         assert request.sampling_params.step_index == 2
 
         third = self.scheduler.schedule()
-        assert [s.req_id for s in third.req_states] == [req_id]
+        assert [s.sched_req_id for s in third.req_states] == [req_id]
         assert self.scheduler.update_from_output(
             third,
             _make_step_output(req_id, step_index=3, finished=True),
@@ -317,22 +332,22 @@ class TestStepScheduler:
         )
 
         first = self.scheduler.schedule()
-        assert [s.req_id for s in first.req_states] == [req_id_a]
+        assert [s.sched_req_id for s in first.req_states] == [req_id_a]
         assert self.scheduler.update_from_output(first, _make_step_output(req_id_a, step_index=1)) == set()
 
         second = self.scheduler.schedule()
-        assert [s.req_id for s in second.req_states] == [req_id_b]
+        assert [s.sched_req_id for s in second.req_states] == [req_id_b]
         assert self.scheduler.update_from_output(second, _make_step_output(req_id_b, step_index=1)) == set()
 
         third = self.scheduler.schedule()
-        assert [s.req_id for s in third.req_states] == [req_id_a]
+        assert [s.sched_req_id for s in third.req_states] == [req_id_a]
         assert self.scheduler.update_from_output(
             third,
             _make_step_output(req_id_a, step_index=2, finished=True),
         ) == {req_id_a}
 
         fourth = self.scheduler.schedule()
-        assert [s.req_id for s in fourth.req_states] == [req_id_b]
+        assert [s.sched_req_id for s in fourth.req_states] == [req_id_b]
         assert self.scheduler.update_from_output(
             fourth,
             _make_step_output(req_id_b, step_index=2, finished=True),
@@ -368,7 +383,7 @@ class TestStepScheduler:
         # upper-layer request shape is refactored for real continuous batching.
         assert len(sched_output.req_states) <= 1
         assert sched_output.num_running_reqs <= 1
-        assert [s.req_id for s in sched_output.req_states] == [req_id_a]
+        assert [s.sched_req_id for s in sched_output.req_states] == [req_id_a]
         assert sched_output.num_waiting_reqs == 2
 
     def test_error_output_marks_finished_error(self) -> None:
@@ -381,7 +396,7 @@ class TestStepScheduler:
         )
 
         sched_output = self.scheduler.schedule()
-        assert [s.req_id for s in sched_output.req_states] == [req_id]
+        assert [s.sched_req_id for s in sched_output.req_states] == [req_id]
         finished = self.scheduler.update_from_output(
             sched_output,
             _make_step_output(req_id, step_index=0, finished=True, error="worker failed"),
@@ -413,7 +428,7 @@ class TestStepScheduler:
         assert self.scheduler.get_request_state(req_id_b).status == DiffusionRequestStatus.FINISHED_ABORTED
 
         running = self.scheduler.schedule()
-        assert [s.req_id for s in running.req_states] == [req_id_a]
+        assert [s.sched_req_id for s in running.req_states] == [req_id_a]
 
         assert self.scheduler.abort_request(req_id_a) is True
         assert self.scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.FINISHED_ABORTED
@@ -432,13 +447,13 @@ class TestStepScheduler:
         assert request.sampling_params.step_index == 1
 
         second = self.scheduler.schedule()
-        assert [s.req_id for s in second.req_states] == [req_id]
+        assert [s.sched_req_id for s in second.req_states] == [req_id]
         assert self.scheduler.preempt_request(req_id) is True
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.PREEMPTED
         assert request.sampling_params.step_index == 1
 
         third = self.scheduler.schedule()
-        assert [s.req_id for s in third.req_states] == [req_id]
+        assert [s.sched_req_id for s in third.req_states] == [req_id]
         assert request.sampling_params.step_index == 1
 
     @pytest.mark.parametrize(
@@ -477,7 +492,7 @@ class TestStepScheduler:
 
         for _ in range(expected_steps - 1):
             sched_output = self.scheduler.schedule()
-            assert [s.req_id for s in sched_output.req_states] == [req_id]
+            assert [s.sched_req_id for s in sched_output.req_states] == [req_id]
             next_step = request.sampling_params.step_index + 1
             assert (
                 self.scheduler.update_from_output(
@@ -488,7 +503,7 @@ class TestStepScheduler:
             )
 
         final_output = self.scheduler.schedule()
-        assert [s.req_id for s in final_output.req_states] == [req_id]
+        assert [s.sched_req_id for s in final_output.req_states] == [req_id]
         assert self.scheduler.update_from_output(
             final_output,
             _make_step_output(req_id, step_index=expected_steps, finished=True),

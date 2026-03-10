@@ -257,7 +257,7 @@ class DiffusionModelRunner:
         # Stepwise mode currently trusts runner-owned cached state more than
         # re-validating scheduler-provided request content on every step.
         sched_req_state = req_states[0]
-        req_id = sched_req_state.req_id
+        req_id = sched_req_state.sched_req_id
         if req_id in self.state_cache:
             return self.state_cache[req_id]
 

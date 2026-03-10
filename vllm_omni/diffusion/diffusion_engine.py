@@ -226,11 +226,11 @@ class DiffusionEngine:
 
                 req_state = sched_output.req_states[0]
                 try:
-                    output = self.execute_fn(sched_output)
+                    model_output = self.execute_fn(sched_output)
                 except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", req_state.req_id, exc_info=True)
-                    output = RunnerOutput(
-                        req_id=req_state.req_id,
+                    logger.error("Execution failed for diffusion request %s", req_state.sched_req_id, exc_info=True)
+                    model_output = RunnerOutput(
+                        req_id=req_state.sched_req_id,
                         step_index=None,
                         finished=True,
                         result=DiffusionOutput(error=str(exc)),
@@ -239,14 +239,14 @@ class DiffusionEngine:
                 # check abort queue
                 self._process_aborts_queue()
 
-                finished_req_ids = self.scheduler.update_from_output(sched_output, output)
+                finished_req_ids = self.scheduler.update_from_output(sched_output, model_output)
                 if target_req_id in finished_req_ids:
                     state = self.scheduler.get_request_state(target_req_id)
                     self.scheduler.pop_request_state(target_req_id)
                     if state is not None and state.status == DiffusionRequestStatus.FINISHED_ABORTED:
                         return DiffusionOutput(error=f"Request {target_req_id} aborted.")
-                    if output.result is not None:
-                        return output.result
+                    if model_output.result is not None:
+                        return model_output.result
                     return DiffusionOutput(error="Diffusion execution finished without a final output.")
 
     def start_profile(self, trace_filename: str | None = None) -> None:

@@ -4,12 +4,21 @@
 from __future__ import annotations
 
 import enum
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+
+logger = init_logger(__name__)
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -33,7 +42,7 @@ class DiffusionRequestStatus(enum.IntEnum):
 class DiffusionRequestState:
     """Scheduler-owned state for one queued OmniDiffusionRequest."""
 
-    req_id: str
+    sched_req_id: str
     req: OmniDiffusionRequest
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
@@ -52,6 +61,20 @@ class DiffusionSchedulerOutput:
 
 class SchedulerInterface(ABC):
     """Abstract lifecycle contract for diffusion schedulers."""
+
+    def _make_sched_req_id(self, request: OmniDiffusionRequest) -> str:
+        if request.request_ids:
+            base = request.request_ids[0]
+        else:
+            logger.warning("Request has no request_ids, generating a random one. Request: %s", request)
+            base = f"req_{uuid.uuid4().hex[:8]}"
+
+        sched_req_id = base
+        suffix = 1
+        while self.get_request_state(sched_req_id) is not None:
+            sched_req_id = f"{base}#{suffix}"
+            suffix += 1
+        return sched_req_id
 
     @abstractmethod
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
@@ -78,11 +101,11 @@ class SchedulerInterface(ABC):
         """Return whether the scheduler still owns runnable requests."""
 
     @abstractmethod
-    def get_request_state(self, req_id: str) -> DiffusionRequestState | None:
+    def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         """Return request state if present."""
 
     @abstractmethod
-    def pop_request_state(self, req_id: str) -> DiffusionRequestState | None:
+    def pop_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         """Remove and return request state if present."""
 
     @abstractmethod
