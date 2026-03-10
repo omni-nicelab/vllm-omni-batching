@@ -28,7 +28,7 @@ class DiffusionRequestStatus(enum.IntEnum):
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
 
-    # if any status is after FINISHED_COMPLETED, it is considered finished
+    # if any status is after or equal to FINISHED_COMPLETED, it is considered finished
     FINISHED_COMPLETED = enum.auto()
     FINISHED_ABORTED = enum.auto()
     FINISHED_ERROR = enum.auto()
@@ -117,7 +117,7 @@ class SchedulerInterface(ABC):
 
     @abstractmethod
     def finish_request(self, req_id: str, status: DiffusionRequestStatus) -> None:
-        """Mark a request finished."""
+        """Handles the finish signal from outside the scheduler."""
 
     @abstractmethod
     def close(self) -> None:

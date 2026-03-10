@@ -315,7 +315,7 @@ class TestStepScheduler:
         assert request.sampling_params.step_index == 3
         assert self.scheduler.has_requests() is False
 
-    def test_rotates_requests_round_robin_by_step(self) -> None:
+    def test_keeps_running_request_scheduled_until_finished(self) -> None:
         req_id_a = self.scheduler.add_request(
             OmniDiffusionRequest(
                 prompts=["prompt_a"],
@@ -334,17 +334,19 @@ class TestStepScheduler:
         first = self.scheduler.schedule()
         assert [s.sched_req_id for s in first.req_states] == [req_id_a]
         assert self.scheduler.update_from_output(first, _make_step_output(req_id_a, step_index=1)) == set()
+        assert self.scheduler._running == [req_id_a]
+        assert list(self.scheduler._waiting) == [req_id_b]
 
         second = self.scheduler.schedule()
-        assert [s.sched_req_id for s in second.req_states] == [req_id_b]
-        assert self.scheduler.update_from_output(second, _make_step_output(req_id_b, step_index=1)) == set()
-
-        third = self.scheduler.schedule()
-        assert [s.sched_req_id for s in third.req_states] == [req_id_a]
+        assert [s.sched_req_id for s in second.req_states] == [req_id_a]
         assert self.scheduler.update_from_output(
-            third,
+            second,
             _make_step_output(req_id_a, step_index=2, finished=True),
         ) == {req_id_a}
+
+        third = self.scheduler.schedule()
+        assert [s.sched_req_id for s in third.req_states] == [req_id_b]
+        assert self.scheduler.update_from_output(third, _make_step_output(req_id_b, step_index=1)) == set()
 
         fourth = self.scheduler.schedule()
         assert [s.sched_req_id for s in fourth.req_states] == [req_id_b]
