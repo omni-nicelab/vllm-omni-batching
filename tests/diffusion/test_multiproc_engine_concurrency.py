@@ -66,7 +66,10 @@ def _make_engine(num_gpus: int = 1):
     sched.initialize(Mock())
     engine.scheduler = sched
     engine.executor = executor
+    engine.execute_fn = executor.execute_request
     engine._rpc_lock = threading.RLock()
+    engine.abort_queue = queue.Queue()
+    engine._request_id_to_sched_req_id = {}
     return engine, executor, req_q, res_q
 
 
@@ -75,17 +78,28 @@ def _start_worker(req_q, res_q, count=2):
     tagged ``DiffusionOutput``s on *res_q* (FIFO order).
     """
 
+    def _tag_for_rpc(method: str, args: tuple[object, ...]) -> str:
+        if method in {"generate", "execute_model"} and args and hasattr(args[0], "request_ids"):
+            return f"result_for_{args[0].request_ids[0]}"
+
+        if method == "execute_stepwise" and args and hasattr(args[0], "req_states"):
+            req_states = args[0].req_states
+            if req_states:
+                request_ids = getattr(req_states[0].req, "request_ids", None)
+                if request_ids:
+                    return f"result_for_{request_ids[0]}"
+                return f"result_for_{req_states[0].sched_req_id}"
+
+        if args:
+            return f"result_for_{args[0]}"
+        return f"result_for_{method}"
+
     def _run():
         for _ in range(count):
             req = req_q.get(timeout=10)
             method = req.get("method", "")
             args = req.get("args", ())
-            if method == "generate" and args and hasattr(args[0], "request_ids"):
-                tag = f"result_for_{args[0].request_ids[0]}"
-            elif args:
-                tag = f"result_for_{args[0]}"
-            else:
-                tag = f"result_for_{method}"
+            tag = _tag_for_rpc(method, args)
             res_q.put(_tagged_output(tag))
 
     t = threading.Thread(target=_run, daemon=True)

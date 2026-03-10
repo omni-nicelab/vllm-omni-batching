@@ -394,6 +394,7 @@ class DiffusionEngine:
         prompt: OmniTextPrompt = {"prompt": "dummy run", "multi_modal_data": {"image": dummy_image}}
         req = OmniDiffusionRequest(
             prompts=[prompt],
+            request_ids=["dummy_req_id"],
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,
