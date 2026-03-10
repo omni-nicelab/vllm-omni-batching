@@ -453,7 +453,7 @@ class OmniDiffusionConfig:
     # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)
     quantization: str | None = None
     quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
-    
+
     # step mode settings
     step_execution: bool = False
 
@@ -616,11 +616,17 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    aborted: bool = False
+    abort_message: str | None = None
 
     post_process_func: Callable[..., Any] | None = None
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+
+class DiffusionRequestAbortedError(RuntimeError):
+    """Raised when a diffusion request ends via user-visible abort."""
 
 
 class AttentionBackendEnum(enum.Enum):

@@ -19,7 +19,7 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -43,6 +43,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 # ---------------------------------------------------------------------------
 # Helpers & fixtures
 # ---------------------------------------------------------------------------
+
+
+def _assert_aborted_output(output: DiffusionOutput, request_id: str) -> None:
+    assert output.output is None
+    assert output.error is None
+    assert output.aborted is True
+    assert output.abort_message == f"Request {request_id} aborted."
 
 
 @contextmanager
@@ -437,8 +444,7 @@ class TestEngineAbort:
 
         output = engine.add_req_and_wait_for_response(request)
 
-        assert output.output is None
-        assert output.error == "Request req-abort aborted."
+        _assert_aborted_output(output, "req-abort")
         assert engine._request_id_to_sched_req_id == {}
 
     def test_abort_batched_request_by_secondary_request_id(self):
@@ -464,8 +470,7 @@ class TestEngineAbort:
 
         output = engine.add_req_and_wait_for_response(request)
 
-        assert output.output is None
-        assert output.error == "Request req-batch-a aborted."
+        _assert_aborted_output(output, "req-batch-a")
         assert engine._request_id_to_sched_req_id == {}
 
     def test_duplicate_abort_is_idempotent(self):
@@ -488,7 +493,7 @@ class TestEngineAbort:
 
         output = engine.add_req_and_wait_for_response(request)
 
-        assert output.error == "Request req-dup aborted."
+        _assert_aborted_output(output, "req-dup")
 
     @pytest.mark.parametrize(
         "scenario",
@@ -538,7 +543,7 @@ class TestEngineAbort:
         output = engine.add_req_and_wait_for_response(request)
 
         assert step["n"] == 2
-        assert output.error == "Request req-mid aborted."
+        _assert_aborted_output(output, "req-mid")
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +590,7 @@ class TestSchedulerAbort:
 
         output = engine.add_req_and_wait_for_response(request)
 
-        assert output.output is None
-        assert output.error == "Request req-rs aborted."
+        _assert_aborted_output(output, "req-rs")
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +639,7 @@ class TestAsyncAbort:
 
             await async_engine.abort("req-async")
 
-            with pytest.raises(RuntimeError, match="aborted"):
+            with pytest.raises(DiffusionRequestAbortedError, match="aborted"):
                 await task
         finally:
             async_engine.close()
@@ -650,7 +654,7 @@ class TestAsyncAbort:
             request_id = request.request_ids[0]
             first_started.set()
             assert abort_forwarded.wait(timeout=5), "entrypoint abort never reached engine.abort"
-            raise Exception(f"Request {request_id} aborted.")
+            raise DiffusionRequestAbortedError(f"Request {request_id} aborted.")
 
         engine = Mock()
         engine.step.side_effect = step
@@ -677,7 +681,7 @@ class TestAsyncAbort:
 
             await async_engine.abort("req-running")
 
-            with pytest.raises(RuntimeError, match="Request req-running aborted"):
+            with pytest.raises(DiffusionRequestAbortedError, match="Request req-running aborted"):
                 await task
 
             engine.abort.assert_called_once_with(["req-running"])
@@ -733,7 +737,7 @@ class TestAsyncAbort:
             running_output = await running_task
             assert running_output.request_id == "req-running"
 
-            with pytest.raises(RuntimeError, match="req-queued aborted"):
+            with pytest.raises(DiffusionRequestAbortedError, match="req-queued aborted"):
                 await queued_task
 
             assert started_request_ids == ["req-running"]

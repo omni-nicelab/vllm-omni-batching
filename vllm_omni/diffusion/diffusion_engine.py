@@ -11,7 +11,7 @@ from typing import Any
 import PIL.Image
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError, OmniDiffusionConfig
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
@@ -93,6 +93,8 @@ class DiffusionEngine:
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
         output = self.add_req_and_wait_for_response(request)
+        if output.aborted:
+            raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
             raise Exception(f"{output.error}")
         logger.info("Generation completed successfully.")
@@ -228,7 +230,10 @@ class DiffusionEngine:
                         self.scheduler.pop_request_state(target_sched_req_id)
                         if state is not None and state.status == DiffusionRequestStatus.FINISHED_ABORTED:
                             request_id = state.req.request_ids[0] if state.req.request_ids else target_sched_req_id
-                            return DiffusionOutput(error=f"Request {request_id} aborted.")
+                            return DiffusionOutput(
+                                aborted=True,
+                                abort_message=f"Request {request_id} aborted.",
+                            )
                         raise RuntimeError("Diffusion scheduler finished target request without execution output.")
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
@@ -256,7 +261,10 @@ class DiffusionEngine:
                     self.scheduler.pop_request_state(target_sched_req_id)
                     if state is not None and state.status == DiffusionRequestStatus.FINISHED_ABORTED:
                         request_id = state.req.request_ids[0] if state.req.request_ids else target_sched_req_id
-                        return DiffusionOutput(error=f"Request {request_id} aborted.")
+                        return DiffusionOutput(
+                            aborted=True,
+                            abort_message=f"Request {request_id} aborted.",
+                        )
                     if model_output.result is not None:
                         return model_output.result
                     return DiffusionOutput(error="Diffusion execution finished without a final output.")

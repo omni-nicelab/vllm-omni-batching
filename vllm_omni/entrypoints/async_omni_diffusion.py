@@ -19,7 +19,7 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.data import DiffusionRequestAbortedError, OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -185,10 +185,13 @@ class AsyncOmniDiffusion:
         except asyncio.CancelledError as e:
             if self._is_abort_requested(request_id, future):
                 logger.info("Generation aborted for request %s before completion", request_id)
-                raise RuntimeError(f"Diffusion generation failed: Request {request_id} aborted.") from e
+                raise DiffusionRequestAbortedError(f"Request {request_id} aborted.") from e
             await self.abort(request_id)
             raise
         except Exception as e:
+            if self._is_abort_requested(request_id, future):
+                logger.info("Generation aborted for request %s: %s", request_id, e)
+                raise DiffusionRequestAbortedError(str(e)) from e
             logger.error("Generation failed for request %s: %s", request_id, e)
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
         finally:
