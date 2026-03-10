@@ -8,7 +8,7 @@ from collections import deque
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestState,
@@ -16,6 +16,7 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     SchedulerInterface,
 )
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
@@ -73,7 +74,7 @@ class RequestScheduler(SchedulerInterface):
         self._finished_req_ids.clear()
         return scheduler_output
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_req_ids = {state.req_id for state in sched_output.req_states}
         if not scheduled_req_ids:
             return set()
@@ -83,9 +84,12 @@ class RequestScheduler(SchedulerInterface):
             state = self._request_states.get(req_id)
             if state is None:
                 continue
-            if output.error:
+            if output.result is None:
                 state.status = DiffusionRequestStatus.FINISHED_ERROR
-                state.error = output.error
+                state.error = "No output result"
+            elif output.result.error:
+                state.status = DiffusionRequestStatus.FINISHED_ERROR
+                state.error = output.result.error
             else:
                 state.status = DiffusionRequestStatus.FINISHED_COMPLETED
                 state.error = None

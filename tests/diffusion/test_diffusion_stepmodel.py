@@ -16,9 +16,11 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, StepScheduler
-from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestState as SchedulerRequestState,
+)
+from vllm_omni.diffusion.sched.interface import (
+    DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     SchedulerInterface,
 )
@@ -144,7 +146,11 @@ class _AbortAwareScheduler(SchedulerInterface):
 
     def schedule(self) -> DiffusionSchedulerOutput:
         req_states = []
-        if self._state is not None and self._state.status < DiffusionRequestStatus.FINISHED_COMPLETED and not self._scheduled:
+        if (
+            self._state is not None
+            and self._state.status < DiffusionRequestStatus.FINISHED_COMPLETED
+            and not self._scheduled
+        ):
             self._state.status = DiffusionRequestStatus.RUNNING
             req_states = [self._state]
             self._scheduled = True
@@ -242,9 +248,7 @@ def test_worker_execute_stepwise_delegates_to_model_runner():
         ]
     )
     worker.lora_manager = None
-    worker.model_runner = SimpleNamespace(
-        execute_stepwise=lambda arg: expected if arg is scheduler_output else None
-    )
+    worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: expected if arg is scheduler_output else None)
 
     output = DiffusionWorker.execute_stepwise(worker, scheduler_output)
 

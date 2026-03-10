@@ -74,11 +74,7 @@ class DiffusionEngine:
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.RLock()
         self.abort_queue: queue.Queue[str] = queue.Queue()
-        self.execute_fn = (
-            self.executor.execute_step
-            if self.step_execution
-            else self.executor.execute_request
-        )
+        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
         try:
             self._dummy_run()
@@ -239,7 +235,7 @@ class DiffusionEngine:
                         finished=True,
                         result=DiffusionOutput(error=str(exc)),
                     )
-                output.error = output.result.error if output.result is not None else None
+
                 # check abort queue
                 self._process_aborts_queue()
 
