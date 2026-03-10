@@ -3,20 +3,17 @@
 
 from __future__ import annotations
 
-import uuid
-from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestState,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
-    SchedulerInterface,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 
@@ -29,71 +26,59 @@ class _StepProgress:
     total_steps: int
 
 
-class StepScheduler(SchedulerInterface):
+class StepScheduler(_BaseScheduler):
     """Placeholder scheduler that advances a request one denoise step per update."""
 
     def __init__(self) -> None:
-        self.od_config: OmniDiffusionConfig | None = None
-        # req_id -> state
-        self._request_states: dict[str, DiffusionRequestState] = {}
+        super().__init__()
         self._request_progress: dict[str, _StepProgress] = {}
-        self._step_id: int = 0
-        self._waiting: deque[str] = deque()
-        self._running: list[str] = []
-        self._finished_req_ids: set[str] = set()
         # currently used by vllm_omni/entrypoints/omni_stage.py,
         # can't be used for real multi-step scheduling without proper architectural changes,
         # so we keep it fixed at 1 for now.
         self._max_batch_size: int = 1
 
-    def initialize(self, od_config: OmniDiffusionConfig) -> None:
-        self.od_config = od_config
-        self._request_states.clear()
+    def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
-        self._step_id = 0
-        self._waiting.clear()
-        self._running.clear()
-        self._finished_req_ids.clear()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
-        req_id = self._make_req_id(request)
+        sched_req_id = self._make_sched_req_id(request)
         total_steps = self._get_total_steps(request)
         if total_steps <= 0:
-            raise ValueError(f"Diffusion request {req_id} must have positive total_steps, got {total_steps}")
+            raise ValueError(f"Diffusion request {sched_req_id} must have positive total_steps, got {total_steps}")
 
         current_step = request.sampling_params.step_index or 0
         if current_step < 0 or current_step >= total_steps:
             raise ValueError(
-                f"Diffusion request {req_id} has invalid initial step_index {current_step} "
+                f"Diffusion request {sched_req_id} has invalid initial step_index {current_step} "
                 f"for total_steps={total_steps}"
             )
 
         request.sampling_params.step_index = current_step
-        state = DiffusionRequestState(req_id=req_id, req=request)
-        self._request_states[req_id] = state
-        self._request_progress[req_id] = _StepProgress(current_step=current_step, total_steps=total_steps)
-        self._waiting.append(req_id)
+        state = DiffusionRequestState(sched_req_id=sched_req_id, req=request)
+        self._request_states[sched_req_id] = state
+        self._request_progress[sched_req_id] = _StepProgress(current_step=current_step, total_steps=total_steps)
+        self._waiting.append(sched_req_id)
         logger.debug(
             "StepScheduler add_request: %s (step=%d/%d, waiting=%d)",
-            req_id,
+            sched_req_id,
             current_step,
             total_steps,
             len(self._waiting),
         )
-        return req_id
+        return sched_req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
         # Schedule waiting requests
         while self._waiting and len(self._running) < self._max_batch_size:
-            req_id = self._waiting.popleft()
-            state = self._request_states.get(req_id)
+            sched_req_id = self._waiting.popleft()
+            state = self._request_states.get(sched_req_id)
             if state is not None:
                 state.status = DiffusionRequestStatus.RUNNING
-                self._running.append(req_id)
+                self._running.append(sched_req_id)
 
         running_states: list[DiffusionRequestState] = []
-        for req_id in self._running:
-            state = self._request_states.get(req_id)
+        for sched_req_id in self._running:
+            state = self._request_states.get(sched_req_id)
             if state is not None:
                 running_states.append(state)
 
@@ -111,120 +96,54 @@ class StepScheduler(SchedulerInterface):
         return scheduler_output
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
-        scheduled_req_ids = {state.req_id for state in sched_output.req_states}
+        scheduled_req_ids = [state.sched_req_id for state in sched_output.req_states]
         if not scheduled_req_ids:
             return set()
 
-        completed_req_ids: set[str] = set()
+        # A scheduled request may be aborted after schedule() but before
+        # update_from_output() processes the runner output. It is already
+        # marked finished at that point, but we still need to surface its id
+        # in this update so the engine can observe the terminal state.
+        finished_req_ids = {
+            sched_req_id for sched_req_id in scheduled_req_ids if sched_req_id in self._finished_req_ids
+        }
+        terminal_statuses: dict[str, DiffusionRequestStatus] = {}
+        terminal_errors: dict[str, str | None] = {}
         output_error = output.result.error if output.result is not None else None
-        for req_id in scheduled_req_ids:
-            state = self._request_states.get(req_id)
-            progress = self._request_progress.get(req_id)
-            if state is None or progress is None:
+        for sched_req_id in scheduled_req_ids:
+            state = self._request_states.get(sched_req_id)
+            progress = self._request_progress.get(sched_req_id)
+            if state is None or progress is None or state.is_finished():
                 continue
 
             if output_error is not None:
-                state.status = DiffusionRequestStatus.FINISHED_ERROR
-                state.error = output_error
-                completed_req_ids.add(req_id)
+                terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
+                terminal_errors[sched_req_id] = output_error
                 continue
 
             if output.step_index is None:
-                logger.warning("Received RunnerOutput with no step_index for request %s, treating as error", req_id)
-                state.status = DiffusionRequestStatus.FINISHED_ERROR
-                state.error = "Missing step_index in RunnerOutput"
-                completed_req_ids.add(req_id)
+                logger.warning(
+                    "Received RunnerOutput with no step_index for request %s, treating as error",
+                    sched_req_id,
+                )
+                terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
+                terminal_errors[sched_req_id] = "Missing step_index in RunnerOutput"
                 continue
 
             # We assume that the decoding stage is executed immediately after the denoising stage completes.
             progress.current_step = output.step_index
             state.req.sampling_params.step_index = output.step_index
             if output.finished:
-                state.status = DiffusionRequestStatus.FINISHED_COMPLETED
-                state.error = None
-                completed_req_ids.add(req_id)
+                terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
+                terminal_errors[sched_req_id] = None
             else:
                 state.error = None
 
-        if completed_req_ids:
-            self._finished_req_ids |= completed_req_ids
+        finished_req_ids |= self._finish_requests(terminal_statuses, terminal_errors)
+        return finished_req_ids
 
-        for req_id in scheduled_req_ids:
-            if req_id in self._running:
-                self._running.remove(req_id)
-
-            if req_id in completed_req_ids:
-                try:
-                    self._waiting.remove(req_id)
-                except ValueError:
-                    pass
-                continue
-
-            if req_id in self._request_states:
-                self._waiting.append(req_id)
-
-        return completed_req_ids
-
-    def abort_request(self, req_id: str) -> bool:
-        if req_id not in self._request_states:
-            return False
-        self.finish_request(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
-        self._finished_req_ids.add(req_id)
-        return True
-
-    def has_requests(self) -> bool:
-        return bool(self._waiting or self._running)
-
-    def get_request_state(self, req_id: str) -> DiffusionRequestState | None:
-        return self._request_states.get(req_id)
-
-    def pop_request_state(self, req_id: str) -> DiffusionRequestState | None:
-        self._request_progress.pop(req_id, None)
-        return self._request_states.pop(req_id, None)
-
-    def preempt_request(self, req_id: str) -> bool:
-        if req_id not in self._request_states:
-            return False
-        if req_id in self._running:
-            self._running.remove(req_id)
-            self._waiting.appendleft(req_id)
-            self._request_states[req_id].status = DiffusionRequestStatus.PREEMPTED
-            return True
-        return False
-
-    def finish_request(self, req_id: str, status: DiffusionRequestStatus) -> None:
-        assert DiffusionRequestStatus.is_finished(status)
-        state = self._request_states.get(req_id)
-        if state is None:
-            return
-
-        state.status = status
-        if req_id in self._running:
-            self._running.remove(req_id)
-        try:
-            self._waiting.remove(req_id)
-        except ValueError:
-            pass
-
-    def close(self) -> None:
-        self._request_states.clear()
-        self._request_progress.clear()
-        self._waiting.clear()
-        self._running.clear()
-        self._finished_req_ids.clear()
-
-    def _make_req_id(self, request: OmniDiffusionRequest) -> str:
-        if request.request_ids:
-            base = request.request_ids[0]
-        else:
-            base = f"req_{uuid.uuid4().hex[:8]}"
-
-        req_id = base
-        suffix = 1
-        while req_id in self._request_states:
-            req_id = f"{base}#{suffix}"
-            suffix += 1
-        return req_id
+    def _pop_extra_request_state(self, sched_req_id: str) -> None:
+        self._request_progress.pop(sched_req_id, None)
 
     def _get_total_steps(self, request: OmniDiffusionRequest) -> int:
         sampling = request.sampling_params

@@ -205,8 +205,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._ensure_open()
         if len(scheduler_output.req_states) != 1:
             raise ValueError(
-                "Request mode currently supports batch_size=1, "
-                f"but got {len(scheduler_output.req_states)} req_states."
+                f"Request mode currently supports batch_size=1, but got {len(scheduler_output.req_states)} req_states."
             )
 
         req_state = scheduler_output.req_states[0]
@@ -217,12 +216,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             exec_all_ranks=True,
         )
         if not isinstance(result, DiffusionOutput):
-            raise RuntimeError(
-                f"Unexpected response type for execute_request: {type(result)!r}"
-            )
+            raise RuntimeError(f"Unexpected response type for execute_request: {type(result)!r}")
 
         return RunnerOutput(
-            req_id=req_state.req_id,
+            req_id=req_state.sched_req_id,
             step_index=None,
             finished=True,
             result=result,
@@ -244,7 +241,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # failed multi-request step batches.
         if isinstance(result, DiffusionOutput):
             req_states = scheduler_output.req_states
-            req_id = req_states[0].req_id if req_states else ""
+            req_id = req_states[0].sched_req_id if req_states else ""
             return RunnerOutput(
                 req_id=req_id,
                 step_index=None,
@@ -252,9 +249,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 result=result,
             )
         else:
-            raise RuntimeError(
-                f"Unexpected response type for execute_step: {type(result)!r}"
-            )
+            raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
     def collective_rpc(
         self,

@@ -241,6 +241,15 @@ class OmniServeCommand(CLISubcommand):
             help="Number of replica groups for HSDP. Each group holds a full sharded copy.",
         )
 
+        # Step-level execution (enables per-step abort)
+        omni_config_group.add_argument(
+            "--step-execution",
+            action="store_true",
+            default=False,
+            help="Enable step-level execution for diffusion models. "
+            "Allows per-step abort instead of waiting for full inference to complete.",
+        )
+
         # Cache optimization parameters
         omni_config_group.add_argument(
             "--cache-backend",

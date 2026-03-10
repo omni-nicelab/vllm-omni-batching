@@ -31,7 +31,7 @@ from vllm.v1.engine import EngineCoreOutput
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionRequestAbortedError, OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors import build_stage_connectors
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
 from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
@@ -1379,6 +1379,16 @@ async def _stage_worker_async(
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                     _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
+        except DiffusionRequestAbortedError as e:
+            logger.info("Request %s aborted: %s", rid, e)
+            out_q.put(
+                {
+                    "request_id": rid,
+                    "stage_id": stage_id,
+                    "error": str(e),
+                    "aborted": True,
+                }
+            )
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
             out_q.put(
