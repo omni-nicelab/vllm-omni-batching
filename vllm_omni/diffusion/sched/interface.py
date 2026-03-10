@@ -96,7 +96,7 @@ class SchedulerInterface(ABC):
         """Update scheduler state from executor output."""
 
     @abstractmethod
-    def abort_request(self, req_id: str) -> bool:
+    def abort_request(self, sched_req_id: str) -> bool:
         """Abort a queued or running request."""
 
     @abstractmethod
@@ -112,12 +112,12 @@ class SchedulerInterface(ABC):
         """Remove and return request state if present."""
 
     @abstractmethod
-    def preempt_request(self, req_id: str) -> bool:
+    def preempt_request(self, sched_req_id: str) -> bool:
         """Preempt a running request back to waiting."""
 
     @abstractmethod
-    def finish_request(self, req_id: str, status: DiffusionRequestStatus) -> None:
-        """Handles the finish signal from outside the scheduler."""
+    def finish_request(self, sched_req_id: str, status: DiffusionRequestStatus) -> None:
+        """Mark a request finished."""
 
     @abstractmethod
     def close(self) -> None:

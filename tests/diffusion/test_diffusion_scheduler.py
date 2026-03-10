@@ -60,7 +60,7 @@ class _StubScheduler(SchedulerInterface):
         self._request = request
         self._output = output
         self.initialized_with = None
-        self._req_id = request.request_ids[0]
+        self._sched_req_id = request.request_ids[0]
         self._state = None
         self._scheduled = False
 
@@ -69,8 +69,8 @@ class _StubScheduler(SchedulerInterface):
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         assert request is self._request
-        self._state = Mock(sched_req_id=self._req_id, req=request)
-        return self._req_id
+        self._state = Mock(sched_req_id=self._sched_req_id, req=request)
+        return self._sched_req_id
 
     def schedule(self):
         if self._scheduled or self._state is None:
@@ -79,25 +79,31 @@ class _StubScheduler(SchedulerInterface):
         return Mock(req_states=[self._state])
 
     def update_from_output(self, sched_output, output: RunnerOutput) -> set[str]:
+        del sched_output
         assert output.result is self._output
-        return {self._req_id}
+        return {self._sched_req_id}
 
-    def abort_request(self, req_id: str) -> bool:
+    def abort_request(self, sched_req_id: str) -> bool:
+        del sched_req_id
         return False
 
     def has_requests(self) -> bool:
         return not self._scheduled
 
-    def get_request_state(self, req_id: str):
+    def get_request_state(self, sched_req_id: str):
+        del sched_req_id
         return self._state
 
-    def pop_request_state(self, req_id: str):
+    def pop_request_state(self, sched_req_id: str):
+        del sched_req_id
         return self._state
 
-    def preempt_request(self, req_id: str) -> bool:
+    def preempt_request(self, sched_req_id: str) -> bool:
+        del sched_req_id
         return False
 
-    def finish_request(self, req_id: str, status) -> None:
+    def finish_request(self, sched_req_id: str, status) -> None:
+        del sched_req_id, status
         return None
 
     def close(self) -> None:
@@ -212,6 +218,7 @@ class TestDiffusionEngine:
         engine.execute_fn = Mock()
         engine._rpc_lock = threading.Lock()
         engine.abort_queue = queue.Queue()
+        engine._request_id_to_sched_req_id = {}
 
         request = _make_request("engine")
         expected = DiffusionOutput(output=None)
@@ -234,6 +241,7 @@ class TestDiffusionEngine:
         engine.execute_fn.return_value.result = expected
         engine._rpc_lock = threading.Lock()
         engine.abort_queue = queue.Queue()
+        engine._request_id_to_sched_req_id = {}
 
         output = engine.add_req_and_wait_for_response(request)
 

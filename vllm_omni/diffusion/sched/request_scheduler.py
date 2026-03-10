@@ -21,24 +21,24 @@ class RequestScheduler(_BaseScheduler):
     """Diffusion scheduler with vLLM-style waiting/running queues."""
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
-        req_id = self._make_sched_req_id(request)
-        state = DiffusionRequestState(sched_req_id=req_id, req=request)
-        self._request_states[req_id] = state
-        self._waiting.append(req_id)
-        logger.debug("Scheduler add_request: %s (waiting=%d)", req_id, len(self._waiting))
-        return req_id
+        sched_req_id = self._make_sched_req_id(request)
+        state = DiffusionRequestState(sched_req_id=sched_req_id, req=request)
+        self._request_states[sched_req_id] = state
+        self._waiting.append(sched_req_id)
+        logger.debug("Scheduler add_request: %s (waiting=%d)", sched_req_id, len(self._waiting))
+        return sched_req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
         if not self._running and self._waiting:
-            req_id = self._waiting.popleft()
-            state = self._request_states.get(req_id)
+            sched_req_id = self._waiting.popleft()
+            state = self._request_states.get(sched_req_id)
             if state is not None:
                 state.status = DiffusionRequestStatus.RUNNING
-                self._running.append(req_id)
+                self._running.append(sched_req_id)
 
         running_states: list[DiffusionRequestState] = []
-        for req_id in self._running:
-            state = self._request_states.get(req_id)
+        for sched_req_id in self._running:
+            state = self._request_states.get(sched_req_id)
             if state is not None:
                 running_states.append(state)
 
@@ -63,22 +63,24 @@ class RequestScheduler(_BaseScheduler):
         # update_from_output() processes the runner output. It is already
         # marked finished at that point, but we still need to surface its id
         # in this update so the engine can observe the terminal state.
-        finished_req_ids = {req_id for req_id in scheduled_req_ids if req_id in self._finished_req_ids}
+        finished_req_ids = {
+            sched_req_id for sched_req_id in scheduled_req_ids if sched_req_id in self._finished_req_ids
+        }
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
-        for req_id in scheduled_req_ids:
-            state = self._request_states.get(req_id)
+        for sched_req_id in scheduled_req_ids:
+            state = self._request_states.get(sched_req_id)
             if state is None or state.is_finished():
                 continue
             if output.result is None:
-                terminal_statuses[req_id] = DiffusionRequestStatus.FINISHED_ERROR
-                terminal_errors[req_id] = "No output result"
+                terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
+                terminal_errors[sched_req_id] = "No output result"
             elif output.result.error:
-                terminal_statuses[req_id] = DiffusionRequestStatus.FINISHED_ERROR
-                terminal_errors[req_id] = output.result.error
+                terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
+                terminal_errors[sched_req_id] = output.result.error
             else:
-                terminal_statuses[req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
-                terminal_errors[req_id] = None
+                terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
+                terminal_errors[sched_req_id] = None
 
         finished_req_ids |= self._finish_requests(terminal_statuses, terminal_errors)
         return finished_req_ids

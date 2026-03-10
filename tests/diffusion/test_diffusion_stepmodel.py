@@ -26,6 +26,8 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestState as SchedulerRequestState,
+)
+from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     SchedulerInterface,
@@ -80,9 +82,7 @@ class _StepPipeline:
     def post_decode(self, state, **kwargs):
         del kwargs
         self.decode_calls += 1
-        return DiffusionOutput(
-            output=torch.tensor([state.step_index], dtype=torch.float32)
-        )
+        return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
 class _AbortAwareScheduler(SchedulerInterface):
@@ -97,10 +97,10 @@ class _AbortAwareScheduler(SchedulerInterface):
         del od_config
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
-        req_id = request.request_ids[0]
-        self._state = SchedulerRequestState(sched_req_id=req_id, req=request)
+        sched_req_id = request.request_ids[0]
+        self._state = SchedulerRequestState(sched_req_id=sched_req_id, req=request)
         self._scheduled = False
-        return req_id
+        return sched_req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
         req_states = []
@@ -120,9 +120,7 @@ class _AbortAwareScheduler(SchedulerInterface):
             num_waiting_reqs=0,
         )
 
-    def update_from_output(
-        self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput
-    ) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         del sched_output, output
         if self._state is None:
             return set()
@@ -131,36 +129,33 @@ class _AbortAwareScheduler(SchedulerInterface):
             return {self._state.sched_req_id}
         return set()
 
-    def abort_request(self, req_id: str) -> bool:
-        if self._state is None or self._state.sched_req_id != req_id:
+    def abort_request(self, sched_req_id: str) -> bool:
+        if self._state is None or self._state.sched_req_id != sched_req_id:
             return False
         self._state.status = DiffusionRequestStatus.FINISHED_ABORTED
-        self._finished_req_ids.add(req_id)
+        self._finished_req_ids.add(sched_req_id)
         return True
 
     def has_requests(self) -> bool:
-        return (
-            self._state is not None
-            and self._state.status < DiffusionRequestStatus.FINISHED_COMPLETED
-        )
+        return self._state is not None and self._state.status < DiffusionRequestStatus.FINISHED_COMPLETED
 
-    def get_request_state(self, req_id: str):
-        if self._state is not None and self._state.sched_req_id == req_id:
+    def get_request_state(self, sched_req_id: str):
+        if self._state is not None and self._state.sched_req_id == sched_req_id:
             return self._state
         return None
 
-    def pop_request_state(self, req_id: str):
-        if self._state is not None and self._state.sched_req_id == req_id:
+    def pop_request_state(self, sched_req_id: str):
+        if self._state is not None and self._state.sched_req_id == sched_req_id:
             state, self._state = self._state, None
             return state
         return None
 
-    def preempt_request(self, req_id: str) -> bool:
-        del req_id
+    def preempt_request(self, sched_req_id: str) -> bool:
+        del sched_req_id
         return False
 
-    def finish_request(self, req_id: str, status) -> None:
-        del req_id, status
+    def finish_request(self, sched_req_id: str, status) -> None:
+        del sched_req_id, status
 
     def close(self) -> None:
         self._state = None
@@ -195,10 +190,10 @@ def _make_runner():
     return runner
 
 
-def _make_scheduler_output(req, req_id="req-1", step_id=0, finished_req_ids=None):
+def _make_scheduler_output(req, sched_req_id="req-1", step_id=0, finished_req_ids=None):
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        req_states=[SchedulerRequestState(sched_req_id=req_id, req=req)],
+        req_states=[SchedulerRequestState(sched_req_id=sched_req_id, req=req)],
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
         num_running_reqs=1,
         num_waiting_reqs=0,
@@ -208,9 +203,7 @@ def _make_scheduler_output(req, req_id="req-1", step_id=0, finished_req_ids=None
 def _make_engine_request(req_id="req-1", num_inference_steps=2):
     return OmniDiffusionRequest(
         prompts=[f"prompt-{req_id}"],
-        sampling_params=OmniDiffusionSamplingParams(
-            num_inference_steps=num_inference_steps
-        ),
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_inference_steps),
         request_ids=[req_id],
     )
 
@@ -224,6 +217,7 @@ def _make_engine(scheduler: SchedulerInterface, execute_fn=None):
     engine.execute_fn = execute_fn
     engine._rpc_lock = threading.RLock()
     engine.abort_queue = queue.Queue()
+    engine._request_id_to_sched_req_id = {}
     return engine
 
 
@@ -249,22 +243,16 @@ class TestRunner:
     def test_completes_request_and_clears_state(self, monkeypatch):
         runner = _make_runner()
         req = _make_step_request()
-        monkeypatch.setattr(
-            model_runner_module, "set_forward_context", _noop_forward_context
-        )
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
-        first = DiffusionModelRunner.execute_stepwise(
-            runner, _make_scheduler_output(req, step_id=0)
-        )
+        first = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
         assert first.req_id == "req-1"
         assert first.step_index == 1
         assert first.finished is False
         assert first.result is None
         assert "req-1" in runner.state_cache
 
-        second = DiffusionModelRunner.execute_stepwise(
-            runner, _make_scheduler_output(req, step_id=1)
-        )
+        second = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=1))
         assert second.req_id == "req-1"
         assert second.step_index == 2
         assert second.finished is True
@@ -284,9 +272,7 @@ class TestWorker:
 
     def test_delegates_to_model_runner(self):
         worker = object.__new__(DiffusionWorker)
-        expected = RunnerOutput(
-            req_id="req-1", step_index=1, finished=False, result=None
-        )
+        expected = RunnerOutput(req_id="req-1", step_index=1, finished=False, result=None)
         scheduler_output = SimpleNamespace(
             req_states=[
                 SimpleNamespace(
@@ -313,12 +299,10 @@ class TestExecutor:
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor.od_config = object()
         executor._ensure_open = lambda: None
-        executor.collective_rpc = Mock(
-            return_value=DiffusionOutput(output=torch.tensor([1.0]))
-        )
+        executor.collective_rpc = Mock(return_value=DiffusionOutput(output=torch.tensor([1.0])))
 
         request = _make_engine_request("req-exec", num_inference_steps=1)
-        scheduler_output = _make_scheduler_output(request, req_id="req-exec")
+        scheduler_output = _make_scheduler_output(request, sched_req_id="req-exec")
 
         output = MultiprocDiffusionExecutor.execute_request(executor, scheduler_output)
 
@@ -331,13 +315,11 @@ class TestExecutor:
     def test_execute_step_passes_through_runner_output(self):
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._ensure_open = lambda: None
-        expected = RunnerOutput(
-            req_id="req-step", step_index=1, finished=False, result=None
-        )
+        expected = RunnerOutput(req_id="req-step", step_index=1, finished=False, result=None)
         executor.collective_rpc = Mock(return_value=expected)
 
         request = _make_engine_request("req-step", num_inference_steps=2)
-        scheduler_output = _make_scheduler_output(request, req_id="req-step")
+        scheduler_output = _make_scheduler_output(request, sched_req_id="req-step")
 
         output = MultiprocDiffusionExecutor.execute_step(executor, scheduler_output)
 
@@ -368,9 +350,7 @@ class TestEngine:
                 req_id="req-step",
                 step_index=call_count["n"],
                 finished=finished,
-                result=(
-                    DiffusionOutput(output=torch.tensor([2.0])) if finished else None
-                ),
+                result=(DiffusionOutput(output=torch.tensor([2.0])) if finished else None),
             )
 
         engine.execute_fn = execute_fn
@@ -395,9 +375,7 @@ class TestEngine:
             ),
         )
 
-        output = engine.add_req_and_wait_for_response(
-            _make_engine_request("req-full", num_inference_steps=1)
-        )
+        output = engine.add_req_and_wait_for_response(_make_engine_request("req-full", num_inference_steps=1))
 
         assert output.error is None
         assert torch.equal(output.output, torch.tensor([7.0]))
@@ -416,9 +394,7 @@ class TestEngine:
             ),
         )
 
-        output = engine.add_req_and_wait_for_response(
-            _make_engine_request("req-error", num_inference_steps=2)
-        )
+        output = engine.add_req_and_wait_for_response(_make_engine_request("req-error", num_inference_steps=2))
 
         assert output.output is None
         assert output.error == "boom"
@@ -432,9 +408,7 @@ class TestEngine:
             execute_fn=lambda _: (_ for _ in ()).throw(RuntimeError("gpu on fire")),
         )
 
-        output = engine.add_req_and_wait_for_response(
-            _make_engine_request("req-raise", num_inference_steps=2)
-        )
+        output = engine.add_req_and_wait_for_response(_make_engine_request("req-raise", num_inference_steps=2))
 
         assert output.output is None
         assert "gpu on fire" in output.error
@@ -457,9 +431,7 @@ class TestEngineAbort:
 
         def execute_fn(_):
             engine.abort("req-abort")
-            return RunnerOutput(
-                req_id="req-abort", step_index=1, finished=False, result=None
-            )
+            return RunnerOutput(req_id="req-abort", step_index=1, finished=False, result=None)
 
         engine.execute_fn = execute_fn
 
@@ -467,6 +439,34 @@ class TestEngineAbort:
 
         assert output.output is None
         assert output.error == "Request req-abort aborted."
+        assert engine._request_id_to_sched_req_id == {}
+
+    def test_abort_batched_request_by_secondary_request_id(self):
+        scheduler = _AbortAwareScheduler()
+        scheduler.initialize(Mock())
+        engine = _make_engine(scheduler)
+        request = OmniDiffusionRequest(
+            prompts=["prompt-a", "prompt-b"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+            request_ids=["req-batch-a", "req-batch-b"],
+        )
+
+        def execute_fn(_):
+            engine.abort("req-batch-b")
+            return RunnerOutput(
+                req_id="req-batch-a",
+                step_index=1,
+                finished=False,
+                result=None,
+            )
+
+        engine.execute_fn = execute_fn
+
+        output = engine.add_req_and_wait_for_response(request)
+
+        assert output.output is None
+        assert output.error == "Request req-batch-a aborted."
+        assert engine._request_id_to_sched_req_id == {}
 
     def test_duplicate_abort_is_idempotent(self):
         """Calling abort twice for the same request does not raise or corrupt state."""
@@ -482,9 +482,7 @@ class TestEngineAbort:
             if step["n"] == 1:
                 engine.abort("req-dup")
                 engine.abort("req-dup")
-            return RunnerOutput(
-                req_id="req-dup", step_index=step["n"], finished=False, result=None
-            )
+            return RunnerOutput(req_id="req-dup", step_index=step["n"], finished=False, result=None)
 
         engine.execute_fn = execute_fn
 
@@ -510,9 +508,7 @@ class TestEngineAbort:
                 finished=True,
                 result=DiffusionOutput(output=torch.tensor([1.0])),
             )
-            output = engine.add_req_and_wait_for_response(
-                _make_engine_request("req-done", num_inference_steps=1)
-            )
+            output = engine.add_req_and_wait_for_response(_make_engine_request("req-done", num_inference_steps=1))
             assert output.error is None
             target_id = "req-done"
         else:
@@ -535,9 +531,7 @@ class TestEngineAbort:
             step["n"] += 1
             if step["n"] == 2:
                 engine.abort("req-mid")
-            return RunnerOutput(
-                req_id="req-mid", step_index=step["n"], finished=False, result=None
-            )
+            return RunnerOutput(req_id="req-mid", step_index=step["n"], finished=False, result=None)
 
         engine.execute_fn = execute_fn
 
@@ -566,10 +560,7 @@ class TestSchedulerAbort:
         assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.WAITING
 
         assert scheduler.abort_request(req_id) is True
-        assert (
-            scheduler.get_request_state(req_id).status
-            == DiffusionRequestStatus.FINISHED_ABORTED
-        )
+        assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
 
         sched_output = scheduler.schedule()
         assert len(sched_output.req_states) == 0
@@ -631,9 +622,7 @@ class TestAsyncAbort:
             task = asyncio.create_task(
                 async_engine.generate(
                     prompt="a prompt",
-                    sampling_params=OmniDiffusionSamplingParams(
-                        num_inference_steps=4
-                    ),
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
                     request_id="req-async",
                 )
             )
@@ -660,9 +649,7 @@ class TestAsyncAbort:
         def step(request):
             request_id = request.request_ids[0]
             first_started.set()
-            assert abort_forwarded.wait(timeout=5), (
-                "entrypoint abort never reached engine.abort"
-            )
+            assert abort_forwarded.wait(timeout=5), "entrypoint abort never reached engine.abort"
             raise Exception(f"Request {request_id} aborted.")
 
         engine = Mock()
@@ -681,16 +668,12 @@ class TestAsyncAbort:
             task = asyncio.create_task(
                 async_engine.generate(
                     prompt="running prompt",
-                    sampling_params=OmniDiffusionSamplingParams(
-                        num_inference_steps=4
-                    ),
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
                     request_id="req-running",
                 )
             )
 
-            assert await asyncio.to_thread(first_started.wait, 5), (
-                "running request never started"
-            )
+            assert await asyncio.to_thread(first_started.wait, 5), "running request never started"
 
             await async_engine.abort("req-running")
 
@@ -714,9 +697,7 @@ class TestAsyncAbort:
             started_request_ids.append(request_id)
             if request_id == "req-running":
                 first_started.set()
-                assert release_first.wait(timeout=5), (
-                    "timed out waiting to release first request"
-                )
+                assert release_first.wait(timeout=5), "timed out waiting to release first request"
             return [SimpleNamespace(request_id=request_id, images=[])]
 
         engine = Mock()
@@ -730,23 +711,17 @@ class TestAsyncAbort:
             running_task = asyncio.create_task(
                 async_engine.generate(
                     prompt="running prompt",
-                    sampling_params=OmniDiffusionSamplingParams(
-                        num_inference_steps=4
-                    ),
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
                     request_id="req-running",
                 )
             )
 
-            assert await asyncio.to_thread(first_started.wait, 5), (
-                "first request never started"
-            )
+            assert await asyncio.to_thread(first_started.wait, 5), "first request never started"
 
             queued_task = asyncio.create_task(
                 async_engine.generate(
                     prompt="queued prompt",
-                    sampling_params=OmniDiffusionSamplingParams(
-                        num_inference_steps=4
-                    ),
+                    sampling_params=OmniDiffusionSamplingParams(num_inference_steps=4),
                     request_id="req-queued",
                 )
             )
