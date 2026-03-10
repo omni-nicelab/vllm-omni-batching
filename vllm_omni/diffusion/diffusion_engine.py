@@ -242,7 +242,7 @@ class DiffusionEngine:
                     
                 # check abort queue
                 self._process_aborts_queue()
-                
+
                 finished_req_ids = self.scheduler.update_from_output(sched_output, output)
                 if target_req_id in finished_req_ids:
                     state = self.scheduler.get_request_state(target_req_id)
@@ -475,7 +475,8 @@ class DiffusionEngine:
                 # Should be a list here, but also handle string just in case.
                 request_ids.extend((ids,) if isinstance(ids, str) else ids)
             # More efficient to abort all as a single batch.
-            self.abort_requests(request_ids)
+            self._abort_requests(request_ids)
     
-    def abort_requests(self, request_id):
-        self.scheduler.finish_requests(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+    def _abort_requests(self, request_id):
+        # TODO:support finish_request function
+        self.scheduler.abort_request(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
