@@ -239,7 +239,7 @@ class DiffusionEngine:
                         finished=True,
                         result=DiffusionOutput(error=str(exc)),
                     )
-                    
+                output.error = output.result.error if output.result is not None else None
                 # check abort queue
                 self._process_aborts_queue()
 
@@ -476,7 +476,10 @@ class DiffusionEngine:
                 request_ids.extend((ids,) if isinstance(ids, str) else ids)
             # More efficient to abort all as a single batch.
             self._abort_requests(request_ids)
-    
-    def _abort_requests(self, request_id):
-        # TODO:support finish_request function
-        self.scheduler.abort_request(request_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
+        if isinstance(request_ids, str):
+            request_ids = [request_ids]
+
+        for req_id in dict.fromkeys(request_ids):
+            self.scheduler.abort_request(req_id)
