@@ -47,6 +47,9 @@ class DiffusionRequestState:
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
+    def is_finished(self) -> bool:
+        return DiffusionRequestStatus.is_finished(self.status)
+
 
 @dataclass
 class DiffusionSchedulerOutput:

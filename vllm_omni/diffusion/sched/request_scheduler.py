@@ -81,7 +81,7 @@ class RequestScheduler(SchedulerInterface):
         completed_req_ids: set[str] = set()
         for req_id in scheduled_req_ids:
             state = self._request_states.get(req_id)
-            if state is None:
+            if state is None or state.is_finished():
                 continue
             if output.result is None:
                 state.status = DiffusionRequestStatus.FINISHED_ERROR

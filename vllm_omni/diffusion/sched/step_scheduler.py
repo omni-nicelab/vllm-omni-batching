@@ -119,7 +119,7 @@ class StepScheduler(SchedulerInterface):
         for req_id in scheduled_req_ids:
             state = self._request_states.get(req_id)
             progress = self._request_progress.get(req_id)
-            if state is None or progress is None:
+            if state is None or progress is None or state.is_finished():
                 continue
 
             if output_error is not None:
