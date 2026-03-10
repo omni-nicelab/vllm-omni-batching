@@ -9,9 +9,11 @@ enabling concurrent request handling and streaming generation.
 """
 
 import asyncio
+import threading
 import uuid
 from collections.abc import AsyncGenerator, Iterable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 from vllm.logger import init_logger
@@ -25,6 +27,12 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _AsyncDiffusionRequestState:
+    future: Future[list[OmniRequestOutput]]
+    abort_requested: bool = False
 
 
 class AsyncOmniDiffusion:
@@ -124,6 +132,8 @@ class AsyncOmniDiffusion:
 
         # Thread pool for running sync engine in async context
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._request_lock = threading.Lock()
+        self._request_states: dict[str, _AsyncDiffusionRequestState] = {}
         self._closed = False
 
         logger.info("AsyncOmniDiffusion initialized with model: %s", model)
@@ -165,19 +175,24 @@ class AsyncOmniDiffusion:
 
         logger.debug("Starting generation for request %s", request_id)
 
-        # Run engine in thread pool
-        loop = asyncio.get_event_loop()
+        future = self._executor.submit(self.engine.step, request)
+        with self._request_lock:
+            self._request_states[request_id] = _AsyncDiffusionRequestState(future=future)
+
         try:
-            # In async mode, only a single request is submitted at a time
-            result = await loop.run_in_executor(
-                self._executor,
-                self.engine.step,
-                request,
-            )
+            result = await asyncio.wrap_future(future)
             result = result[0]
+        except asyncio.CancelledError as e:
+            if self._is_abort_requested(request_id, future):
+                logger.info("Generation aborted for request %s before completion", request_id)
+                raise RuntimeError(f"Diffusion generation failed: Request {request_id} aborted.") from e
+            await self.abort(request_id)
+            raise
         except Exception as e:
             logger.error("Generation failed for request %s: %s", request_id, e)
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
+        finally:
+            self._clear_request_state(request_id, future)
 
         # Update request_id if needed
         if not result.request_id:
@@ -216,6 +231,19 @@ class AsyncOmniDiffusion:
             return
         self._closed = True
 
+        running_request_ids: list[str] = []
+        with self._request_lock:
+            for request_id, state in self._request_states.items():
+                state.abort_requested = True
+                if not state.future.done() and not state.future.cancel():
+                    running_request_ids.append(request_id)
+
+        if running_request_ids:
+            try:
+                self.engine.abort(running_request_ids)
+            except Exception as e:
+                logger.warning("Error aborting diffusion requests during shutdown: %s", e)
+
         try:
             self.engine.close()
         except Exception as e:
@@ -241,7 +269,29 @@ class AsyncOmniDiffusion:
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort a request."""
-        self.engine.abort(request_id)
+        if isinstance(request_id, str):
+            request_ids = [request_id]
+        else:
+            request_ids = list(request_id)
+
+        engine_abort_ids: list[str] = []
+        with self._request_lock:
+            for req_id in request_ids:
+                state = self._request_states.get(req_id)
+                if state is None:
+                    engine_abort_ids.append(req_id)
+                    continue
+
+                state.abort_requested = True
+                if state.future.done():
+                    continue
+                if state.future.cancel():
+                    logger.debug("Cancelled queued diffusion request %s before execution", req_id)
+                    continue
+                engine_abort_ids.append(req_id)
+
+        if engine_abort_ids:
+            self.engine.abort(engine_abort_ids)
 
     @property
     def is_running(self) -> bool:
@@ -340,3 +390,14 @@ class AsyncOmniDiffusion:
             self._executor,
             self.engine.stop_profile,
         )
+
+    def _is_abort_requested(self, request_id: str, future: Future[list[OmniRequestOutput]]) -> bool:
+        with self._request_lock:
+            state = self._request_states.get(request_id)
+            return state is not None and state.future is future and state.abort_requested
+
+    def _clear_request_state(self, request_id: str, future: Future[list[OmniRequestOutput]]) -> None:
+        with self._request_lock:
+            state = self._request_states.get(request_id)
+            if state is not None and state.future is future:
+                self._request_states.pop(request_id, None)

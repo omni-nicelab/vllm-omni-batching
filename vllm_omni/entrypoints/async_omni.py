@@ -192,6 +192,7 @@ class AsyncOmni(OmniBase):
                     "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
                     "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
                     "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
+                    "step_execution": kwargs.get("step_execution", False),
                 },
                 "final_output": True,
                 "final_output_type": "image",

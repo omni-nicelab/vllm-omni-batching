@@ -187,6 +187,9 @@ class DiffusionLoRAManager:
             lora_scale: The external scale for the LoRA adapter.
         """
         if lora_request is None:
+            if self._active_adapter_id is None:
+                logger.debug("No active LoRA adapter to deactivate")
+                return
             logger.debug("No lora_request provided, deactivating all LoRA adapters")
             self._deactivate_all_adapters()
             return
