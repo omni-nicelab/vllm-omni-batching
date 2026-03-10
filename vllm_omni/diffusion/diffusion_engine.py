@@ -267,7 +267,7 @@ class DiffusionEngine:
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
-            target_req_id = self.scheduler.add_request(request)
+            target_sched_req_id = self.scheduler.add_request(request)
 
             while True:
                 sched_output = self.scheduler.schedule()
@@ -280,12 +280,16 @@ class DiffusionEngine:
                 try:
                     output = self.executor.add_req(req_state.req)
                 except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", req_state.req_id, exc_info=True)
+                    logger.error(
+                        "Execution failed for diffusion request %s",
+                        req_state.sched_req_id,
+                        exc_info=True,
+                    )
                     output = DiffusionOutput(error=str(exc))
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, output)
-                if target_req_id in finished_req_ids:
-                    self.scheduler.pop_request_state(target_req_id)
+                if target_sched_req_id in finished_req_ids:
+                    self.scheduler.pop_request_state(target_sched_req_id)
                     return output
 
     def start_profile(self, trace_filename: str | None = None) -> None:
