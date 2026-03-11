@@ -89,12 +89,6 @@ class DiffusionRequestState:
             return False
         return self.step_index >= total_steps
 
-    @property
-    def new_request(self) -> bool:
-        # TODO: this is only an approximation for current stepwise mode.
-        # A real "new request" signal should eventually come from scheduler/runner state transitions.
-        return self.step_index == 0 or self.timesteps is None
-
 
 @dataclass
 class RunnerOutput:

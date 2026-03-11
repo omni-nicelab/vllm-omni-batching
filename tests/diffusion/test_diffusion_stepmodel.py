@@ -25,12 +25,14 @@ from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionEx
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, StepScheduler
 from vllm_omni.diffusion.sched.interface import (
-    DiffusionRequestState as SchedulerRequestState,
-)
-from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    NewRequestData,
     SchedulerInterface,
+)
+from vllm_omni.diffusion.sched.interface import (
+    DiffusionRequestState as SchedulerRequestState,
 )
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
@@ -110,20 +112,21 @@ class _AbortAwareScheduler(SchedulerInterface):
         return sched_req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
-        req_states = []
+        scheduled_new_reqs = []
         if (
             self._state is not None
             and self._state.status < DiffusionRequestStatus.FINISHED_COMPLETED
             and not self._scheduled
         ):
             self._state.status = DiffusionRequestStatus.RUNNING
-            req_states = [self._state]
+            scheduled_new_reqs = [NewRequestData.from_state(self._state)]
             self._scheduled = True
         return DiffusionSchedulerOutput(
             step_id=0,
-            req_states=req_states,
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
             finished_req_ids=set(self._finished_req_ids),
-            num_running_reqs=len(req_states),
+            num_running_reqs=len(scheduled_new_reqs),
             num_waiting_reqs=0,
         )
 
@@ -200,7 +203,19 @@ def _make_runner():
 def _make_scheduler_output(req, sched_req_id="req-1", step_id=0, finished_req_ids=None):
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        req_states=[SchedulerRequestState(sched_req_id=sched_req_id, req=req)],
+        scheduled_new_reqs=[NewRequestData(sched_req_id=sched_req_id, req=req)],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
+        num_running_reqs=1,
+        num_waiting_reqs=0,
+    )
+
+
+def _make_cached_scheduler_output(sched_req_id="req-1", step_id=0, finished_req_ids=None):
+    return DiffusionSchedulerOutput(
+        step_id=step_id,
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData(sched_req_ids=[sched_req_id]),
         finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
         num_running_reqs=1,
         num_waiting_reqs=0,
@@ -259,7 +274,7 @@ class TestRunner:
         assert first.result is None
         assert "req-1" in runner.state_cache
 
-        second = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=1))
+        second = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
         assert second.req_id == "req-1"
         assert second.step_index == 2
         assert second.finished is True
@@ -273,6 +288,13 @@ class TestRunner:
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
 
+    def test_cached_request_requires_existing_state(self, monkeypatch):
+        runner = _make_runner()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        with pytest.raises(ValueError, match="Missing cached state for request req-1"):
+            DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
 
 class TestWorker:
     """DiffusionWorker.execute_stepwise"""
@@ -281,13 +303,14 @@ class TestWorker:
         worker = object.__new__(DiffusionWorker)
         expected = RunnerOutput(req_id="req-1", step_index=1, finished=False, result=None)
         scheduler_output = SimpleNamespace(
-            req_states=[
+            scheduled_new_reqs=[
                 SimpleNamespace(
                     req=SimpleNamespace(
                         sampling_params=SimpleNamespace(lora_request=None),
                     )
                 )
-            ]
+            ],
+            scheduled_cached_reqs=SimpleNamespace(sched_req_ids=[]),
         )
         worker.lora_manager = None
         worker.model_runner = SimpleNamespace(
@@ -568,7 +591,7 @@ class TestSchedulerAbort:
         assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
 
         sched_output = scheduler.schedule()
-        assert len(sched_output.req_states) == 0
+        assert sched_output.num_scheduled_reqs == 0
 
     def test_request_scheduler_abort(self):
         """Abort path through RequestScheduler returns an aborted error."""

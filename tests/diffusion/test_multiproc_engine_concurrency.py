@@ -82,13 +82,16 @@ def _start_worker(req_q, res_q, count=2):
         if method in {"generate", "execute_model"} and args and hasattr(args[0], "request_ids"):
             return f"result_for_{args[0].request_ids[0]}"
 
-        if method == "execute_stepwise" and args and hasattr(args[0], "req_states"):
-            req_states = args[0].req_states
-            if req_states:
-                request_ids = getattr(req_states[0].req, "request_ids", None)
+        if method == "execute_stepwise" and args and hasattr(args[0], "scheduled_new_reqs"):
+            new_reqs = args[0].scheduled_new_reqs
+            if new_reqs:
+                request_ids = getattr(new_reqs[0].req, "request_ids", None)
                 if request_ids:
                     return f"result_for_{request_ids[0]}"
-                return f"result_for_{req_states[0].sched_req_id}"
+                return f"result_for_{new_reqs[0].sched_req_id}"
+            cached_req_ids = getattr(args[0].scheduled_cached_reqs, "sched_req_ids", [])
+            if cached_req_ids:
+                return f"result_for_{cached_req_ids[0]}"
 
         if args:
             return f"result_for_{args[0]}"

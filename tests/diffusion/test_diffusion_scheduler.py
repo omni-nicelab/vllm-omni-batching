@@ -18,6 +18,7 @@ from vllm_omni.diffusion.sched import (
     SchedulerInterface,
     StepScheduler,
 )
+from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -55,6 +56,14 @@ def _make_request_output(req_id: str, *, error: str | None = None) -> RunnerOutp
     )
 
 
+def _new_ids(sched_output) -> list[str]:
+    return [req.sched_req_id for req in sched_output.scheduled_new_reqs]
+
+
+def _cached_ids(sched_output) -> list[str]:
+    return list(sched_output.scheduled_cached_reqs.sched_req_ids)
+
+
 class _StubScheduler(SchedulerInterface):
     def __init__(self, request: OmniDiffusionRequest, output: DiffusionOutput) -> None:
         self._request = request
@@ -74,9 +83,19 @@ class _StubScheduler(SchedulerInterface):
 
     def schedule(self):
         if self._scheduled or self._state is None:
-            return Mock(req_states=[])
+            return Mock(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData.make_empty(),
+                scheduled_req_ids=[],
+                is_empty=True,
+            )
         self._scheduled = True
-        return Mock(req_states=[self._state])
+        return Mock(
+            scheduled_new_reqs=[NewRequestData.from_state(self._state)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            scheduled_req_ids=[self._state.sched_req_id],
+            is_empty=False,
+        )
 
     def update_from_output(self, sched_output, output: RunnerOutput) -> set[str]:
         del sched_output
@@ -120,8 +139,8 @@ class TestRequestScheduler:
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.WAITING
 
         sched_output = self.scheduler.schedule()
-        assert len(sched_output.req_states) == 1
-        assert sched_output.req_states[0].sched_req_id == req_id
+        assert _new_ids(sched_output) == [req_id]
+        assert _cached_ids(sched_output) == []
         assert sched_output.num_running_reqs == 1
         assert sched_output.num_waiting_reqs == 0
 
@@ -158,20 +177,23 @@ class TestRequestScheduler:
         req_id_b = self.scheduler.add_request(_make_request("b"))
 
         first = self.scheduler.schedule()
-        assert [s.sched_req_id for s in first.req_states] == [req_id_a]
+        assert _new_ids(first) == [req_id_a]
+        assert _cached_ids(first) == []
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
         # Request A is still running; scheduling again should not pull B.
         second = self.scheduler.schedule()
-        assert [s.sched_req_id for s in second.req_states] == [req_id_a]
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [req_id_a]
         assert second.num_running_reqs == 1
         assert second.num_waiting_reqs == 1
 
         self.scheduler.update_from_output(first, _make_request_output(req_id_a))
 
         third = self.scheduler.schedule()
-        assert [s.sched_req_id for s in third.req_states] == [req_id_b]
+        assert _new_ids(third) == [req_id_b]
+        assert _cached_ids(third) == []
         assert third.num_running_reqs == 1
         assert third.num_waiting_reqs == 0
 
@@ -186,7 +208,7 @@ class TestRequestScheduler:
 
         # A should still run normally.
         output_a = self.scheduler.schedule()
-        assert [s.sched_req_id for s in output_a.req_states] == [req_id_a]
+        assert _new_ids(output_a) == [req_id_a]
 
         # Abort running request.
         assert self.scheduler.abort_request(req_id_a) is True
@@ -194,7 +216,7 @@ class TestRequestScheduler:
         assert state_a.status == DiffusionRequestStatus.FINISHED_ABORTED
 
         assert self.scheduler.has_requests() is False
-        assert self.scheduler.schedule().req_states == []
+        assert self.scheduler.schedule().scheduled_req_ids == []
 
     def test_has_requests_state_transition(self) -> None:
         assert self.scheduler.has_requests() is False
@@ -302,19 +324,22 @@ class TestStepScheduler:
         req_id = self.scheduler.add_request(request)
 
         first = self.scheduler.schedule()
-        assert [s.sched_req_id for s in first.req_states] == [req_id]
+        assert _new_ids(first) == [req_id]
+        assert _cached_ids(first) == []
         assert self.scheduler.update_from_output(first, _make_step_output(req_id, step_index=1)) == set()
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.RUNNING
         assert request.sampling_params.step_index == 1
         assert self.scheduler.has_requests() is True
 
         second = self.scheduler.schedule()
-        assert [s.sched_req_id for s in second.req_states] == [req_id]
+        assert _new_ids(second) == []
+        assert _cached_ids(second) == [req_id]
         assert self.scheduler.update_from_output(second, _make_step_output(req_id, step_index=2)) == set()
         assert request.sampling_params.step_index == 2
 
         third = self.scheduler.schedule()
-        assert [s.sched_req_id for s in third.req_states] == [req_id]
+        assert _new_ids(third) == []
+        assert _cached_ids(third) == [req_id]
         assert self.scheduler.update_from_output(
             third,
             _make_step_output(req_id, step_index=3, finished=True),
@@ -340,24 +365,24 @@ class TestStepScheduler:
         )
 
         first = self.scheduler.schedule()
-        assert [s.sched_req_id for s in first.req_states] == [req_id_a]
+        assert _new_ids(first) == [req_id_a]
         assert self.scheduler.update_from_output(first, _make_step_output(req_id_a, step_index=1)) == set()
         assert self.scheduler._running == [req_id_a]
         assert list(self.scheduler._waiting) == [req_id_b]
 
         second = self.scheduler.schedule()
-        assert [s.sched_req_id for s in second.req_states] == [req_id_a]
+        assert _cached_ids(second) == [req_id_a]
         assert self.scheduler.update_from_output(
             second,
             _make_step_output(req_id_a, step_index=2, finished=True),
         ) == {req_id_a}
 
         third = self.scheduler.schedule()
-        assert [s.sched_req_id for s in third.req_states] == [req_id_b]
+        assert _new_ids(third) == [req_id_b]
         assert self.scheduler.update_from_output(third, _make_step_output(req_id_b, step_index=1)) == set()
 
         fourth = self.scheduler.schedule()
-        assert [s.sched_req_id for s in fourth.req_states] == [req_id_b]
+        assert _cached_ids(fourth) == [req_id_b]
         assert self.scheduler.update_from_output(
             fourth,
             _make_step_output(req_id_b, step_index=2, finished=True),
@@ -391,9 +416,9 @@ class TestStepScheduler:
         # Current upstream request is already pre-batched, so StepScheduler must
         # not co-batch multiple requests here. Revisit this assertion if the
         # upper-layer request shape is refactored for real continuous batching.
-        assert len(sched_output.req_states) <= 1
+        assert sched_output.num_scheduled_reqs <= 1
         assert sched_output.num_running_reqs <= 1
-        assert [s.sched_req_id for s in sched_output.req_states] == [req_id_a]
+        assert _new_ids(sched_output) == [req_id_a]
         assert sched_output.num_waiting_reqs == 2
 
     def test_error_output_marks_finished_error(self) -> None:
@@ -406,7 +431,7 @@ class TestStepScheduler:
         )
 
         sched_output = self.scheduler.schedule()
-        assert [s.sched_req_id for s in sched_output.req_states] == [req_id]
+        assert _new_ids(sched_output) == [req_id]
         finished = self.scheduler.update_from_output(
             sched_output,
             _make_step_output(req_id, step_index=0, finished=True, error="worker failed"),
@@ -438,7 +463,7 @@ class TestStepScheduler:
         assert self.scheduler.get_request_state(req_id_b).status == DiffusionRequestStatus.FINISHED_ABORTED
 
         running = self.scheduler.schedule()
-        assert [s.sched_req_id for s in running.req_states] == [req_id_a]
+        assert _new_ids(running) == [req_id_a]
 
         assert self.scheduler.abort_request(req_id_a) is True
         assert self.scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.FINISHED_ABORTED
@@ -457,13 +482,13 @@ class TestStepScheduler:
         assert request.sampling_params.step_index == 1
 
         second = self.scheduler.schedule()
-        assert [s.sched_req_id for s in second.req_states] == [req_id]
+        assert _cached_ids(second) == [req_id]
         assert self.scheduler.preempt_request(req_id) is True
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.PREEMPTED
         assert request.sampling_params.step_index == 1
 
         third = self.scheduler.schedule()
-        assert [s.sched_req_id for s in third.req_states] == [req_id]
+        assert _cached_ids(third) == [req_id]
         assert request.sampling_params.step_index == 1
 
     @pytest.mark.parametrize(
@@ -502,7 +527,7 @@ class TestStepScheduler:
 
         for _ in range(expected_steps - 1):
             sched_output = self.scheduler.schedule()
-            assert [s.sched_req_id for s in sched_output.req_states] == [req_id]
+            assert sched_output.scheduled_req_ids == [req_id]
             next_step = request.sampling_params.step_index + 1
             assert (
                 self.scheduler.update_from_output(
@@ -513,7 +538,7 @@ class TestStepScheduler:
             )
 
         final_output = self.scheduler.schedule()
-        assert [s.sched_req_id for s in final_output.req_states] == [req_id]
+        assert final_output.scheduled_req_ids == [req_id]
         assert self.scheduler.update_from_output(
             final_output,
             _make_step_output(req_id, step_index=expected_steps, finished=True),

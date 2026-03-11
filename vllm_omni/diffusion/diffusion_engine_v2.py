@@ -288,7 +288,7 @@ class DiffusionEngine:
                 continue
 
             sched_output = self.scheduler.schedule()
-            if not sched_output.req_states:
+            if sched_output.is_empty:
                 if self._shutdown.is_set() and not self.scheduler.has_requests():
                     break
                 time.sleep(0.001)
@@ -344,7 +344,7 @@ class DiffusionEngine:
             with self._rpc_lock:
                 runner_output = self.execute(sched_output)
         except Exception as exc:
-            sched_req_id = sched_output.req_states[0].sched_req_id if sched_output.req_states else ""
+            sched_req_id = sched_output.scheduled_req_ids[0] if sched_output.scheduled_req_ids else ""
             logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
             runner_output = RunnerOutput(
                 req_id=sched_req_id,
@@ -361,7 +361,10 @@ class DiffusionEngine:
         runner_output: RunnerOutput,
         finished_req_ids: set[str],
     ) -> None:
-        for req_state in sched_output.req_states:
+        for sched_req_id in sched_output.scheduled_req_ids:
+            req_state = self.scheduler.get_request_state(sched_req_id)
+            if req_state is None:
+                continue
             event_type = _ENGINE_OUTPUT_PROGRESS
             error = getattr(runner_output, "error", None)
 
@@ -401,7 +404,7 @@ class DiffusionEngine:
 
             while True:
                 sched_output = self.scheduler.schedule()
-                if not sched_output.req_states:
+                if sched_output.is_empty:
                     if target_sched_req_id in sched_output.finished_req_ids:
                         req_state = self.scheduler.get_request_state(target_sched_req_id)
                         self._clear_request_id_mapping(req_state)

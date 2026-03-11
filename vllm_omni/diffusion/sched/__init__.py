@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
     DiffusionRequestState,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    NewRequestData,
     SchedulerInterface,
 )
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler
@@ -15,6 +17,8 @@ Scheduler = RequestScheduler
 __all__ = [
     "DiffusionRequestStatus",
     "DiffusionRequestState",
+    "NewRequestData",
+    "CachedRequestData",
     "DiffusionSchedulerOutput",
     "SchedulerInterface",
     "RequestScheduler",

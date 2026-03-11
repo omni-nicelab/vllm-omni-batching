@@ -11,9 +11,11 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
+    CachedRequestData,
     DiffusionRequestState,
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    NewRequestData,
 )
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 
@@ -32,10 +34,6 @@ class StepScheduler(_BaseScheduler):
     def __init__(self) -> None:
         super().__init__()
         self._request_progress: dict[str, _StepProgress] = {}
-        # currently used by vllm_omni/entrypoints/omni_stage.py,
-        # can't be used for real multi-step scheduling without proper architectural changes,
-        # so we keep it fixed at 1 for now.
-        self._max_batch_size: int = 1
 
     def _reset_scheduler_state(self) -> None:
         self._request_progress.clear()
@@ -68,23 +66,33 @@ class StepScheduler(_BaseScheduler):
         return sched_req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
-        # Schedule waiting requests
-        while self._waiting and len(self._running) < self._max_batch_size:
-            sched_req_id = self._waiting.popleft()
-            state = self._request_states.get(sched_req_id)
-            if state is not None:
-                state.status = DiffusionRequestStatus.RUNNING
-                self._running.append(sched_req_id)
+        scheduled_new_reqs: list[NewRequestData] = []
+        scheduled_cached_req_ids: list[str] = []
 
-        running_states: list[DiffusionRequestState] = []
+        # First, schedule the RUNNING request(s)
         for sched_req_id in self._running:
             state = self._request_states.get(sched_req_id)
             if state is not None:
-                running_states.append(state)
+                scheduled_cached_req_ids.append(sched_req_id)
+
+        # Second, schedule WAITING requests while capacity remains.
+        while self._waiting and len(self._running) < self._max_batch_size:
+            sched_req_id = self._waiting.popleft()
+            state = self._request_states.get(sched_req_id)
+            if state is None:
+                continue
+            was_new_request = state.status == DiffusionRequestStatus.WAITING
+            state.status = DiffusionRequestStatus.RUNNING
+            self._running.append(sched_req_id)
+            if was_new_request:
+                scheduled_new_reqs.append(NewRequestData.from_state(state))
+            else:
+                scheduled_cached_req_ids.append(sched_req_id)
 
         scheduler_output = DiffusionSchedulerOutput(
             step_id=self._step_id,
-            req_states=running_states,
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_cached_reqs=CachedRequestData(sched_req_ids=scheduled_cached_req_ids),
             finished_req_ids=set(self._finished_req_ids),
             num_running_reqs=len(self._running),
             num_waiting_reqs=len(self._waiting),
@@ -96,7 +104,7 @@ class StepScheduler(_BaseScheduler):
         return scheduler_output
 
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
-        scheduled_req_ids = [state.sched_req_id for state in sched_output.req_states]
+        scheduled_req_ids = sched_output.scheduled_req_ids
         if not scheduled_req_ids:
             return set()
 

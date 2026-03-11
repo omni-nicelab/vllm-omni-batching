@@ -203,15 +203,16 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
         """Adapt request-mode scheduler output to worker execute_model RPC."""
         self._ensure_open()
-        if len(scheduler_output.req_states) != 1:
+        if scheduler_output.num_scheduled_reqs != 1:
             raise ValueError(
-                f"Request mode currently supports batch_size=1, but got {len(scheduler_output.req_states)} req_states."
+                f"Request mode currently supports batch_size=1, "
+                f"but got {scheduler_output.num_scheduled_reqs} req_states."
             )
 
-        req_state = scheduler_output.req_states[0]
+        new_req = scheduler_output.scheduled_new_reqs[0]
         result = self.collective_rpc(
             "execute_model",
-            args=(req_state.req, self.od_config),
+            args=(new_req.req, self.od_config),
             unique_reply_rank=0,
             exec_all_ranks=True,
         )
@@ -219,7 +220,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise RuntimeError(f"Unexpected response type for execute_request: {type(result)!r}")
 
         return RunnerOutput(
-            req_id=req_state.sched_req_id,
+            req_id=new_req.sched_req_id,
             step_index=None,
             finished=True,
             result=result,
@@ -240,8 +241,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         # TODO: Remove this fallback; DiffusionOutput cannot faithfully represent
         # failed multi-request step batches.
         if isinstance(result, DiffusionOutput):
-            req_states = scheduler_output.req_states
-            req_id = req_states[0].sched_req_id if req_states else ""
+            req_id = scheduler_output.scheduled_req_ids[0] if scheduler_output.scheduled_req_ids else ""
             return RunnerOutput(
                 req_id=req_id,
                 step_index=None,

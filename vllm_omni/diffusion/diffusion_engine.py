@@ -223,7 +223,7 @@ class DiffusionEngine:
                 # check abort queue
                 self._process_aborts_queue()
                 sched_output = self.scheduler.schedule()
-                if not sched_output.req_states:
+                if sched_output.is_empty:
                     if target_sched_req_id in sched_output.finished_req_ids:
                         state = self.scheduler.get_request_state(target_sched_req_id)
                         self._clear_request_id_mapping(state)
@@ -239,13 +239,13 @@ class DiffusionEngine:
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
 
-                req_state = sched_output.req_states[0]
+                sched_req_id = sched_output.scheduled_req_ids[0]
                 try:
                     model_output = self.execute_fn(sched_output)
                 except Exception as exc:
-                    logger.error("Execution failed for diffusion request %s", req_state.sched_req_id, exc_info=True)
+                    logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
                     model_output = RunnerOutput(
-                        req_id=req_state.sched_req_id,
+                        req_id=sched_req_id,
                         step_index=None,
                         finished=True,
                         result=DiffusionOutput(error=str(exc)),
