@@ -35,6 +35,9 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.entrypoints import async_omni_diffusion as async_omni_diffusion_module
+from vllm_omni.entrypoints import stage_utils as stage_utils_module
+from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -237,6 +240,16 @@ def _make_async_engine(engine):
     async_engine._request_states = {}
     async_engine._closed = False
     return async_engine
+
+
+def _make_inline_async_omni(inline_engine):
+    omni = object.__new__(AsyncOmni)
+    omni._inline_diffusion = True
+    omni._inline_engine = inline_engine
+    omni.stage_list = [SimpleNamespace(final_output_type="image")]
+    omni.log_stats = False
+    omni.default_sampling_params_list = [OmniDiffusionSamplingParams(num_inference_steps=2)]
+    return omni
 
 
 # ---------------------------------------------------------------------------
@@ -745,3 +758,103 @@ class TestAsyncAbort:
         finally:
             release_first.set()
             async_engine.close()
+
+
+class TestAsyncOmniInlineAbort:
+    """AsyncOmni inline diffusion abort scenarios."""
+
+    def test_inline_engine_uses_async_wrapper(self, monkeypatch):
+        captured = {}
+
+        class FakeAsyncOmniDiffusion:
+            def __init__(self, model, **kwargs):
+                captured["model"] = model
+                captured["kwargs"] = kwargs
+
+            async def generate(self, *args, **kwargs):
+                raise AssertionError("generate should not run during initialization")
+
+            async def abort(self, request_id):
+                return None
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(async_omni_diffusion_module, "AsyncOmniDiffusion", FakeAsyncOmniDiffusion)
+        monkeypatch.setattr(stage_utils_module, "set_stage_devices", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            stage_utils_module,
+            "load_func_from_config",
+            lambda cfg: f"loaded:{cfg}" if cfg is not None else None,
+        )
+
+        omni = object.__new__(AsyncOmni)
+        stage_config = SimpleNamespace(
+            stage_id=0,
+            engine_args={"model_stage": "diffusion", "step_execution": True},
+            runtime={"devices": "0"},
+            cfg_kv_collect_func="pkg.module:collect",
+            engine_input_source=["prompt"],
+        )
+
+        AsyncOmni._init_inline_diffusion_engine(omni, "inline-model", stage_config, {})
+
+        assert omni._inline_diffusion is True
+        assert isinstance(omni._inline_engine, FakeAsyncOmniDiffusion)
+        assert captured["model"] == "inline-model"
+        assert captured["kwargs"]["stage_id"] == 0
+        assert captured["kwargs"]["engine_input_source"] == ["prompt"]
+        assert captured["kwargs"]["cfg_kv_collect_func"] == "loaded:pkg.module:collect"
+        assert captured["kwargs"]["step_execution"] is True
+
+    @pytest.mark.anyio
+    async def test_inline_abort_uses_async_wrapper_abort(self):
+        class FakeInlineEngine:
+            def __init__(self):
+                self.abort_calls = []
+                self.engine = SimpleNamespace(abort=Mock())
+
+            async def abort(self, request_id):
+                self.abort_calls.append(request_id)
+
+        inline_engine = FakeInlineEngine()
+        omni = _make_inline_async_omni(inline_engine)
+
+        await AsyncOmni.abort(omni, "req-inline")
+
+        assert inline_engine.abort_calls == ["req-inline"]
+        inline_engine.engine.abort.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_generate_inline_cancellation_forwards_abort(self):
+        class FakeInlineEngine:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.abort_calls = []
+
+            async def generate(self, prompt, sampling_params, request_id):
+                del prompt, sampling_params, request_id
+                self.started.set()
+                await asyncio.Future()
+
+            async def abort(self, request_id):
+                self.abort_calls.append(request_id)
+
+        inline_engine = FakeInlineEngine()
+        omni = _make_inline_async_omni(inline_engine)
+        agen = AsyncOmni._generate_inline(
+            omni,
+            prompt="prompt",
+            request_id="req-inline",
+            sampling_params_list=[OmniDiffusionSamplingParams(num_inference_steps=2)],
+            output_modalities=["image"],
+        )
+
+        task = asyncio.create_task(agen.__anext__())
+        await asyncio.wait_for(inline_engine.started.wait(), timeout=1)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert inline_engine.abort_calls == ["req-inline"]

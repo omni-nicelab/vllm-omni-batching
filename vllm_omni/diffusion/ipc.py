@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 _SHM_TENSOR_THRESHOLD = 1_000_000  # 1 MB
 
@@ -65,25 +66,46 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     return tensor
 
 
-def pack_diffusion_output_shm(output: DiffusionOutput) -> DiffusionOutput:
-    """Replace large tensors in *output* with shared-memory handles.
+def _resolve_diffusion_output(message: DiffusionOutput | RunnerOutput | Any) -> DiffusionOutput | None:
+    if isinstance(message, DiffusionOutput):
+        return message
+    if isinstance(message, RunnerOutput):
+        result = message.result
+        return result if isinstance(result, DiffusionOutput) else None
+    return None
 
-    The DiffusionOutput is modified **in-place** so that the (now lightweight)
-    object can be serialised cheaply through a MessageQueue.
+
+def pack_diffusion_output_shm(message: DiffusionOutput | RunnerOutput | Any) -> DiffusionOutput | RunnerOutput | Any:
+    """Replace large tensors in diffusion results with shared-memory handles.
+
+    Accepts either a raw ``DiffusionOutput`` or a stepwise ``RunnerOutput``.
+    Non-diffusion payloads are returned unchanged.
     """
+    output = _resolve_diffusion_output(message)
+    if output is None:
+        return message
+
     if output.output is not None and isinstance(output.output, torch.Tensor):
         if output.output.nelement() * output.output.element_size() > _SHM_TENSOR_THRESHOLD:
             output.output = _tensor_to_shm(output.output)
     if output.trajectory_latents is not None and isinstance(output.trajectory_latents, torch.Tensor):
         if output.trajectory_latents.nelement() * output.trajectory_latents.element_size() > _SHM_TENSOR_THRESHOLD:
             output.trajectory_latents = _tensor_to_shm(output.trajectory_latents)
-    return output
+    return message
 
 
-def unpack_diffusion_output_shm(output: DiffusionOutput) -> DiffusionOutput:
-    """Reconstruct tensors from shared-memory handles produced by ``pack_diffusion_output_shm``."""
+def unpack_diffusion_output_shm(message: DiffusionOutput | RunnerOutput | Any) -> DiffusionOutput | RunnerOutput | Any:
+    """Reconstruct tensors from shared-memory handles in diffusion results.
+
+    Accepts either a raw ``DiffusionOutput`` or a stepwise ``RunnerOutput``.
+    Non-diffusion payloads are returned unchanged.
+    """
+    output = _resolve_diffusion_output(message)
+    if output is None:
+        return message
+
     if isinstance(output.output, dict) and output.output.get("__tensor_shm__"):
         output.output = _tensor_from_shm(output.output)
     if isinstance(output.trajectory_latents, dict) and output.trajectory_latents.get("__tensor_shm__"):
         output.trajectory_latents = _tensor_from_shm(output.trajectory_latents)
-    return output
+    return message

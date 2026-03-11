@@ -400,7 +400,7 @@ class OmniBase:
         DiffusionExecutor as separate processes.
         """
         from vllm_omni.diffusion.data import OmniDiffusionConfig
-        from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
+        from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
         from vllm_omni.entrypoints.stage_utils import (
             _to_dict,
             load_func_from_config,
@@ -428,7 +428,7 @@ class OmniBase:
 
         cfg_kv_collect_func = load_func_from_config(getattr(stage_config, "cfg_kv_collect_func", None))
 
-        self._inline_engine = OmniDiffusion(
+        self._inline_engine = AsyncOmniDiffusion(
             model=model,
             stage_id=stage_id,
             engine_input_source=getattr(stage_config, "engine_input_source", []),

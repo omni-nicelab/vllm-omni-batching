@@ -446,9 +446,9 @@ class AsyncOmni(OmniBase):
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate using inline diffusion engine (no stage worker subprocess).
 
-        Eliminates Hop3 IPC overhead by running OmniDiffusion directly in the
-        orchestrator process.  The blocking generate() call is offloaded to a
-        thread executor so the asyncio event loop remains responsive.
+        Eliminates Hop3 IPC overhead by running diffusion directly in the
+        orchestrator process via AsyncOmniDiffusion, which preserves request
+        abort semantics for both running and queued inline requests.
         """
         _wall_start_ts = time.time()
 
@@ -474,29 +474,25 @@ class AsyncOmni(OmniBase):
         )
 
         try:
-            loop = asyncio.get_running_loop()
-            results = await loop.run_in_executor(
-                None,
-                self._inline_engine.generate,
-                prompt,
-                sp0,
-                [request_id],
+            result = await self._inline_engine.generate(
+                prompt=prompt,
+                sampling_params=sp0,
+                request_id=request_id,
             )
 
-            for result in results:
-                images = getattr(result, "images", None) or []
-                finished = getattr(result, "finished", True)
+            images = getattr(result, "images", None) or []
+            finished = getattr(result, "finished", True)
 
-                output_to_yield = OmniRequestOutput(
-                    stage_id=0,
-                    final_output_type=stage.final_output_type,
-                    request_output=result,
-                    images=images,
-                    finished=finished,
-                )
+            output_to_yield = OmniRequestOutput(
+                stage_id=0,
+                final_output_type=stage.final_output_type,
+                request_output=result,
+                images=images,
+                finished=finished,
+            )
 
-                metrics.stage_last_ts[0] = time.time()
-                yield output_to_yield
+            metrics.stage_last_ts[0] = time.time()
+            yield output_to_yield
 
             try:
                 metrics.on_finalize_request(
@@ -513,6 +509,7 @@ class AsyncOmni(OmniBase):
                 )
 
         except (asyncio.CancelledError, GeneratorExit):
+            await self.abort(request_id)
             logger.info(
                 "[%s] Inline request %s cancelled.",
                 self._name,
@@ -825,7 +822,7 @@ class AsyncOmni(OmniBase):
     async def abort(self, request_id: str | Iterable[str]) -> None:
         if self._inline_diffusion:
             if self._inline_engine is not None:
-                self._inline_engine.engine.abort(request_id)
+                await self._inline_engine.abort(request_id)
             return None
         abort_task = {"type": OmniStageTaskType.ABORT, "request_id": request_id}
         for stage in self.stage_list:
