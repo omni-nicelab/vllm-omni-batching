@@ -325,9 +325,12 @@ class DiffusionModelRunner:
 
                 noise_pred = self.pipeline.denoise_step(state)
                 finished = False
-                if noise_pred is None:
+
+                # In CFG parallel mode, only rank 0 gets the actual noise_pred; non-rank-0 workers receive None.
+                # A true interrupt (all ranks return None) is detected by checking self.pipeline.interrupt.
+                if noise_pred is None and getattr(self.pipeline, "interrupt", False):
                     finished = True
-                    result = DiffusionOutput(error="stepwise denoise returned None")
+                    result = DiffusionOutput(error="stepwise denoise interrupted")
                 else:
                     self.pipeline.step_scheduler(state, noise_pred)
                     finished = state.denoise_completed
