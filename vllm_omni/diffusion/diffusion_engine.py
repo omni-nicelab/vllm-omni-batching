@@ -18,7 +18,7 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.scheduler import Scheduler
+from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -47,7 +47,11 @@ def supports_audio_output(model_class_name: str) -> bool:
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(
+        self,
+        od_config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ):
         """Initialize the diffusion engine.
 
         Args:
@@ -60,7 +64,7 @@ class DiffusionEngine:
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.scheduler = Scheduler()
+        self.scheduler: SchedulerInterface = scheduler or RequestScheduler()
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.Lock()
 
@@ -230,7 +234,10 @@ class DiffusionEngine:
             return results
 
     @staticmethod
-    def make_engine(config: OmniDiffusionConfig) -> "DiffusionEngine":
+    def make_engine(
+        config: OmniDiffusionConfig,
+        scheduler: SchedulerInterface | None = None,
+    ) -> "DiffusionEngine":
         """Factory method to create a DiffusionEngine instance.
 
         Args:
@@ -239,26 +246,28 @@ class DiffusionEngine:
         Returns:
             An instance of DiffusionEngine.
         """
-        return DiffusionEngine(config)
+        return DiffusionEngine(config, scheduler=scheduler)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
             target_sched_req_id = self.scheduler.add_request(request)
 
+            # keep scheduling and executing until the target request is finished
             while True:
                 sched_output = self.scheduler.schedule()
-                if not sched_output.req_states:
+                if sched_output.is_empty:
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
 
-                req_state = sched_output.req_states[0]
+                sched_req_id = sched_output.scheduled_req_ids[0]
+                req = sched_output.scheduled_new_reqs[0].req
                 try:
-                    output = self.executor.add_req(req_state.req)
+                    output = self.executor.add_req(req)
                 except Exception as exc:
                     logger.error(
                         "Execution failed for diffusion request %s",
-                        req_state.sched_req_id,
+                        sched_req_id,
                         exc_info=True,
                     )
                     output = DiffusionOutput(error=str(exc))
