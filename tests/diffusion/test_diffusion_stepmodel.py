@@ -139,19 +139,19 @@ class _AbortAwareScheduler(SchedulerInterface):
             return {self._state.sched_req_id}
         return set()
 
-    def abort_request(self, sched_req_id: str) -> bool:
-        if self._state is None or self._state.sched_req_id != sched_req_id:
-            return False
-        self._state.status = DiffusionRequestStatus.FINISHED_ABORTED
-        self._finished_req_ids.add(sched_req_id)
-        return True
-
     def has_requests(self) -> bool:
         return self._state is not None and self._state.status < DiffusionRequestStatus.FINISHED_COMPLETED
 
     def get_request_state(self, sched_req_id: str):
         if self._state is not None and self._state.sched_req_id == sched_req_id:
             return self._state
+        return None
+
+    def get_sched_req_id(self, request_id: str) -> str | None:
+        if self._state is None:
+            return None
+        if request_id in self._state.req.request_ids:
+            return self._state.sched_req_id
         return None
 
     def pop_request_state(self, sched_req_id: str):
@@ -164,8 +164,13 @@ class _AbortAwareScheduler(SchedulerInterface):
         del sched_req_id
         return False
 
-    def finish_request(self, sched_req_id: str, status) -> None:
-        del sched_req_id, status
+    def finish_requests(self, sched_req_ids, status) -> None:
+        if isinstance(sched_req_ids, str):
+            sched_req_ids = [sched_req_ids]
+        for sched_req_id in sched_req_ids:
+            if self._state is not None and self._state.sched_req_id == sched_req_id:
+                self._state.status = status
+                self._finished_req_ids.add(sched_req_id)
 
     def close(self) -> None:
         self._state = None
@@ -239,7 +244,6 @@ def _make_engine(scheduler: SchedulerInterface, execute_fn=None):
     engine.execute_fn = execute_fn
     engine._rpc_lock = threading.RLock()
     engine.abort_queue = queue.Queue()
-    engine._request_id_to_sched_req_id = {}
     return engine
 
 
@@ -468,7 +472,6 @@ class TestEngineAbort:
         output = engine.add_req_and_wait_for_response(request)
 
         _assert_aborted_output(output, "req-abort")
-        assert engine._request_id_to_sched_req_id == {}
 
     def test_abort_batched_request_by_secondary_request_id(self):
         scheduler = _AbortAwareScheduler()
@@ -494,7 +497,6 @@ class TestEngineAbort:
         output = engine.add_req_and_wait_for_response(request)
 
         _assert_aborted_output(output, "req-batch-a")
-        assert engine._request_id_to_sched_req_id == {}
 
     def test_duplicate_abort_is_idempotent(self):
         """Calling abort twice for the same request does not raise or corrupt state."""
@@ -587,7 +589,7 @@ class TestSchedulerAbort:
 
         assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.WAITING
 
-        assert scheduler.abort_request(req_id) is True
+        scheduler.finish_requests(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
         assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
 
         sched_output = scheduler.schedule()

@@ -54,6 +54,7 @@ class StepScheduler(_BaseScheduler):
         request.sampling_params.step_index = current_step
         state = DiffusionRequestState(sched_req_id=sched_req_id, req=request)
         self._request_states[sched_req_id] = state
+        self._register_request_ids(request.request_ids, sched_req_id)
         self._request_progress[sched_req_id] = _StepProgress(current_step=current_step, total_steps=total_steps)
         self._waiting.append(sched_req_id)
         logger.debug(

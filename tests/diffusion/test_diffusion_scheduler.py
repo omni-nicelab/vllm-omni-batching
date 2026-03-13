@@ -102,16 +102,17 @@ class _StubScheduler(SchedulerInterface):
         assert output.result is self._output
         return {self._sched_req_id}
 
-    def abort_request(self, sched_req_id: str) -> bool:
-        del sched_req_id
-        return False
-
     def has_requests(self) -> bool:
         return not self._scheduled
 
     def get_request_state(self, sched_req_id: str):
         del sched_req_id
         return self._state
+
+    def get_sched_req_id(self, request_id: str) -> str | None:
+        if request_id in self._request.request_ids:
+            return self._sched_req_id
+        return None
 
     def pop_request_state(self, sched_req_id: str):
         del sched_req_id
@@ -121,8 +122,8 @@ class _StubScheduler(SchedulerInterface):
         del sched_req_id
         return False
 
-    def finish_request(self, sched_req_id: str, status) -> None:
-        del sched_req_id, status
+    def finish_requests(self, sched_req_ids, status) -> None:
+        del sched_req_ids, status
         return None
 
     def close(self) -> None:
@@ -202,7 +203,7 @@ class TestRequestScheduler:
         req_id_b = self.scheduler.add_request(_make_request("b"))
 
         # Abort waiting request.
-        assert self.scheduler.abort_request(req_id_b) is True
+        self.scheduler.finish_requests(req_id_b, DiffusionRequestStatus.FINISHED_ABORTED)
         state_b = self.scheduler.get_request_state(req_id_b)
         assert state_b.status == DiffusionRequestStatus.FINISHED_ABORTED
 
@@ -211,7 +212,7 @@ class TestRequestScheduler:
         assert _new_ids(output_a) == [req_id_a]
 
         # Abort running request.
-        assert self.scheduler.abort_request(req_id_a) is True
+        self.scheduler.finish_requests(req_id_a, DiffusionRequestStatus.FINISHED_ABORTED)
         state_a = self.scheduler.get_request_state(req_id_a)
         assert state_a.status == DiffusionRequestStatus.FINISHED_ABORTED
 
@@ -231,6 +232,23 @@ class TestRequestScheduler:
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
         assert self.scheduler.has_requests() is False
 
+    def test_request_id_mapping_lifecycle(self) -> None:
+        request = OmniDiffusionRequest(
+            prompts=["prompt_map_a", "prompt_map_b"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_ids=["map-a", "map-b"],
+        )
+
+        sched_req_id = self.scheduler.add_request(request)
+
+        assert self.scheduler.get_sched_req_id("map-a") == sched_req_id
+        assert self.scheduler.get_sched_req_id("map-b") == sched_req_id
+
+        self.scheduler.pop_request_state(sched_req_id)
+
+        assert self.scheduler.get_sched_req_id("map-a") is None
+        assert self.scheduler.get_sched_req_id("map-b") is None
+
 
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self) -> None:
@@ -240,7 +258,6 @@ class TestDiffusionEngine:
         engine.execute_fn = Mock()
         engine._rpc_lock = threading.Lock()
         engine.abort_queue = queue.Queue()
-        engine._request_id_to_sched_req_id = {}
 
         request = _make_request("engine")
         expected = DiffusionOutput(output=None)
@@ -263,7 +280,6 @@ class TestDiffusionEngine:
         engine.execute_fn.return_value.result = expected
         engine._rpc_lock = threading.Lock()
         engine.abort_queue = queue.Queue()
-        engine._request_id_to_sched_req_id = {}
 
         output = engine.add_req_and_wait_for_response(request)
 
@@ -459,13 +475,13 @@ class TestStepScheduler:
             )
         )
 
-        assert self.scheduler.abort_request(req_id_b) is True
+        self.scheduler.finish_requests(req_id_b, DiffusionRequestStatus.FINISHED_ABORTED)
         assert self.scheduler.get_request_state(req_id_b).status == DiffusionRequestStatus.FINISHED_ABORTED
 
         running = self.scheduler.schedule()
         assert _new_ids(running) == [req_id_a]
 
-        assert self.scheduler.abort_request(req_id_a) is True
+        self.scheduler.finish_requests(req_id_a, DiffusionRequestStatus.FINISHED_ABORTED)
         assert self.scheduler.get_request_state(req_id_a).status == DiffusionRequestStatus.FINISHED_ABORTED
         assert self.scheduler.has_requests() is False
 

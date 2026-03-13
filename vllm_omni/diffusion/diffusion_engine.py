@@ -74,7 +74,6 @@ class DiffusionEngine:
         self.scheduler.initialize(od_config)
         self._rpc_lock = threading.RLock()
         self.abort_queue: queue.Queue[str] = queue.Queue()
-        self._request_id_to_sched_req_id: dict[str, str] = {}
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
         try:
@@ -217,24 +216,15 @@ class DiffusionEngine:
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
             target_sched_req_id = self.scheduler.add_request(request)
-            self._register_request_id_mapping(request, target_sched_req_id)
 
+            # keep scheduling and executing until the target request is finished
             while True:
                 # check abort queue
                 self._process_aborts_queue()
                 sched_output = self.scheduler.schedule()
                 if sched_output.is_empty:
                     if target_sched_req_id in sched_output.finished_req_ids:
-                        state = self.scheduler.get_request_state(target_sched_req_id)
-                        self._clear_request_id_mapping(state)
-                        self.scheduler.pop_request_state(target_sched_req_id)
-                        if state is not None and state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-                            request_id = state.req.request_ids[0] if state.req.request_ids else target_sched_req_id
-                            return DiffusionOutput(
-                                aborted=True,
-                                abort_message=f"Request {request_id} aborted.",
-                            )
-                        raise RuntimeError("Diffusion scheduler finished target request without execution output.")
+                        return self._finalize_finished_request(target_sched_req_id)
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
@@ -256,18 +246,11 @@ class DiffusionEngine:
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, model_output)
                 if target_sched_req_id in finished_req_ids:
-                    state = self.scheduler.get_request_state(target_sched_req_id)
-                    self._clear_request_id_mapping(state)
-                    self.scheduler.pop_request_state(target_sched_req_id)
-                    if state is not None and state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-                        request_id = state.req.request_ids[0] if state.req.request_ids else target_sched_req_id
-                        return DiffusionOutput(
-                            aborted=True,
-                            abort_message=f"Request {request_id} aborted.",
-                        )
-                    if model_output.result is not None:
-                        return model_output.result
-                    return DiffusionOutput(error="Diffusion execution finished without a final output.")
+                    return self._finalize_finished_request(
+                        target_sched_req_id,
+                        runner_output=model_output,
+                        missing_result_error="Diffusion execution finished without a final output.",
+                    )
 
     def start_profile(self, trace_filename: str | None = None) -> None:
         """
@@ -470,7 +453,6 @@ class DiffusionEngine:
                 self._rpc_lock.release()
 
     def close(self) -> None:
-        self._request_id_to_sched_req_id.clear()
         if hasattr(self, "scheduler"):
             self.scheduler.close()
         if hasattr(self, "executor"):
@@ -501,26 +483,38 @@ class DiffusionEngine:
 
         sched_req_ids: list[str] = []
         for request_id in dict.fromkeys(request_ids):
-            sched_req_id = self._resolve_sched_req_id(request_id)
+            sched_req_id = self.scheduler.get_sched_req_id(request_id)
             if sched_req_id is not None:
                 sched_req_ids.append(sched_req_id)
 
         for sched_req_id in dict.fromkeys(sched_req_ids):
-            self.scheduler.abort_request(sched_req_id)
+            if self.scheduler.get_request_state(sched_req_id) is not None:
+                self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
 
-    def _register_request_id_mapping(
+    def _finalize_finished_request(
         self,
-        request: OmniDiffusionRequest,
         sched_req_id: str,
-    ) -> None:
-        for request_id in request.request_ids:
-            self._request_id_to_sched_req_id[request_id] = sched_req_id
+        runner_output: RunnerOutput | None = None,
+        missing_result_error: str = "Diffusion scheduler finished target request without execution output.",
+    ) -> DiffusionOutput:
+        state = self.scheduler.get_request_state(sched_req_id)
+        popped_state = self.scheduler.pop_request_state(sched_req_id)
+        state = state or popped_state
 
-    def _resolve_sched_req_id(self, request_id: str) -> str | None:
-        return self._request_id_to_sched_req_id.get(request_id)
+        if state is None:
+            raise RuntimeError(f"Diffusion scheduler lost state for request {sched_req_id}.")
 
-    def _clear_request_id_mapping(self, req_state) -> None:
-        if req_state is None:
-            return
-        for request_id in req_state.req.request_ids:
-            self._request_id_to_sched_req_id.pop(request_id, None)
+        if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+            request_id = state.req.request_ids[0] if state.req.request_ids else sched_req_id
+            return DiffusionOutput(
+                aborted=True,
+                abort_message=f"Request {request_id} aborted.",
+            )
+
+        if runner_output is not None and runner_output.result is not None:
+            return runner_output.result
+
+        if runner_output is None:
+            raise RuntimeError(missing_result_error)
+
+        return DiffusionOutput(error=missing_result_error)

@@ -19,6 +19,7 @@ class _BaseScheduler(SchedulerInterface):
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
         self._request_states: dict[str, DiffusionRequestState] = {}
+        self._request_id_to_sched_req_id: dict[str, str] = {}
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
@@ -31,17 +32,12 @@ class _BaseScheduler(SchedulerInterface):
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
         self._request_states.clear()
+        self._request_id_to_sched_req_id.clear()
         self._step_id = 0
         self._waiting.clear()
         self._running.clear()
         self._finished_req_ids.clear()
         self._reset_scheduler_state()
-
-    def abort_request(self, sched_req_id: str) -> bool:
-        if sched_req_id not in self._request_states:
-            return False
-        self.finish_request(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
-        return True
 
     def has_requests(self) -> bool:
         return bool(self._waiting or self._running)
@@ -49,9 +45,15 @@ class _BaseScheduler(SchedulerInterface):
     def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         return self._request_states.get(sched_req_id)
 
+    def get_sched_req_id(self, request_id: str) -> str | None:
+        return self._request_id_to_sched_req_id.get(request_id)
+
     def pop_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         self._pop_extra_request_state(sched_req_id)
-        return self._request_states.pop(sched_req_id, None)
+        state = self._request_states.pop(sched_req_id, None)
+        if state is not None:
+            self._unregister_request_ids(state.req.request_ids, sched_req_id)
+        return state
 
     def preempt_request(self, sched_req_id: str) -> bool:
         if sched_req_id not in self._request_states:
@@ -63,12 +65,15 @@ class _BaseScheduler(SchedulerInterface):
             return True
         return False
 
-    def finish_request(self, sched_req_id: str, status: DiffusionRequestStatus) -> None:
+    def finish_requests(self, sched_req_ids: str | list[str], status: DiffusionRequestStatus) -> None:
         assert DiffusionRequestStatus.is_finished(status)
-        self._finish_requests({sched_req_id: status})
+        if isinstance(sched_req_ids, str):
+            sched_req_ids = [sched_req_ids]
+        self._finish_requests({sched_req_id: status for sched_req_id in sched_req_ids})
 
     def close(self) -> None:
         self._request_states.clear()
+        self._request_id_to_sched_req_id.clear()
         self._waiting.clear()
         self._running.clear()
         self._finished_req_ids.clear()
@@ -122,3 +127,15 @@ class _BaseScheduler(SchedulerInterface):
 
     def _pop_extra_request_state(self, sched_req_id: str) -> None:
         """Remove subclass-owned per-request state before popping request state."""
+
+    def _register_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:
+        for request_id in request_ids:
+            existing = self._request_id_to_sched_req_id.get(request_id)
+            if existing is not None and existing != sched_req_id:
+                raise ValueError(f"request_id {request_id!r} is already mapped to active sched_req_id {existing!r}.")
+            self._request_id_to_sched_req_id[request_id] = sched_req_id
+
+    def _unregister_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:
+        for request_id in request_ids:
+            if self._request_id_to_sched_req_id.get(request_id) == sched_req_id:
+                self._request_id_to_sched_req_id.pop(request_id, None)

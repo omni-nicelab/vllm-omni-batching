@@ -69,7 +69,6 @@ def _make_engine(num_gpus: int = 1):
     engine.execute_fn = executor.execute_request
     engine._rpc_lock = threading.RLock()
     engine.abort_queue = queue.Queue()
-    engine._request_id_to_sched_req_id = {}
     return engine, executor, req_q, res_q
 
 
