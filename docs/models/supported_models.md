@@ -6,6 +6,7 @@ vLLM-Omni supports unified multimodal comprehension and generation models across
 
 If vLLM-Omni natively supports a model, its implementation can be found in <gh-file:vllm_omni/model_executor/models> and <gh-file:vllm_omni/diffusion/models>.
 
+
 ## List of Supported Models for Nvidia GPU / AMD GPU
 
 <style>
@@ -83,3 +84,19 @@ th {
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` |
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` |
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` |
+
+
+## List of Supported Models for Step-Execution
+
+`step_execution=True` is currently supported only for pipelines that implement
+the segmented diffusion contract
+([`prepare_encode()` / `denoise_step()` / `step_scheduler()` / `post_decode()`](gh-file:vllm_omni/diffusion/models/interface.py)).
+
+Current in-tree support:
+
+| Pipeline | Example HF Models | Step execution |
+|----------|-------------------|----------------|
+| `QwenImagePipeline` | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes |
+| All other diffusion pipelines | Qwen-Image edit/layered variants, GLM-Image, Wan, Flux, LongCat, etc. | No |
+
+For model authors, see [Diffusion Step Execution](../contributing/model/diffusion_step_execution.md).
