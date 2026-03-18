@@ -276,6 +276,10 @@ class DiffusionEngine:
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
 
+                # NOTE: add_req_and_wait_for_response() is synchronous, and
+                # the scheduler currently enforces _max_batch_size = 1 (see
+                # vllm_omni/diffusion/sched/base_scheduler.py), so we directly
+                # take the single scheduled request here.
                 sched_req_id = sched_output.scheduled_req_ids[0]
                 req = sched_output.scheduled_new_reqs[0].req
                 try:
