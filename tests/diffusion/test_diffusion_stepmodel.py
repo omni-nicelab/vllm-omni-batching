@@ -199,6 +199,7 @@ def _make_runner():
     runner.device = torch.device("cpu")
     runner.pipeline = _StepPipeline()
     runner.cache_backend = None
+    runner.cache_manager = None
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()
