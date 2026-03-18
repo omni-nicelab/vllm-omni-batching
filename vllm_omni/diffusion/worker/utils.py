@@ -15,6 +15,16 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class CacheBackendSlot:
+    """Backend-owned resident cache state for one diffusion request."""
+
+    backend_name: str
+    resident_bytes: int = 0
+    payload: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class DiffusionRequestState:
     """Per-request mutable state across all pipeline stages.
 
@@ -57,6 +67,7 @@ class DiffusionRequestState:
 
     # ── Pipeline-specific extras (avoid subclassing for rare fields) ──
     extra: dict[str, Any] = field(default_factory=dict)
+    cache_slot: CacheBackendSlot | None = None
 
     # ── Properties ──
 
