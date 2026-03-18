@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
-
+import asyncio
+import os
 import queue
 import threading
 import time
@@ -86,9 +87,14 @@ class DiffusionEngine:
             StepScheduler() if self.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
+        self.loop = asyncio.new_event_loop()
         self._rpc_lock = threading.RLock()
+        self._results_map: dict[str, asyncio.Future] = {}
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+
+        self._loop_thread = threading.Thread(target=self._run_background_loop, args=(self.loop,), daemon=True)
+        self._loop_thread.start()
 
         try:
             self._dummy_run()
@@ -276,6 +282,65 @@ class DiffusionEngine:
 
             return results
 
+    def _run_background_loop(self, loop: asyncio.AbstractEventLoop):
+        """background loop execution"""
+        async def loop_exec(self):
+            while True:
+                # TODO: check if rpc_rock necessary
+                # with self._rpc_lock:
+                self._process_aborts_queue()
+
+                if not self.scheduler.has_requests():
+                    await asyncio.sleep(0.01)
+                    continue
+
+                sched_output = self.scheduler.schedule()
+                if sched_output.is_empty:
+                    self._handle_finished_requests(sched_output.finished_req_ids, None)
+                    continue
+                sched_req_id = sched_output.scheduled_req_ids[0]
+                try:
+                    model_output = self.execute_fn(sched_output)
+                except Exception as exc:
+                    logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
+                    model_output = RunnerOutput(
+                        req_id=sched_req_id,
+                        step_index=None,
+                        finished=True,
+                        result=DiffusionOutput(error=str(exc)),
+                    )
+
+                with self._rpc_lock:
+                    finished_req_ids = self.scheduler.update_from_output(sched_output, model_output)
+                    self._handle_finished_requests(finished_req_ids, model_output.result)
+
+        asyncio.set_event_loop(loop)
+        loop.create_task(loop_exec(self))
+        loop.run_forever()
+
+    def _handle_finished_requests(self, finished_ids, result):
+        """set result for Future"""
+        for rid in finished_ids:
+            state = self.scheduler.get_request_state(rid)
+
+            self._clear_request_id_mapping(state)
+            self.scheduler.pop_request_state(rid)
+
+            if rid in self._results_map:
+                fut = self._results_map.pop(rid) # multi-thread pop issue?
+
+                if state and state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+                    logger.info(f"Found abort req: {rid}")
+                    out = DiffusionOutput(aborted=True, abort_message="...")
+                else:
+                    out = result or DiffusionOutput(error="No output")
+
+                if not fut.done():
+                    fut.set_result(out)
+                    logger.info(f"_handle_finished_requests fut done: {fut.done()}")
+                    # TODO: self.loop maybe?
+                    # fut.get_loop().call_soon_threadsafe(fut.set_result, out)
+
     @staticmethod
     def make_engine(
         config: OmniDiffusionConfig,
@@ -290,6 +355,35 @@ class DiffusionEngine:
             An instance of DiffusionEngine.
         """
         return DiffusionEngine(config, scheduler=scheduler)
+
+    def add_request(self, request: OmniDiffusionRequest):
+        with self._rpc_lock:
+            target_sched_req_id = self.scheduler.add_request(request)
+            self._register_request_id_mapping(request, target_sched_req_id)
+
+            fut = self.loop.create_future()
+            self._results_map[target_sched_req_id] = fut # is this necessary?
+
+        return target_sched_req_id
+
+    def get_result(self, request_id: str) -> DiffusionOutput:
+        """consumer"""
+        with self._rpc_lock:
+            fut = self._results_map.get(request_id)
+
+        if fut is None:
+            raise RuntimeError("Future not found, possibly already processed or race condition.")
+        try:
+            res = asyncio.run_coroutine_threadsafe(asyncio.wait_for(fut, timeout=30), self.loop).result()
+            return res
+        except Exception as e:
+            logger.error(f"Wait for response failed: {e}")
+            raise
+
+    def add_req_and_wait_for_response_new(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        result = self.add_request(request)
+        logger.info(f"[new] get result: {request.request_ids}")
+        return self.get_result(result)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
