@@ -239,6 +239,7 @@ def _make_runner():
     runner.device = torch.device("cpu")
     runner.pipeline = _StepPipeline()
     runner.cache_backend = None
+    runner.cache_manager = None
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()
@@ -255,6 +256,7 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.device = device
     runner.pipeline = _DistributedStepPipeline(mode=mode, device=device)
     runner.cache_backend = None
+    runner.cache_manager = None
     runner.offload_backend = None
     runner.state_cache = {}
     runner.kv_transfer_manager = SimpleNamespace()

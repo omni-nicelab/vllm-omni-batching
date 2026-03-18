@@ -21,9 +21,11 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
+from vllm_omni.diffusion.cache.cache_manager import CacheManager
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
+from vllm_omni.diffusion import experimental as diffusion_experimental
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -67,6 +69,7 @@ class DiffusionModelRunner:
         self.device = device
         self.pipeline = None
         self.cache_backend = None
+        self.cache_manager: CacheManager | None = None
         self.offload_backend = None
 
         # Cache for per-request stepwise state.
@@ -171,6 +174,7 @@ class DiffusionModelRunner:
 
         # Setup cache backend
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
+        self.cache_manager = None
 
         if self.cache_backend is not None:
             if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
@@ -183,6 +187,9 @@ class DiffusionModelRunner:
                 self.od_config.cache_backend = None
             else:
                 self.cache_backend.enable(self.pipeline)
+                cache_state_driver = self.cache_backend.create_state_driver(self.pipeline)
+                if cache_state_driver is not None:
+                    self.cache_manager = CacheManager(cache_state_driver)
 
         logger.info("Model runner: Initialization complete.")
 
@@ -299,7 +306,9 @@ class DiffusionModelRunner:
     def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[DiffusionRequestState, bool]:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for req_id in scheduler_output.finished_req_ids:
-            self.state_cache.pop(req_id, None)
+            state = self.state_cache.pop(req_id, None)
+            if state is not None and self.cache_manager is not None:
+                self.cache_manager.free(state)
 
         if scheduler_output.num_scheduled_reqs != 1:
             raise ValueError(
@@ -337,6 +346,8 @@ class DiffusionModelRunner:
     def _update_states_after(self, state: DiffusionRequestState, finished: bool) -> None:
         """Step-after update: clear cached state for completed request."""
         if finished:
+            if self.cache_manager is not None:
+                self.cache_manager.free(state)
             self.state_cache.pop(state.req_id, None)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
@@ -344,11 +355,16 @@ class DiffusionModelRunner:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not self.supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
-        # Stepwise mode only supports the basic state-driven denoise path for now.
-        # Request-mode extras such as cache backends, KV transfer, editing inputs,
-        # and similar features are not supported here yet.
         if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Step mode does not support cache_backend yet.")
+            if not diffusion_experimental.EXPERIMENT_CACHEPOOL:
+                raise ValueError(
+                    "Step mode cache backends require global EXPERIMENT_CACHEPOOL=True "
+                    f"(got cache_backend='{self.od_config.cache_backend}')."
+                )
+            if self.cache_manager is None:
+                raise ValueError(
+                    f"Step mode cache backend '{self.od_config.cache_backend}' has no resident-state driver."
+                )
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
@@ -367,32 +383,40 @@ class DiffusionModelRunner:
                         gen_device = self.device
                     state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
 
-            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-                # step0/new request: encode
-                if is_new_request:
-                    self.pipeline.prepare_encode(state)
+            cache_active = False
+            finished = False
+            if self.cache_manager is not None:
+                self.cache_manager.activate(state)
+                cache_active = True
 
-                noise_pred = self.pipeline.denoise_step(state)
-                finished = False
+            try:
+                with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                    if is_new_request:
+                        self.pipeline.prepare_encode(state)
 
-                # In CFG parallel mode, only rank 0 gets the actual noise_pred; non-rank-0 workers receive None.
-                # A true interrupt (all ranks return None) is detected by checking self.pipeline.interrupt.
-                if noise_pred is None and getattr(self.pipeline, "interrupt", False):
-                    finished = True
-                    result = DiffusionOutput(error="stepwise denoise interrupted")
-                else:
-                    self.pipeline.step_scheduler(state, noise_pred)
-                    finished = state.denoise_completed
-                    if finished:
-                        result = self.pipeline.post_decode(state)
+                    noise_pred = self.pipeline.denoise_step(state)
+                    if noise_pred is None and getattr(self.pipeline, "interrupt", False):
+                        finished = True
+                        result = DiffusionOutput(error="stepwise denoise interrupted")
+                    elif noise_pred is None and self.cache_manager is not None:
+                        finished = True
+                        result = DiffusionOutput(error="stepwise denoise returned None")
                     else:
-                        result = None
+                        self.pipeline.step_scheduler(state, noise_pred)
+                        finished = state.denoise_completed
+                        if finished:
+                            result = self.pipeline.post_decode(state)
+                        else:
+                            result = None
+            finally:
+                if cache_active and self.cache_manager is not None:
+                    self.cache_manager.deactivate(state)
 
-                self._update_states_after(state, finished)
+            self._update_states_after(state, finished)
 
-                return RunnerOutput(
-                    req_id=state.req_id,
-                    step_index=state.step_index,
-                    finished=finished,
-                    result=result,
-                )
+            return RunnerOutput(
+                req_id=state.req_id,
+                step_index=state.step_index,
+                finished=finished,
+                result=result,
+            )
