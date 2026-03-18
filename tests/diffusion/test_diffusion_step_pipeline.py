@@ -40,6 +40,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 # Helpers & fixtures
 # ---------------------------------------------------------------------------
 
+
 @contextmanager
 def _noop_forward_context(*args, **kwargs):
     del args, kwargs
@@ -272,6 +273,7 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
         assert "req-1" not in runner.state_cache
     finally:
         destroy_distributed_env()
+
 
 # ---------------------------------------------------------------------------
 # Runner / Worker
