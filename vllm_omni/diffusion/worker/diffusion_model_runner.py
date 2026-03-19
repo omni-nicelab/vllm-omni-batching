@@ -145,7 +145,7 @@ class DiffusionModelRunner:
         )
         logger.info("Model runner: Model loaded successfully.")
 
-        if self.od_config.step_execution and not self.supports_step_mode():
+        if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
