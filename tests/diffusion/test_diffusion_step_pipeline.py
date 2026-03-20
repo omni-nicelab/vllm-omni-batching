@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+from tests.utils import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D
@@ -458,7 +459,10 @@ class TestSupportedPipelines:
         assert isinstance(pipeline, SupportsStepExecution) is True
 
 
-@pytest.mark.parallel
+@hardware_test(
+    res={"cuda": "L4"},
+    num_cards=2,
+)
 def test_execute_stepwise_with_ulysses_parallel():
     world_size = 2
     if current_omni_platform.get_device_count() < world_size:
@@ -471,7 +475,10 @@ def test_execute_stepwise_with_ulysses_parallel():
     )
 
 
-@pytest.mark.parallel
+@hardware_test(
+    res={"cuda": "L4"},
+    num_cards=2,
+)
 def test_execute_stepwise_with_ring_parallel():
     world_size = 2
     if current_omni_platform.get_device_count() < world_size:
@@ -484,7 +491,10 @@ def test_execute_stepwise_with_ring_parallel():
     )
 
 
-@pytest.mark.parallel
+@hardware_test(
+    res={"cuda": "L4"},
+    num_cards=2,
+)
 def test_execute_stepwise_with_cfg_parallel():
     world_size = 2
     if current_omni_platform.get_device_count() < world_size:
