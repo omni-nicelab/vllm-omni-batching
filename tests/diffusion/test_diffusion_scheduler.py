@@ -18,7 +18,7 @@ from vllm_omni.diffusion.sched import (
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def _make_request(req_id: str) -> OmniDiffusionRequest:
