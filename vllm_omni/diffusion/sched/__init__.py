@@ -15,13 +15,13 @@ from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 Scheduler = RequestScheduler
 
 __all__ = [
-    "DiffusionRequestStatus",
     "DiffusionRequestState",
+    "DiffusionRequestStatus",
     "NewRequestData",
     "CachedRequestData",
     "DiffusionSchedulerOutput",
+    "Scheduler",
     "SchedulerInterface",
     "RequestScheduler",
     "StepScheduler",
-    "Scheduler",
 ]

@@ -21,11 +21,11 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.cache.cache_manager import CacheManager
+from vllm_omni.diffusion import experimental as diffusion_experimental
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.cache_manager import CacheManager
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
-from vllm_omni.diffusion import experimental as diffusion_experimental
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -78,6 +78,21 @@ class DiffusionModelRunner:
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
+    def _compile_transformer(self, attr_name: str) -> None:
+        """Compile a transformer attribute on the pipeline with torch.compile."""
+        model = getattr(self.pipeline, attr_name, None)
+        if model is None:
+            return
+        try:
+            setattr(self.pipeline, attr_name, regionally_compile(model, dynamic=True))
+            logger.info("Model runner: %s compiled with torch.compile.", attr_name)
+        except Exception as e:
+            logger.warning(
+                "Model runner: torch.compile for %s failed: %s. Using eager mode.",
+                attr_name,
+                e,
+            )
+
     def load_model(
         self,
         memory_pool_context_fn: callable | None = None,
@@ -122,6 +137,7 @@ class DiffusionModelRunner:
                     load_device=load_device,
                     load_format=load_format,
                     custom_pipeline_name=custom_pipeline_name,
+                    device=self.device,
                 )
         time_after_load = time.perf_counter()
 
@@ -141,14 +157,8 @@ class DiffusionModelRunner:
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                try:
-                    self.pipeline.transformer = regionally_compile(
-                        self.pipeline.transformer,
-                        dynamic=True,
-                    )
-                    logger.info("Model runner: Model compiled with torch.compile.")
-                except Exception as e:
-                    logger.warning(f"Model runner: torch.compile failed with error: {e}. Using eager mode.")
+                self._compile_transformer("transformer")
+                self._compile_transformer("transformer_2")
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",

@@ -42,8 +42,7 @@ class RequestScheduler(_BaseScheduler):
                 scheduled_cached_req_ids.append(sched_req_id)
 
         # Second, schedule WAITING requests while capacity remains.
-        # RequestScheduler only allows one active request at a time.
-        while self._waiting and not self._running:
+        while self._waiting and len(self._running) < self._max_batch_size:
             sched_req_id = self._waiting.popleft()
             state = self._request_states.get(sched_req_id)
             if state is None:
@@ -83,6 +82,8 @@ class RequestScheduler(_BaseScheduler):
         }
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
+        # NOTE: request-mode currently assumes one executor call produces one
+        # RunnerOutput for the single scheduled request in this cycle.
         for sched_req_id in scheduled_req_ids:
             state = self._request_states.get(sched_req_id)
             if state is None or state.is_finished():

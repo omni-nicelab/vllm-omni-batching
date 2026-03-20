@@ -9,6 +9,7 @@ from safetensors.torch import save_file
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,7 +36,7 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
         if not hasattr(first_output, "request_output") or not first_output.request_output:
             raise ValueError("No request_output found in OmniRequestOutput")
 
-        req_out = first_output.request_output[0]
+        req_out = first_output.request_output
         if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
             raise ValueError("Invalid request_output structure or missing 'images' key")
         return req_out.images
@@ -89,7 +90,7 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
                 width=width,
                 num_inference_steps=2,
                 guidance_scale=0.0,
-                generator=torch.Generator("cuda").manual_seed(42),
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
                 num_outputs_per_prompt=1,
             ),
         )
@@ -119,7 +120,7 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
                     width=width,
                     num_inference_steps=2,
                     guidance_scale=0.0,
-                    generator=torch.Generator("cuda").manual_seed(42),
+                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
                     num_outputs_per_prompt=1,
                     lora_request=lora_request,
                     lora_scale=2.0,

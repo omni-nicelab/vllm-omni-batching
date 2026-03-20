@@ -49,7 +49,7 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -329,10 +329,7 @@ class ZImageAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        cos = cos.to(query.dtype)
-        sin = sin.to(query.dtype)
-        query = self.rope(query, cos, sin)
-        key = self.rope(key, cos, sin)
+        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
@@ -579,10 +576,6 @@ class ZImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-        "w13": ["w1", "w3"],
-    }
 
     # Sequence Parallelism for Z-Image (following diffusers' _cp_plan pattern)
     # Similar to how Wan uses `rope` module's split_output to shard rotary embeddings,
@@ -985,6 +978,8 @@ class ZImageTransformer2DModel(CachedTransformer):
             (".w13", ".w1", 0),
             (".w13", ".w3", 1),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         params_dict = dict(self.named_parameters())
 

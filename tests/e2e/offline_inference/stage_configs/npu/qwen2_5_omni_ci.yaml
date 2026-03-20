@@ -1,4 +1,4 @@
-# stage config for running qwen2.5-omni with architecture of OmniLLM.
+# stage config for running qwen2.5-omni for multi-stage omni runtime.
 
 # This config is optimized for CI e2e tests.
 stage_args:
@@ -21,6 +21,7 @@ stage_args:
       trust_remote_code: true
       engine_output_type: latent
       enable_prefix_caching: false
+      mm_processor_cache_gb: 0
     is_comprehension: true
     final_output: true
     final_output_type: text

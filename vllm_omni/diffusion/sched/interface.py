@@ -149,12 +149,13 @@ class SchedulerInterface(ABC):
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         """Update scheduler state from executor output."""
 
-    def has_requests(self) -> bool:
-        """Return whether the scheduler still owns runnable requests."""
-
     @abstractmethod
     def get_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
         """Return request state if present."""
+
+    @abstractmethod
+    def has_requests(self) -> bool:
+        """Return whether the scheduler still owns runnable requests."""
 
     @abstractmethod
     def get_sched_req_id(self, request_id: str) -> str | None:

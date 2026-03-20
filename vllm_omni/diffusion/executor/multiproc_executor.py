@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
+from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker import WorkerProc
@@ -168,7 +169,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def add_req(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         self._ensure_open()
-        deadline = None
         rpc_request = {
             "type": "rpc",
             "method": "generate",
@@ -180,13 +180,12 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
         try:
             self._broadcast_mq.enqueue(rpc_request)
+            response = self._result_mq.dequeue()
 
             try:
-                response = self._result_mq.dequeue(timeout=deadline)
-            except zmq.error.Again as exc:
-                raise TimeoutError("Generate call timed out.") from exc
-            except TimeoutError as exc:
-                raise TimeoutError("Generate call timed out.") from exc
+                unpack_diffusion_output_shm(response)
+            except Exception as e:
+                logger.warning("SHM unpack failed (data may already be inline): %s", e)
 
             if isinstance(response, dict) and response.get("status") == "error":
                 raise RuntimeError(

@@ -182,7 +182,11 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
     monkeypatch.setattr(manager_mod, "replace_submodule", _fake_replace_submodule)
 
     pipeline = torch.nn.Module()
-    pipeline.packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
+    pipeline.stacked_params_mapping = [
+        (".to_qkv.", ".to_q.", "q"),
+        (".to_qkv.", ".to_k.", "k"),
+        (".to_qkv.", ".to_v.", "v"),
+    ]
     pipeline.transformer = torch.nn.Module()
     pipeline.transformer.to_qkv = _FakeLinearBase()
 
@@ -194,7 +198,7 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
     )
 
     # Treat the dummy layer as a packed 3-slice projection so the manager uses
-    # `packed_modules_mapping` to decide replacement based on target_modules.
+    # `stacked_params_mapping` to decide replacement based on target_modules.
     monkeypatch.setattr(manager, "_get_packed_modules_list", lambda _module: ["q", "k", "v"])
 
     peft_helper = type("_PH", (), {"r": 1, "target_modules": ["to_q"]})()
@@ -254,7 +258,11 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
 
 def test_lora_manager_activates_packed_lora_from_sublayers():
     pipeline = torch.nn.Module()
-    pipeline.packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
+    pipeline.stacked_params_mapping = [
+        (".to_qkv", ".to_q", "q"),
+        (".to_qkv", ".to_k", "k"),
+        (".to_qkv", ".to_v", "v"),
+    ]
     manager = DiffusionLoRAManager(
         pipeline=pipeline,
         device=torch.device("cpu"),
@@ -500,3 +508,50 @@ def test_scale_keys_are_rounded():
     # Currently we round keys to 3 decimal places
     manager._update_adapter_scale(adapter_id, 0.0031)
     assert manager._adapter_scales[adapter_id] == 0.003
+
+
+def test_lora_manager_uses_valid_max_rank(monkeypatch):
+    """Ensure that the LoRA manager uses a valid max rank for vLLM."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    # Ensure that the rank is correctly adjusted to the smallest valid max rank
+    supported_max_rank = 64
+    unsupported_max_rank = 63
+    assert supported_max_rank in DiffusionLoRAManager._VALID_MAX_RANKS
+    assert unsupported_max_rank not in DiffusionLoRAManager._VALID_MAX_RANKS
+
+    def _fake_load(_req: LoRARequest):
+        lora_model = type("LM", (), {"id": _req.lora_int_id})()
+        peft_helper = type("PH", (), {"r": unsupported_max_rank})()
+        return lora_model, peft_helper
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    req1 = _dummy_lora_request(1)
+    manager.add_adapter(req1)
+    assert manager._max_lora_rank == supported_max_rank
+
+
+@pytest.mark.parametrize("rank", [-1, 0, DiffusionLoRAManager._VALID_MAX_RANKS[-1] + 1])
+def test_lora_manager_max_rank_validation(monkeypatch, rank):
+    """Check that invalid max ranks are handled correctly."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    lora_rank = rank
+
+    def _fake_load(_req: LoRARequest):
+        lora_model = type("LM", (), {"id": _req.lora_int_id})()
+        peft_helper = type("PH", (), {"r": lora_rank})()
+        return lora_model, peft_helper
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    req1 = _dummy_lora_request(1)
+    with pytest.raises(ValueError):
+        manager.add_adapter(req1)

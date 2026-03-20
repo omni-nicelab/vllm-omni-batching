@@ -24,9 +24,8 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._finished_req_ids: set[str] = set()
-        # currently used by vllm_omni/entrypoints/omni_stage.py,
-        # can't be used for real multi-step scheduling without proper architectural changes,
-        # so we keep it fixed at 1 for now.
+        # The current DiffusionEngine execution mode does not support real
+        # request batching well, so we keep this fixed at 1 for now.
         self._max_batch_size: int = 1
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
