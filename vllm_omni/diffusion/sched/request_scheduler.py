@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -14,7 +16,9 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionSchedulerOutput,
     NewRequestData,
 )
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
@@ -82,16 +86,17 @@ class RequestScheduler(_BaseScheduler):
         }
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
+        result = output.result
         for sched_req_id in scheduled_req_ids:
             state = self._request_states.get(sched_req_id)
             if state is None or state.is_finished():
                 continue
-            if output.result is None:
+            if result is None:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[sched_req_id] = "No output result"
-            elif output.result.error:
+            elif result.error:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
-                terminal_errors[sched_req_id] = output.result.error
+                terminal_errors[sched_req_id] = result.error
             else:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
                 terminal_errors[sched_req_id] = None

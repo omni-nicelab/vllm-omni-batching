@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 
 class DiffusionExecutor(ABC):
@@ -64,6 +70,16 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute request-mode work from a scheduler output."""
+        pass
+
+    @abstractmethod
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute step-mode work from a scheduler output."""
+        pass
+
+    @abstractmethod
     def collective_rpc(
         self,
         method: str,
@@ -71,6 +87,7 @@ class DiffusionExecutor(ABC):
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         """Execute a method on workers."""
         pass
