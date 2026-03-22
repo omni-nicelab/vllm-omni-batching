@@ -39,6 +39,7 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -674,6 +675,15 @@ class TestIPC:
 @pytest.mark.cpu
 class TestSupportedPipelines:
     """Step-execution protocol checks for supported pipelines."""
+
+    def test_default_stage_config_includes_step_execution(self):
+        stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+            {
+                "step_execution": True,
+            }
+        )[0]
+
+        assert stage_cfg["engine_args"]["step_execution"] is True
 
     def test_qwen_image_supports_step_execution(self):
         from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution
