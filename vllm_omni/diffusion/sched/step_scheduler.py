@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -19,16 +22,48 @@ from vllm_omni.diffusion.worker.utils import RunnerOutput
 logger = init_logger(__name__)
 
 
-class RequestScheduler(_BaseScheduler):
-    """Diffusion scheduler with vLLM-style waiting/running queues."""
+@dataclass
+class _StepProgress:
+    current_step: int
+    total_steps: int
+
+
+class StepScheduler(_BaseScheduler):
+    """Placeholder scheduler that advances a request one denoise step per update."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._request_progress: dict[str, _StepProgress] = {}
+
+    def _reset_scheduler_state(self) -> None:
+        self._request_progress.clear()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         sched_req_id = self._make_sched_req_id(request)
+        total_steps = self._get_total_steps(request)
+        if total_steps <= 0:
+            raise ValueError(f"Diffusion request {sched_req_id} must have positive total_steps, got {total_steps}")
+
+        current_step = request.sampling_params.step_index or 0
+        if current_step < 0 or current_step >= total_steps:
+            raise ValueError(
+                f"Diffusion request {sched_req_id} has invalid initial step_index {current_step} "
+                f"for total_steps={total_steps}"
+            )
+
+        request.sampling_params.step_index = current_step
         state = DiffusionRequestState(sched_req_id=sched_req_id, req=request)
         self._request_states[sched_req_id] = state
         self._register_request_ids(request.request_ids, sched_req_id)
+        self._request_progress[sched_req_id] = _StepProgress(current_step=current_step, total_steps=total_steps)
         self._waiting.append(sched_req_id)
-        logger.debug("Scheduler add_request: %s (waiting=%d)", sched_req_id, len(self._waiting))
+        logger.debug(
+            "StepScheduler add_request: %s (step=%d/%d, waiting=%d)",
+            sched_req_id,
+            current_step,
+            total_steps,
+            len(self._waiting),
+        )
         return sched_req_id
 
     def schedule(self) -> DiffusionSchedulerOutput:
@@ -64,6 +99,7 @@ class RequestScheduler(_BaseScheduler):
             num_waiting_reqs=len(self._waiting),
         )
 
+        # update after schedule
         self._step_id += 1
         self._finished_req_ids.clear()
         return scheduler_output
@@ -82,25 +118,59 @@ class RequestScheduler(_BaseScheduler):
         }
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
+        output_error = output.result.error if output.result is not None else None
         for sched_req_id in scheduled_req_ids:
             state = self._request_states.get(sched_req_id)
-            if state is None or state.is_finished():
+            progress = self._request_progress.get(sched_req_id)
+            if state is None or progress is None or state.is_finished():
                 continue
-            if output.result is None:
+
+            if output_error is not None:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
-                terminal_errors[sched_req_id] = "No output result"
-            elif output.result.error:
+                terminal_errors[sched_req_id] = output_error
+                continue
+
+            if output.step_index is None:
+                logger.warning(
+                    "Received RunnerOutput with no step_index for request %s, treating as error",
+                    sched_req_id,
+                )
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
-                terminal_errors[sched_req_id] = output.result.error
-            else:
+                terminal_errors[sched_req_id] = "Missing step_index in RunnerOutput"
+                continue
+
+            # We assume that the decoding stage is executed immediately after the denoising stage completes.
+            progress.current_step = output.step_index
+            state.req.sampling_params.step_index = output.step_index
+            if output.finished:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
                 terminal_errors[sched_req_id] = None
+            else:
+                state.error = None
 
         finished_req_ids |= self._finish_requests(terminal_statuses, terminal_errors)
         return finished_req_ids
 
-    def abort_request(self, sched_req_id: str) -> bool:
-        if self.get_request_state(sched_req_id) is None:
-            return False
-        self.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
-        return True
+    def _pop_extra_request_state(self, sched_req_id: str) -> None:
+        self._request_progress.pop(sched_req_id, None)
+
+    def _get_total_steps(self, request: OmniDiffusionRequest) -> int:
+        sampling = request.sampling_params
+
+        if sampling.timesteps is not None:
+            return self._sequence_length(sampling.timesteps)
+        if sampling.sigmas is not None:
+            return len(sampling.sigmas)
+        return int(sampling.num_inference_steps)
+
+    @staticmethod
+    def _sequence_length(values: Any) -> int:
+        ndim = getattr(values, "ndim", None)
+        if ndim == 0:
+            return 1
+
+        shape = getattr(values, "shape", None)
+        if shape is not None:
+            return int(shape[0])
+
+        return len(values)

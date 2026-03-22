@@ -670,6 +670,8 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    aborted: bool = False
+    abort_message: str | None = None
 
     post_process_func: Callable[..., Any] | None = None
 
@@ -685,6 +687,10 @@ class DiffusionOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+
+class DiffusionRequestAbortedError(RuntimeError):
+    """Raised when a diffusion request ends via user-visible abort."""
 
 
 class AttentionBackendEnum(enum.Enum):
