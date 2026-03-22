@@ -281,7 +281,7 @@ class DiffusionEngine:
     def make_engine(
         config: OmniDiffusionConfig,
         scheduler: SchedulerInterface | None = None,
-    ) -> "DiffusionEngine":
+    ) -> DiffusionEngine:
         """Factory method to create a DiffusionEngine instance.
 
         Args:

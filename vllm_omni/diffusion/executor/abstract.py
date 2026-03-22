@@ -19,7 +19,7 @@ class DiffusionExecutor(ABC):
     uses_multiproc: bool = False
 
     @staticmethod
-    def get_class(od_config: OmniDiffusionConfig) -> type["DiffusionExecutor"]:
+    def get_class(od_config: OmniDiffusionConfig) -> type[DiffusionExecutor]:
         executor_class: type[DiffusionExecutor]
         distributed_executor_backend = od_config.distributed_executor_backend
 
