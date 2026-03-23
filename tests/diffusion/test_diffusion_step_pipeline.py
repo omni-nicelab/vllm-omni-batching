@@ -558,7 +558,35 @@ class TestExecutor:
 
 @pytest.mark.cpu
 class TestEngine:
-    """DiffusionEngine.add_req_and_wait_for_response"""
+    """Step-execution paths in DiffusionEngine.add_req_and_wait_for_response"""
+
+    @pytest.mark.parametrize(
+        ("execute_fn", "expected_error"),
+        [
+            (
+                lambda _: RunnerOutput(
+                    req_id="req-error",
+                    step_index=1,
+                    finished=True,
+                    result=DiffusionOutput(error="boom"),
+                ),
+                "boom",
+            ),
+            (
+                lambda _: (_ for _ in ()).throw(RuntimeError("gpu on fire")),
+                "gpu on fire",
+            ),
+        ],
+    )
+    def test_step_engine_returns_error(self, execute_fn, expected_error):
+        scheduler = StepScheduler()
+        scheduler.initialize(Mock())
+        engine = _make_engine(scheduler, execute_fn=execute_fn)
+
+        output = engine.add_req_and_wait_for_response(_make_engine_request("req-error", num_inference_steps=2))
+
+        assert output.output is None
+        assert expected_error in output.error
 
     def test_step_execution_completes(self):
         scheduler = StepScheduler()
@@ -586,7 +614,7 @@ class TestEngine:
         assert output.error is None
         assert torch.equal(output.output, torch.tensor([2.0]))
 
-    def test_abort_after_first_step_stops_rescheduling(self):
+    def test_step_abort_stops_rescheduling_after_first_step(self):
         scheduler = StepScheduler()
         scheduler.initialize(Mock())
         engine = _make_engine(scheduler)
@@ -611,7 +639,7 @@ class TestEngine:
         assert step["n"] == 1
         _assert_aborted_output(output, "req-stop")
 
-    def test_abort_mid_step(self):
+    def test_step_abort_after_reschedule_returns_aborted_output(self):
         scheduler = StepScheduler()
         scheduler.initialize(Mock())
         engine = _make_engine(scheduler)
