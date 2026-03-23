@@ -34,18 +34,11 @@ class BackgroundResources:
             try:
                 for _ in range(self.num_workers):
                     self.broadcast_mq.enqueue(SHUTDOWN_MESSAGE)
+
+                self.broadcast_mq = None
+                self.result_mq = None
             except Exception as exc:
                 logger.warning("Failed to send shutdown signal: %s", exc)
-
-        for queue, label in ((self.broadcast_mq, "broadcast"), (self.result_mq, "result")):
-            if queue is None:
-                continue
-            try:
-                close_fn = getattr(queue, "close", None)
-                if callable(close_fn):
-                    close_fn()
-            except Exception as exc:
-                logger.warning("Failed to close %s queue: %s", label, exc)
 
         if self.processes:
             for proc in self.processes:
@@ -258,4 +251,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def shutdown(self) -> None:
         self._closed = True
-        self._finalizer()
+        try:
+            self._finalizer()
+        finally:
+            self._broadcast_mq = None
+            self._result_mq = None
+            self.resources = None
+            self._processes = []
