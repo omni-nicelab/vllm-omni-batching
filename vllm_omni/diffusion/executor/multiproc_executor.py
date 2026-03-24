@@ -274,7 +274,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "args": args,
             "kwargs": kwargs,
             "output_rank": unique_reply_rank if unique_reply_rank is not None else 0,
-            "exec_all_ranks": unique_reply_rank is None,
+            "exec_all_ranks": unique_reply_rank is None or exec_all_ranks,
         }
 
         try:
