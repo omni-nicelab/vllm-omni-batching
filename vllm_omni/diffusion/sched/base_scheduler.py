@@ -24,8 +24,6 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._finished_req_ids: set[str] = set()
-        # The current DiffusionEngine execution mode does not support real
-        # request batching well, so we keep this fixed at 1 for now.
         self._max_batch_size: int = 1
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
@@ -36,6 +34,10 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting.clear()
         self._running.clear()
         self._finished_req_ids.clear()
+        # The current DiffusionEngine execution mode does not support real
+        # request batching well, so we keep this fixed at 1 for now.
+        # TODO: Add support for multiple concurrent requests
+        self.max_num_running_reqs = 1
         self._reset_scheduler_state()
 
     def has_requests(self) -> bool:

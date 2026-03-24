@@ -46,7 +46,7 @@ class RequestScheduler(_BaseScheduler):
                 scheduled_cached_req_ids.append(sched_req_id)
 
         # Second, schedule WAITING requests while capacity remains.
-        while self._waiting and len(self._running) < self._max_batch_size:
+        while self._waiting and len(self._running) < self.max_num_running_reqs:
             sched_req_id = self._waiting.popleft()
             state = self._request_states.get(sched_req_id)
             if state is None:
