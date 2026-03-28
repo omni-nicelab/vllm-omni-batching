@@ -263,7 +263,7 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    model_name = args.model
     print("=" * 20, "\n", f"vllm version: {vllm.__version__}", "\n", "=" * 20)
 
     # Get paths from args
@@ -296,10 +296,11 @@ def main(args):
 
     omni = Omni(
         model=model_name,
+        dtype=args.dtype,
         stage_configs_path=args.stage_configs_path,
         log_stats=args.log_stats,
         stage_init_timeout=args.stage_init_timeout,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        init_timeout=args.init_timeout,
     )
 
     thinker_sampling_params = SamplingParams(
@@ -333,11 +334,14 @@ def main(args):
         repetition_penalty=1.1,
     )
 
-    sampling_params_list = [
+    all_sampling_params = [
         thinker_sampling_params,
         talker_sampling_params,  # code predictor is integrated into talker for Qwen3 Omni
         code2wav_sampling_params,
     ]
+    # Match sampling params to the number of configured stages
+    num_stages = omni.num_stages
+    sampling_params_list = all_sampling_params[:num_stages]
 
     if args.txt_prompts is None:
         prompts = [query_result.inputs for _ in range(args.num_prompts)]
@@ -415,6 +419,12 @@ def main(args):
 
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        help="Model name or path.",
+    )
     parser.add_argument(
         "--query-type",
         "-q",
@@ -528,11 +538,6 @@ def parse_args():
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
-    )
-    parser.add_argument(
         "--enable-profiler",
         action="store_true",
         default=False,
@@ -544,6 +549,12 @@ def parse_args():
         nargs="*",
         default=None,
         help="List of stage IDs to profile. If not set, profiles all stages.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
     return parser.parse_args()
