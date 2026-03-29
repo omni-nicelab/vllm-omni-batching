@@ -162,6 +162,7 @@ class AsyncOmni(OmniBase):
                     "vae_use_tiling": kwargs.get("vae_use_tiling", False),
                     "cache_backend": cache_backend,
                     "cache_config": cache_config,
+                    "step_execution": kwargs.get("step_execution", False),
                     "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
                     "enforce_eager": kwargs.get("enforce_eager", False),
                 },

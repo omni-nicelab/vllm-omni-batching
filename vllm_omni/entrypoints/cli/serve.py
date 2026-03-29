@@ -175,6 +175,11 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="JSON string of cache configuration (e.g., '{\"rel_l1_thresh\": 0.2}').",
         )
+        omni_config_group.add_argument(
+            "--step-execution",
+            action="store_true",
+            help="Enable online step execution for diffusion models so serving uses DiffusionCore.",
+        )
 
         # VAE memory optimization parameters
         omni_config_group.add_argument(

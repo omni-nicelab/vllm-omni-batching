@@ -1,6 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.inputs import parse as vllm_parse
+
+if not hasattr(vllm_parse, "ParsedEmbedsPrompt"):
+    class _ParsedEmbedsPrompt(dict):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+    vllm_parse.ParsedEmbedsPrompt = _ParsedEmbedsPrompt
+
 from vllm_omni.entrypoints import omni as omni_module
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
@@ -73,3 +82,19 @@ def test_default_stage_devices_from_sequence_parallel(monkeypatch):
     else:
         devices = getattr(runtime, "devices", None)
     assert devices == "0,1,2,3"
+
+
+def test_default_stage_config_includes_step_execution(monkeypatch):
+    monkeypatch.setattr(omni_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])
+    monkeypatch.setattr(omni_module, "resolve_model_config_path", lambda model: None)
+    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
+    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
+
+    omni = AsyncOmni(
+        model="dummy-model",
+        step_execution=True,
+    )
+
+    stage_cfg = omni.stage_configs[0]
+    engine_args = stage_cfg.engine_args
+    assert engine_args.get("step_execution") is True

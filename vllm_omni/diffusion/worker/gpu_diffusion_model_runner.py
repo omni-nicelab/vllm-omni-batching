@@ -10,6 +10,7 @@ model-related operations.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -70,6 +71,27 @@ class GPUDiffusionModelRunner:
         self.cache_backend = None
         self.batch_builder = batch_builder or FixedResolutionBatchBuilder()
         self._request_state_cache: dict[str, DiffusionRequestState] = {}
+
+    @staticmethod
+    def _format_timestep_value(timestep: torch.Tensor | float | int | None) -> str:
+        if timestep is None:
+            return "None"
+        if isinstance(timestep, torch.Tensor):
+            if timestep.numel() == 1:
+                value = timestep.detach().cpu().item()
+                if isinstance(value, float):
+                    return f"{value:.6g}"
+                return str(value)
+            preview = timestep.detach().flatten()[:3].cpu().tolist()
+            return f"tensor(shape={tuple(timestep.shape)}, preview={preview})"
+        return str(timestep)
+
+    def _format_request_step(self, state: DiffusionRequestState) -> str:
+        return (
+            f"{state.req_id}(step_index={state.step_index},"
+            f" progress={state.step_index + 1}/{state.total_steps},"
+            f" timestep={self._format_timestep_value(state.current_timestep)})"
+        )
 
     def load_model(
         self,
@@ -192,8 +214,10 @@ class GPUDiffusionModelRunner:
         if denoise_states:
             batch = self.batch_builder.build(denoise_states)
             if batch is not None:
-                step_outputs = self._denoise_batch(batch)
+                step_outputs = self._denoise_batch(batch, scheduler_output.step_id)
 
+        # Recompute completion after denoise so requests that finish in this
+        # scheduling cycle are decoded immediately instead of being rescheduled.
         decoded = {}
         decode_states = [state for state in states if state.denoise_completed]
         if decode_states:
@@ -307,7 +331,7 @@ class GPUDiffusionModelRunner:
 
         return encoded_states
 
-    def _denoise_batch(self, batch: StepBatch) -> list[StepOutput]:
+    def _denoise_batch(self, batch: StepBatch, step_id: int | None = None) -> list[StepOutput]:
         """Execute denoise + per-request scheduler_step."""
         if not batch.requests:
             return []
@@ -324,6 +348,15 @@ class GPUDiffusionModelRunner:
                     "Disable cache or ensure uniform step counts."
                 )
             self.cache_backend.refresh(self.pipeline, steps_set.pop())
+
+        if logger.isEnabledFor(logging.INFO):
+            req_progress = ", ".join(self._format_request_step(state) for state in batch.requests)
+            logger.info(
+                "Runner denoise_batch: step_id=%s batch_size=%d reqs=[%s]",
+                step_id,
+                len(batch.requests),
+                req_progress,
+            )
 
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             noise_pred = self.pipeline.denoise_step(

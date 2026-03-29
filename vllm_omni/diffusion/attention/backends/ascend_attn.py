@@ -54,6 +54,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        attention_mask = self._normalize_attention_mask(attention_mask, query, key)
 
         output = torch.nn.functional.scaled_dot_product_attention(
             query,
@@ -66,6 +67,30 @@ class AscendAttentionBackendImpl(AttentionImpl):
         )
         out = output.permute(0, 2, 1, 3)
         return out
+
+    @staticmethod
+    def _normalize_attention_mask(
+        attention_mask: torch.Tensor | None,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if attention_mask is None:
+            return None
+
+        if attention_mask.ndim == 2:
+            batch_size = query.shape[0]
+            key_len = key.shape[-2]
+            if attention_mask.shape == (batch_size, key_len):
+                return attention_mask[:, None, None, :]
+
+        if attention_mask.ndim == 3:
+            batch_size = query.shape[0]
+            query_len = query.shape[-2]
+            key_len = key.shape[-2]
+            if attention_mask.shape == (batch_size, query_len, key_len):
+                return attention_mask[:, None, :, :]
+
+        return attention_mask
 
     def forward(
         self,

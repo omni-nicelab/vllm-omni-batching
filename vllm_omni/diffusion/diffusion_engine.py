@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import queue
+import threading
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -9,6 +11,8 @@ from typing import Any
 import PIL.Image
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.core.diffusion_core import DiffusionCore
+from vllm_omni.diffusion.core.outputs import DiffusionCoreOutput
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
@@ -161,6 +165,8 @@ class DiffusionEngine:
         Returns:
             An instance of DiffusionEngine.
         """
+        if config.step_execution:
+            return StepExecutionDiffusionEngine(config)
         return DiffusionEngine(config)
 
     def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
@@ -347,3 +353,193 @@ class DiffusionEngine:
         # TODO implement it
         logger.warning("DiffusionEngine abort is not implemented yet")
         pass
+
+
+class StepExecutionDiffusionEngine(DiffusionEngine):
+    """Diffusion engine backed by DiffusionCore for online step execution."""
+
+    def __init__(self, od_config: OmniDiffusionConfig):
+        self.od_config = od_config
+
+        self.post_process_func = get_diffusion_post_process_func(od_config)
+        self.pre_process_func = get_diffusion_pre_process_func(od_config)
+
+        executor_class = DiffusionExecutor.get_class(od_config)
+        self.core = DiffusionCore(od_config, executor_class)
+        self.executor = self.core.executor
+
+        self._closed = False
+        self._pending_lock = threading.Lock()
+        self._pending_outputs: dict[str, queue.Queue[DiffusionCoreOutput]] = {}
+        self._shutdown_event = threading.Event()
+        self._loop_thread = threading.Thread(
+            target=self._run_loop,
+            name="DiffusionCoreLoop",
+            daemon=True,
+        )
+        self._loop_thread.start()
+
+        try:
+            self._dummy_run()
+        except Exception as e:
+            logger.error(f"Dummy run failed: {e}")
+            self.close()
+            raise e
+
+    def step(self, requests: list[OmniDiffusionRequest]):
+        if self._closed:
+            raise RuntimeError("Diffusion engine is closed")
+
+        request_map: dict[str, OmniDiffusionRequest] = {}
+        wait_queues: dict[str, queue.Queue[DiffusionCoreOutput]] = {}
+
+        with self._pending_lock:
+            for request in requests:
+                request_id = request.request_id
+                if request_id is None:
+                    raise ValueError("OmniDiffusionRequest.request_id must be set for step_execution")
+                if request_id in self._pending_outputs:
+                    raise ValueError(f"Duplicate in-flight diffusion request_id: {request_id}")
+                waiter: queue.Queue[DiffusionCoreOutput] = queue.Queue(maxsize=1)
+                self._pending_outputs[request_id] = waiter
+                wait_queues[request_id] = waiter
+                request_map[request_id] = request
+
+        try:
+            for request in requests:
+                self.core.enqueue_request(request)
+
+            outputs: list[OmniRequestOutput] = []
+            for request in requests:
+                request_id = request.request_id
+                assert request_id is not None
+                core_output = wait_queues[request_id].get()
+                if core_output.error:
+                    raise RuntimeError(core_output.error)
+                outputs.append(self._build_request_output(request_map[request_id], core_output))
+
+            if len(outputs) == 1:
+                return outputs[0]
+            return outputs
+        finally:
+            with self._pending_lock:
+                for request in requests:
+                    request_id = request.request_id
+                    if request_id is not None:
+                        self._pending_outputs.pop(request_id, None)
+
+    def add_req_and_wait_for_response(self, requests: list[OmniDiffusionRequest]):
+        raise NotImplementedError("step_execution uses DiffusionCore and does not support add_req_and_wait_for_response.")
+
+    def _run_loop(self) -> None:
+        try:
+            while not self._shutdown_event.is_set():
+                if not self.core.has_unfinished_requests():
+                    try:
+                        request_type, payload = self.core.input_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    self.core._handle_client_request(request_type, payload)
+
+                self._drain_input_queue()
+
+                outputs, executed = self.core.step()
+                for output in outputs:
+                    self._deliver_output(output)
+
+                if not executed and self.core.has_unfinished_requests():
+                    time.sleep(0.001)
+        except Exception as e:
+            logger.exception("DiffusionCore loop failed")
+            self._fail_pending_requests(f"DiffusionCore loop failed: {e}")
+            self._shutdown_event.set()
+
+    def _drain_input_queue(self) -> None:
+        while True:
+            try:
+                request_type, payload = self.core.input_queue.get_nowait()
+            except queue.Empty:
+                return
+            self.core._handle_client_request(request_type, payload)
+
+    def _deliver_output(self, output: DiffusionCoreOutput) -> None:
+        with self._pending_lock:
+            waiter = self._pending_outputs.get(output.request_id)
+        if waiter is None:
+            return
+        try:
+            waiter.put_nowait(output)
+        except queue.Full:
+            logger.debug("Skipping duplicate output for request %s", output.request_id)
+
+    def _build_request_output(
+        self,
+        request: OmniDiffusionRequest,
+        core_output: DiffusionCoreOutput,
+    ) -> OmniRequestOutput:
+        prompt = request.prompt
+        if isinstance(prompt, list):
+            prompt = prompt[0] if prompt else None
+        return OmniRequestOutput.from_diffusion(
+            request_id=core_output.request_id,
+            images=core_output.images or [],
+            prompt=prompt,
+            metrics=core_output.metrics,
+            latents=core_output.latents,
+        )
+
+    def _dummy_run(self):
+        prompt = "dummy run"
+        num_inference_steps = 1
+        height = 1024
+        width = 1024
+        if supports_image_input(self.od_config.model_class_name):
+            dummy_image = PIL.Image.new("RGB", (width, height), color=(0, 0, 0))
+        else:
+            dummy_image = None
+        req = OmniDiffusionRequest(
+            request_id="__dummy_warmup__",
+            prompt=prompt,
+            height=height,
+            width=width,
+            pil_image=dummy_image,
+            num_inference_steps=num_inference_steps,
+            num_outputs_per_prompt=1,
+        )
+        logger.info("dummy run to warm up the model")
+        self.step([req])
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._shutdown_event.set()
+        if hasattr(self, "_loop_thread") and self._loop_thread.is_alive():
+            self._loop_thread.join(timeout=5)
+        self._fail_pending_requests("Diffusion engine is shutting down")
+        if hasattr(self, "executor"):
+            self.executor.shutdown()
+
+    def abort(self, request_id: str | Iterable[str]) -> None:
+        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+        for req_id in request_ids:
+            self._deliver_output(
+                DiffusionCoreOutput(
+                    request_id=req_id,
+                    finished=True,
+                    error="Request aborted",
+                )
+            )
+        self.core.enqueue_abort(request_ids)
+
+    def _fail_pending_requests(self, error: str) -> None:
+        with self._pending_lock:
+            request_ids = list(self._pending_outputs.keys())
+        for req_id in request_ids:
+            self._deliver_output(
+                DiffusionCoreOutput(
+                    request_id=req_id,
+                    finished=True,
+                    error=error,
+                )
+            )

@@ -13,8 +13,12 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+
+try:
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+except ImportError:
+    pytest.skip("flash_attn package is required for FlashAttention backend tests", allow_module_level=True)
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
@@ -210,21 +214,12 @@ def test_fa_vs_sdpa():
     # Run FlashAttention
     output_fa = fa_impl.forward(query=query.clone(), key=key.clone(), value=value.clone(), attn_metadata=attn_metadata)
 
-    # Run SDPA
-    # SDPA expects 4D attention mask: (batch_size, 1, seq_len, seq_len) or (batch_size, seq_len)
-    # For causal=False, we need to convert 2D mask to 4D
-    if attn_mask is not None:
-        # Expand mask for SDPA: (batch_size, seq_len) -> (batch_size, 1, 1, seq_len)
-        attn_mask_4d = attn_mask.unsqueeze(1).unsqueeze(2)
-        # Convert bool to float: True -> 0.0, False -> -inf
-        attn_mask_float = torch.zeros_like(attn_mask_4d, dtype=dtype)
-        attn_mask_float.masked_fill_(~attn_mask_4d, float("-inf"))
-        attn_metadata_sdpa = AttentionMetadata(attn_mask=attn_mask_float)
-    else:
-        attn_metadata_sdpa = AttentionMetadata(attn_mask=None)
-
+    # Run SDPA with the same 2D padding mask interface used by diffusion batching.
     output_sdpa = sdpa_impl.forward(
-        query=query.clone(), key=key.clone(), value=value.clone(), attn_metadata=attn_metadata_sdpa
+        query=query.clone(),
+        key=key.clone(),
+        value=value.clone(),
+        attn_metadata=attn_metadata,
     )
 
     # Compare outputs (only compare valid regions)

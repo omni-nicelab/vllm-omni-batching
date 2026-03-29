@@ -9,6 +9,7 @@ enabling concurrent request handling and streaming generation.
 """
 
 import asyncio
+import os
 import uuid
 from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -77,7 +78,10 @@ class AsyncOmniDiffusion:
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
         # Thread pool for running sync engine in async context
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        max_workers = 1
+        if od_config.step_execution:
+            max_workers = max(4, min(32, os.cpu_count() or 4))
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._closed = False
 
         logger.info("AsyncOmniDiffusion initialized with model: %s", model)

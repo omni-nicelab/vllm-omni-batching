@@ -36,10 +36,10 @@ class DiffusionStepScheduler:
         # scheduling constraints
         # NOTE: for Qwen-Image, axes_dims_rope: [16,56,56]
         # TODO: better defaults values
-        self._max_batch_size: int = int(getattr(od_config, "max_batch_size", 2))
-        self._max_model_len: int = int(getattr(od_config, "max_model_len", 56 * 56))
+        self._max_batch_size: int = 2# int(getattr(od_config, "max_batch_size", 2))
+        self._max_model_len: int = 4096# int(getattr(od_config, "max_model_len", 56 * 56))
         # NOTE: this is an "image token" budget (i.e. tokens), not pixel-space units.
-        self._max_num_scheduled_tokens: int = int(getattr(od_config, "max_num_batched_dit_tokens", 4 * 56 * 56))
+        self._max_num_scheduled_tokens: int = 8192 # int(getattr(od_config, "max_num_batched_dit_tokens", 4 * 56 * 56))
 
         # Validate scheduling constraints following vLLM design
         if self._max_num_scheduled_tokens > self._max_batch_size * self._max_model_len:

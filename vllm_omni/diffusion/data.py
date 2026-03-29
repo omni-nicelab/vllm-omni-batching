@@ -247,6 +247,7 @@ class OmniDiffusionConfig:
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
+    step_execution: bool = False
 
     # Workload type
     # workload_type: WorkloadType = WorkloadType.T2V
