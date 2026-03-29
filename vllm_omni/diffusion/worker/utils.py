@@ -122,14 +122,15 @@ class DiffusionRequestState:
 
 @dataclass
 class RunnerOutput:
-    """Output of a single denoising step for a request.
+    """Output of one denoising step.
 
     NOTE: `latents` may be None when returned through IPC to avoid
     serialization overhead. The actual latents are kept in Worker's
     _request_state_cache.
     """
 
-    req_id: str
-    step_index: int | None = None
-    finished: bool = False
-    result: DiffusionOutput | None = None
+    req_id: str | list[str]
+    step_index: str | list[int] = None
+    finished: bool | list[bool] = False
+    result: DiffusionOutput | list[DiffusionOutput] = None
+
