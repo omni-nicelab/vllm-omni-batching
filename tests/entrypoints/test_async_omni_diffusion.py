@@ -18,6 +18,13 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_get_diffusion_od_config_returns_direct_config():
+    diffusion = object.__new__(AsyncOmniDiffusion)
+    diffusion.od_config = object()
+
+    assert diffusion.get_diffusion_od_config() is diffusion.od_config
+
+
 def test_async_omni_diffusion_generate_aborts_engine_on_cancel():
     async def run_test():
         started = threading.Event()
