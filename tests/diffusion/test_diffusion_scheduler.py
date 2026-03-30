@@ -227,9 +227,14 @@ class TestRequestScheduler:
         state_b = self.scheduler.get_request_state(req_id_b)
         assert state_b.status == DiffusionRequestStatus.FINISHED_ABORTED
 
+        first = self.scheduler.schedule()
+        assert first.finished_req_ids == {req_id_b}
         # A should still run normally.
-        output_a = self.scheduler.schedule()
-        assert _new_ids(output_a) == [req_id_a]
+        assert _new_ids(first) == [req_id_a]
+
+        # B is already marked finished aborted, scheduling again should not pull it.
+        second = self.scheduler.schedule()
+        assert second.finished_req_ids == set()
 
         # Abort running request.
         self.scheduler.finish_requests(req_id_a, DiffusionRequestStatus.FINISHED_ABORTED)
