@@ -38,6 +38,55 @@ class DiffusionRequestStatus(enum.IntEnum):
         return status >= DiffusionRequestStatus.FINISHED_COMPLETED
 
 
+@dataclass(frozen=True, eq=True)
+class SamplingParamsKey:
+    """Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
+
+    Only requests with an identical key can share a forward pass.
+    Each field here must match exactly; any difference forces separate batches.
+
+    Excluded from the key (allowed to differ within a batch):
+    RNG fields (seed/generator), per-request tensor inputs (latents/embeds),
+    preprocessing flags (height_not_provided, etc.), unused sampling fields
+    (prompt_template, n_tokens, VSA_sparsity), and side-effect-only flags
+    (save_output, profile, debug, return_trajectory_*, return_frames).
+    """
+
+    # -- Spatial / temporal shape --
+    height: int | None = None
+    width: int | None = None
+    num_frames: int = 1
+    resolution: str | None = None
+    fps: int | None = None
+    frame_rate: int | None = None
+
+    # -- Denoising schedule --
+    num_inference_steps: int | None = None
+    num_outputs_per_prompt: int = 1
+
+    # -- CFG / guidance --
+    do_classifier_free_guidance: bool = False
+    guidance_scale: float = 0.0
+    guidance_scale_provided: bool = False
+    guidance_scale_2: float | None = None
+    guidance_rescale: float = 0.0
+    true_cfg_scale: float = 0.0
+    cfg_normalize: bool = False
+
+    # -- Output format --
+    output_type: str | None = None
+
+    # -- Pipeline behaviour flags --
+    max_sequence_length: int | None = None
+    layers: int | None = None
+    use_en_prompt: bool = False
+    boundary_ratio: float = 0.0
+    decode_timestep: float = 0.0
+    decode_noise_scale: float = 0.0
+    eta: float = 0.0
+    lora_scale: float = 1.0
+
+
 @dataclass
 class DiffusionRequestState:
     """Scheduler-owned state for one queued OmniDiffusionRequest."""
@@ -47,6 +96,7 @@ class DiffusionRequestState:
     # TODO: Align this with OmniDiffusionRequest.request_ids once scheduler batching is supported.
     sched_req_id: str
     req: OmniDiffusionRequest
+    sampling_params_key: SamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
@@ -81,7 +131,7 @@ class CachedRequestData:
 class DiffusionSchedulerOutput:
     """Output of a single scheduling cycle."""
 
-    step_id: int
+    step_id: int  # global step index
     scheduled_new_reqs: list[NewRequestData]
     scheduled_cached_reqs: CachedRequestData
     finished_req_ids: set[str]

@@ -130,7 +130,30 @@ class RunnerOutput:
     """
 
     req_id: str | list[str]
-    step_index: str | list[int] = None
+    step_index: int | list[int] | None = None
     finished: bool | list[bool] = False
-    result: DiffusionOutput | list[DiffusionOutput] = None
+    result: DiffusionOutput | list[DiffusionOutput] | None = None
 
+    def __post_init__(self) -> None:
+        if isinstance(self.req_id, list):
+            self.req_id_to_index: dict[str, int] = {rid: i for i, rid in enumerate(self.req_id)}
+        else:
+            self.req_id_to_index = {self.req_id: 0}
+
+    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
+        """Return a per-request view for *sched_req_id*.
+
+        Scalar mode (single req_id str) returns *self* directly.
+        List/batch mode indexes into each field by position.
+        """
+        if sched_req_id not in self.req_id_to_index:
+            return None
+        if isinstance(self.req_id, str):
+            return self
+        idx = self.req_id_to_index[sched_req_id]
+        return RunnerOutput(
+            req_id=sched_req_id,
+            step_index=self.step_index[idx] if isinstance(self.step_index, list) else self.step_index,
+            finished=self.finished[idx] if isinstance(self.finished, list) else self.finished,
+            result=self.result[idx] if isinstance(self.result, list) else self.result,
+        )

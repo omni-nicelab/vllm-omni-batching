@@ -34,12 +34,14 @@ def _make_request(req_id: str) -> OmniDiffusionRequest:
 
 
 def _make_request_output(req_id: str, *, error: str | None = None, finished: bool = True):
-    return SimpleNamespace(
+    out = SimpleNamespace(
         req_id=req_id,
         step_index=None,
         finished=finished,
         result=DiffusionOutput(output=None, error=error),
     )
+    out.get_req_output = lambda sid: out if sid == req_id else None
+    return out
 
 
 def _make_step_output(
@@ -49,12 +51,24 @@ def _make_step_output(
     finished: bool = False,
     error: str | None = None,
 ):
-    return SimpleNamespace(
+    out = SimpleNamespace(
         req_id=req_id,
         step_index=step_index,
         finished=finished,
-        result=DiffusionOutput(output=None, error=error) if error is not None else None,
+        result=DiffusionOutput(output=None, error=error),
     )
+    out.get_req_output = lambda sid: out if sid == req_id else None
+    return out
+
+
+class _BatchedStepOutput:
+    """Wraps multiple per-request step outputs with ``get_req_output()`` support."""
+
+    def __init__(self, *outputs):
+        self._outputs = {o.req_id: o for o in outputs}
+
+    def get_req_output(self, req_id: str):
+        return self._outputs.get(req_id)
 
 
 def _make_step_request(
@@ -153,7 +167,7 @@ class _StubScheduler(SchedulerInterface):
 class TestRequestScheduler:
     def setup_method(self) -> None:
         self.scheduler: RequestScheduler = RequestScheduler()
-        self.scheduler.initialize(Mock())
+        self.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
 
     def test_single_request_success_lifecycle(self) -> None:
         req_id = self.scheduler.add_request(_make_request("a"))
@@ -218,6 +232,47 @@ class TestRequestScheduler:
         assert third.num_running_reqs == 1
         assert third.num_waiting_reqs == 0
 
+    def test_batches_compatible_requests_up_to_max_num_seqs(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(_make_request("a"))
+        req_id_b = scheduler.add_request(_make_request("b"))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_id_a, req_id_b]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_keeps_incompatible_head_waiting_for_next_batch(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        req_id_a = scheduler.add_request(_make_request("a"))
+        req_id_b = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_b"],
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2),
+                request_ids=["b"],
+            )
+        )
+        req_id_c = scheduler.add_request(_make_request("c"))
+
+        first = scheduler.schedule()
+        assert _new_ids(first) == [req_id_a]
+        assert first.num_waiting_reqs == 2
+
+        scheduler.update_from_output(first, _make_request_output(req_id_a))
+        second = scheduler.schedule()
+        assert _new_ids(second) == [req_id_b]
+        assert second.num_waiting_reqs == 1
+
+        scheduler.update_from_output(second, _make_request_output(req_id_b))
+        third = scheduler.schedule()
+        assert _new_ids(third) == [req_id_c]
+        assert third.num_waiting_reqs == 0
+
     def test_abort_request_for_waiting_and_running(self) -> None:
         req_id_a = self.scheduler.add_request(_make_request("a"))
         req_id_b = self.scheduler.add_request(_make_request("b"))
@@ -279,7 +334,7 @@ class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
-        engine.scheduler.initialize(Mock())
+        engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
         engine._rpc_lock = threading.RLock()
         engine.abort_queue = queue.Queue()
 
@@ -349,7 +404,7 @@ class TestDiffusionEngine:
     def test_abort_queue_marks_request_finished_aborted(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
-        engine.scheduler.initialize(Mock())
+        engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
         engine.abort_queue = queue.Queue()
 
         req_id = engine.scheduler.add_request(_make_request("req-abort"))
@@ -361,7 +416,7 @@ class TestDiffusionEngine:
     def test_finalize_finished_request_returns_aborted_output(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
-        engine.scheduler.initialize(Mock())
+        engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
 
         req_id = engine.scheduler.add_request(_make_request("req-finalize"))
         engine.scheduler.finish_requests(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
@@ -402,7 +457,7 @@ class TestDiffusionEngine:
 class TestStepScheduler:
     def setup_method(self) -> None:
         self.scheduler: StepScheduler = StepScheduler()
-        self.scheduler.initialize(Mock())
+        self.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
 
     def test_single_request_step_lifecycle(self) -> None:
         request = _make_step_request("step", num_inference_steps=3)
@@ -494,15 +549,14 @@ class TestStepScheduler:
         req_id = self.scheduler.add_request(_make_step_request("missing", num_inference_steps=3))
 
         sched_output = self.scheduler.schedule()
-        finished = self.scheduler.update_from_output(
-            sched_output,
-            SimpleNamespace(
-                req_id=req_id,
-                step_index=None,
-                finished=True,
-                result=None,
-            ),
+        output = SimpleNamespace(
+            req_id=req_id,
+            step_index=None,
+            finished=True,
+            result=None,
         )
+        output.get_req_output = lambda sid, _o=output, _rid=req_id: _o if sid == _rid else None
+        finished = self.scheduler.update_from_output(sched_output, output)
 
         assert finished == {req_id}
         state = self.scheduler.get_request_state(req_id)
@@ -552,6 +606,100 @@ class TestStepScheduler:
         )
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
+
+    def test_batches_compatible_requests(self) -> None:
+        """Two requests with same sampling params batch together."""
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(_make_step_request("b"))
+
+        out = scheduler.schedule()
+        assert _new_ids(out) == [req_a, req_b]
+        assert out.num_running_reqs == 2
+        assert out.num_waiting_reqs == 0
+
+    def test_different_step_progress_same_params_batches(self) -> None:
+        """Requests at different denoise steps but same sampling params share a batch."""
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=4))
+
+        # Schedule and advance A by one step.
+        out1 = scheduler.schedule()
+        assert _new_ids(out1) == [req_a]
+        scheduler.update_from_output(out1, _make_step_output(req_a, step_index=1))
+
+        # Now add B (step 0) while A is at step 1.
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=4))
+
+        out2 = scheduler.schedule()
+        # A is cached (running), B is new — both scheduled.
+        assert _cached_ids(out2) == [req_a]
+        assert _new_ids(out2) == [req_b]
+        assert out2.num_running_reqs == 2
+
+    def test_incompatible_head_blocks_queue(self) -> None:
+        """Incompatible request at queue head blocks subsequent compatible ones."""
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=4))
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=8))
+        scheduler.add_request(_make_step_request("c", num_inference_steps=4))
+
+        out = scheduler.schedule()
+        # Only A is scheduled; B is incompatible so it blocks, C never reached.
+        assert _new_ids(out) == [req_a]
+        assert out.num_waiting_reqs == 2
+
+        # Finish A, then B gets scheduled alone (incompatible with C).
+        scheduler.update_from_output(out, _make_step_output(req_a, step_index=4, finished=True))
+
+        out2 = scheduler.schedule()
+        assert _new_ids(out2) == [req_b]
+        assert out2.num_waiting_reqs == 1
+
+    def test_max_num_seqs_caps_batch(self) -> None:
+        """Batch size is capped by max_num_seqs even when all are compatible."""
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(_make_step_request("b"))
+        scheduler.add_request(_make_step_request("c"))
+
+        out = scheduler.schedule()
+        assert _new_ids(out) == [req_a, req_b]
+        assert out.num_waiting_reqs == 1
+
+    def test_freed_capacity_admits_waiting(self) -> None:
+        """After a batched request finishes, freed slot admits waiting request."""
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=2))
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=2))
+        req_c = scheduler.add_request(_make_step_request("c", num_inference_steps=2))
+
+        out1 = scheduler.schedule()
+        assert _new_ids(out1) == [req_a, req_b]
+        assert out1.num_waiting_reqs == 1
+
+        # Finish A, advance B — single update with batched output.
+        batched = _BatchedStepOutput(
+            _make_step_output(req_a, step_index=2, finished=True),
+            _make_step_output(req_b, step_index=1),
+        )
+        scheduler.update_from_output(out1, batched)
+
+        out2 = scheduler.schedule()
+        # B is cached, C joins as new.
+        assert _cached_ids(out2) == [req_b]
+        assert _new_ids(out2) == [req_c]
+        assert out2.num_running_reqs == 2
 
     def test_preempt_request_preserves_step_index(self) -> None:
         request = _make_step_request("preempt", num_inference_steps=3)
