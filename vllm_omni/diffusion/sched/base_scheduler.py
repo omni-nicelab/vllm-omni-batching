@@ -54,6 +54,8 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._finished_req_ids: set[str] = set()
+        # Default to 1; overwritten by initialize() from od_config.max_num_seqs.
+        self.max_num_running_reqs: int = 1
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
