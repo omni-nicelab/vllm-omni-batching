@@ -132,7 +132,7 @@ class RunnerOutput:
     req_id: str | list[str]
     step_index: int | list[int] | None = None
     finished: bool | list[bool] = False
-    result: DiffusionOutput | list[DiffusionOutput] | None = None
+    result: DiffusionOutput | list[DiffusionOutput | None] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.req_id, list):

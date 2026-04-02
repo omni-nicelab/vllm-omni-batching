@@ -150,14 +150,19 @@ class _CacheDiTPipeline:
         num_steps = state.sampling.num_inference_steps
         state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
         state.latents = torch.tensor([0.0])
+        state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
+        state.prompt_embeds_mask = torch.tensor([[True, True]])
         return state
 
-    def denoise_step(self, state, **kwargs):
-        del kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         assert self.runner is not None
+        active_req_id = self.runner.cache_manager._active_req_id
+        if active_req_id is None:
+            raise AssertionError("cache manager must activate one request before denoise_step")
+        state = self.runner.state_cache[active_req_id]
         assert self.live_cache_slot is state.cache_slot
 
-        active_req_id = self.runner.cache_manager._active_req_id
         resident_req_ids = tuple(
             sorted(
                 req_id
@@ -262,13 +267,17 @@ class _TeaCachePipeline:
         num_steps = state.sampling.num_inference_steps
         state.timesteps = [torch.tensor(num_steps - idx) for idx in range(num_steps)]
         state.latents = torch.tensor([0.0])
+        state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
+        state.prompt_embeds_mask = torch.tensor([[True, True]])
         return state
 
-    def denoise_step(self, state, **kwargs):
-        del kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         assert self.runner is not None
-
         active_req_id = self.runner.cache_manager._active_req_id
+        if active_req_id is None:
+            raise AssertionError("cache manager must activate one request before denoise_step")
+        state = self.runner.state_cache[active_req_id]
         resident_req_ids = tuple(
             sorted(
                 req_id
@@ -461,6 +470,8 @@ class TestExecuteStepwiseCacheDiTCachePool:
         assert runner.cache_manager.driver.deactivate_history == [1]
         assert runner.cache_manager._active_req_id is None
         assert runner.pipeline.live_cache_slot is None
+        assert runner.state_cache == {}
+        assert runner.input_batch is None
 
 
     def test_stepwise_cache_backend_requires_experiment_cachepool(self, monkeypatch):

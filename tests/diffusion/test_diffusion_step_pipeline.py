@@ -71,35 +71,42 @@ class _StepPipeline:
         self.denoise_calls = 0
         self.scheduler_calls = 0
         self.decode_calls = 0
+        self.last_prepare_kwargs = None
+        self.last_denoise_kwargs = None
+        self.last_scheduler_kwargs = None
+        self.last_decode_kwargs = None
 
     def prepare_encode(self, state, **kwargs):
-        del kwargs
         self.prepare_calls += 1
+        self.last_prepare_kwargs = kwargs
+        state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
+        state.prompt_embeds_mask = torch.tensor([[True, True]])
         state.timesteps = [torch.tensor(10), torch.tensor(5)]
         state.latents = torch.tensor([0.0])
         return state
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
         self.denoise_calls += 1
-        return torch.tensor([1.0])
+        self.last_denoise_kwargs = kwargs
+        return torch.ones_like(input_batch.latents)
 
     def step_scheduler(self, state, noise_pred, **kwargs):
-        del noise_pred, kwargs
+        del noise_pred
         self.scheduler_calls += 1
+        self.last_scheduler_kwargs = kwargs
         state.step_index += 1
 
     def post_decode(self, state, **kwargs):
-        del kwargs
         self.decode_calls += 1
+        self.last_decode_kwargs = kwargs
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
 
 
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         self.denoise_calls += 1
         return None
 
@@ -110,6 +117,26 @@ class _InterruptingStepPipeline(_StepPipeline):
     def post_decode(self, state, **kwargs):
         del state, kwargs
         raise AssertionError("post_decode should not run after interrupt")
+
+
+class _SchedulerOwnedStepPipeline(_StepPipeline):
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
+        self.denoise_calls += 1
+        return None
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del kwargs
+        assert noise_pred is None
+        self.scheduler_calls += 1
+        state.step_index += 1
+
+
+class _FailingStepPipeline(_StepPipeline):
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
+        self.denoise_calls += 1
+        raise RuntimeError("denoise boom")
 
 
 class _IdentityNoiseTransformer(torch.nn.Module):
@@ -140,6 +167,8 @@ class _DistributedStepPipeline(CFGParallelMixin):
 
     def prepare_encode(self, state, **kwargs):
         del kwargs
+        state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32, device=self.device)
+        state.prompt_embeds_mask = torch.tensor([[True, True]], device=self.device)
         state.timesteps = [torch.tensor(1.0, device=self.device)]
         state.latents = torch.ones((1, 1), device=self.device)
         state.step_index = 0
@@ -147,8 +176,9 @@ class _DistributedStepPipeline(CFGParallelMixin):
         state.do_true_cfg = self.mode == "cfg"
         return state
 
-    def denoise_step(self, state, **kwargs):
+    def denoise_step(self, input_batch, **kwargs):
         del kwargs
+        batch = input_batch
         if self.mode == "ulysses":
             sp_group = get_sp_group().ulysses_group
             seq_world_size = torch.distributed.get_world_size(sp_group)
@@ -157,7 +187,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
             intermediate = SeqAllToAll4D.apply(sp_group, input_tensor, 2, 1, False)
             output = SeqAllToAll4D.apply(sp_group, intermediate, 1, 2, False)
             torch.testing.assert_close(output, original, rtol=1e-5, atol=1e-5)
-            return torch.ones_like(state.latents)
+            return torch.ones_like(batch.latents)
 
         if self.mode == "ring":
             ring_group = get_sp_group().ring_group
@@ -170,10 +200,10 @@ class _DistributedStepPipeline(CFGParallelMixin):
             comm.wait()
             expected = torch.full_like(recv_tensor, float(((rank - 1) % world_size) + 1))
             torch.testing.assert_close(recv_tensor, expected, rtol=1e-5, atol=1e-5)
-            return torch.ones_like(state.latents)
+            return torch.ones_like(batch.latents)
 
-        positive_kwargs = {"x": state.latents + 1}
-        negative_kwargs = {"x": state.latents - 1}
+        positive_kwargs = {"x": batch.latents + 1}
+        negative_kwargs = {"x": batch.latents - 1}
         return self.predict_noise_maybe_with_cfg(
             do_true_cfg=True,
             true_cfg_scale=1.0,
@@ -242,6 +272,8 @@ def _make_runner():
     runner.cache_manager = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner.input_batch = None
+    runner.model_state = SimpleNamespace(prepare_attn=lambda input_batch: {})
     runner.kv_transfer_manager = SimpleNamespace()
     return runner
 
@@ -259,6 +291,8 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.cache_manager = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner.input_batch = None
+    runner.model_state = SimpleNamespace(prepare_attn=lambda input_batch: {})
     runner.kv_transfer_manager = SimpleNamespace()
     return runner
 
@@ -371,17 +405,46 @@ class TestRunner:
         assert second.result.error is None
         assert torch.equal(second.result.output, torch.tensor([2.0]))
         assert "req-1" not in runner.state_cache
+        assert runner.input_batch is None
 
         assert runner.pipeline.prepare_calls == 1
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
 
-    def test_rejects_multi_request_step_batch(self):
+    def test_prepares_input_batch_and_attn_metadata(self, monkeypatch):
+        runner = _make_runner()
+        req = _make_step_request()
+        attn_metadata = {"positive": object()}
+        prepare_attn = Mock(return_value=attn_metadata)
+        runner.model_state = SimpleNamespace(prepare_attn=prepare_attn)
+        forward_context_calls = []
+
+        @contextmanager
+        def _capture_forward_context(*args, **kwargs):
+            del args
+            forward_context_calls.append(kwargs)
+            yield
+
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _capture_forward_context)
+
+        output = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+
+        assert output.finished is False
+        assert runner.input_batch is not None
+        prepare_attn.assert_called_once_with(runner.input_batch)
+        assert len(forward_context_calls) == 2
+        assert forward_context_calls[0].get("attn_metadata") is None
+        assert forward_context_calls[1]["attn_metadata"] is attn_metadata
+        assert runner.pipeline.last_denoise_kwargs == {}
+        assert runner.pipeline.last_scheduler_kwargs == {}
+
+    def test_supports_multi_request_step_batch(self, monkeypatch):
         runner = _make_runner()
         req_1 = _make_step_request()
         req_2 = _make_step_request()
         req_2.request_ids = ["req-2"]
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
         scheduler_output = DiffusionSchedulerOutput(
             step_id=0,
@@ -395,8 +458,15 @@ class TestRunner:
             num_waiting_reqs=0,
         )
 
-        with pytest.raises(ValueError, match="batch_size=1"):
-            DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+        output = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+        assert output.req_id == ["req-1", "req-2"]
+        assert output.step_index == [1, 1]
+        assert output.finished == [False, False]
+        assert output.result == [None, None]
+        assert runner.pipeline.prepare_calls == 2
+        assert runner.pipeline.denoise_calls == 1
+        assert runner.pipeline.scheduler_calls == 2
 
     def test_rejects_missing_cached_state(self):
         runner = _make_runner()
@@ -422,6 +492,83 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 1
         assert runner.pipeline.scheduler_calls == 0
         assert runner.pipeline.decode_calls == 0
+
+    def test_none_noise_pred_without_cache_manager_still_advances_scheduler(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _SchedulerOwnedStepPipeline()
+        req = _make_step_request()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        first = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        second = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        assert first.finished is False
+        assert first.result is None
+        assert second.finished is True
+        assert second.result is not None
+        assert torch.equal(second.result.output, torch.tensor([2.0]))
+        assert runner.pipeline.denoise_calls == 2
+        assert runner.pipeline.scheduler_calls == 2
+        assert runner.pipeline.decode_calls == 1
+        assert runner.input_batch is None
+
+    def test_pipeline_error_cleans_state_and_allows_same_req_id_retry(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _FailingStepPipeline()
+        req = _make_step_request()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        with pytest.raises(RuntimeError, match="denoise boom"):
+            DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+
+        assert runner.state_cache == {}
+        assert runner.input_batch is None
+
+        runner.pipeline = _StepPipeline()
+        output = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=1))
+        assert output.req_id == "req-1"
+        assert output.step_index == 1
+        assert output.finished is False
+        assert output.result is None
+
+    def test_rejects_batched_noise_pred_row_count_mismatch(self, monkeypatch):
+        class _ShortNoisePipeline(_StepPipeline):
+            def prepare_encode(self, state, **kwargs):
+                del kwargs
+                self.prepare_calls += 1
+                state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
+                state.prompt_embeds_mask = torch.tensor([[True, True]])
+                state.timesteps = [torch.tensor(10)]
+                num_rows = 2 if state.req_id == "req-1" else 1
+                state.latents = torch.zeros((num_rows, 1), dtype=torch.float32)
+                return state
+
+            def denoise_step(self, input_batch, **kwargs):
+                del input_batch, kwargs
+                self.denoise_calls += 1
+                return torch.ones((2, 1), dtype=torch.float32)
+
+        runner = _make_runner()
+        runner.pipeline = _ShortNoisePipeline()
+        req_1 = _make_step_request()
+        req_2 = _make_step_request()
+        req_2.request_ids = ["req-2"]
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=0,
+            scheduled_new_reqs=[
+                NewRequestData(sched_req_id="req-1", req=req_1),
+                NewRequestData(sched_req_id="req-2", req=req_2),
+            ],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids=set(),
+            num_running_reqs=2,
+            num_waiting_reqs=0,
+        )
+
+        with pytest.raises(ValueError, match="Stepwise noise_pred consumed 3 rows"):
+            DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
 
     def test_load_model_rejects_unsupported_step_execution(self, monkeypatch):
         class _RequestOnlyPipeline:
