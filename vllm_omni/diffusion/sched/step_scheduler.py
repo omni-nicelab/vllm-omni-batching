@@ -23,6 +23,11 @@ logger = init_logger(__name__)
 
 @dataclass
 class _StepProgress:
+    """
+    Tracks request progress in the StepScheduler, mainly for debugging and step validation.
+    May be extended to support more advanced scheduling logic.
+    """
+
     current_step: int
     total_steps: int
 

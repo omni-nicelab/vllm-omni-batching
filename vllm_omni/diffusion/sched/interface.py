@@ -212,7 +212,8 @@ class SchedulerInterface(ABC):
 
     @abstractmethod
     def pop_request_state(self, sched_req_id: str) -> DiffusionRequestState | None:
-        """Remove and return request state if present."""
+        """Remove and return request state if present.
+        Used when a request is finished and no longer needs to be tracked."""
 
     @abstractmethod
     def preempt_request(self, sched_req_id: str) -> bool:
