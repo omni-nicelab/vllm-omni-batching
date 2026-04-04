@@ -79,8 +79,8 @@ class _BaseScheduler(SchedulerInterface):
 
     def _add_request_with_sched_req_id(self, sched_req_id: str, request: OmniDiffusionRequest) -> str:
         state = self._make_request_state(sched_req_id, request)
-        self._request_states[sched_req_id] = state
         self._register_request_ids(request.request_ids, sched_req_id)
+        self._request_states[sched_req_id] = state
         self._waiting.append(sched_req_id)
         logger.debug("%s add_request: %s (waiting=%d)", self.__class__.__name__, sched_req_id, len(self._waiting))
         return sched_req_id
@@ -256,10 +256,13 @@ class _BaseScheduler(SchedulerInterface):
         return None if state is None else state.sampling_params_key
 
     def _register_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:
+        # check for duplicates before registering to avoid partial registration if an error is raised
         for request_id in request_ids:
             existing = self._request_id_to_sched_req_id.get(request_id)
             if existing is not None and existing != sched_req_id:
                 raise ValueError(f"request_id {request_id!r} is already mapped to active sched_req_id {existing!r}.")
+        # register request_ids to sched_req_id
+        for request_id in request_ids:
             self._request_id_to_sched_req_id[request_id] = sched_req_id
 
     def _unregister_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:

@@ -329,6 +329,24 @@ class TestRequestScheduler:
         assert self.scheduler.get_sched_req_id("map-a") is None
         assert self.scheduler.get_sched_req_id("map-b") is None
 
+    def test_duplicate_later_request_id_does_not_leave_partial_scheduler_state(self) -> None:
+        original_req_id = self.scheduler.add_request(_make_request("dup"))
+
+        conflicting_request = OmniDiffusionRequest(
+            prompts=["prompt_ok", "prompt_dup"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_ids=["ok", "dup"],
+        )
+
+        with pytest.raises(ValueError, match="request_id 'dup' is already mapped"):
+            self.scheduler.add_request(conflicting_request)
+
+        assert self.scheduler.get_request_state("ok") is None
+        assert self.scheduler.get_sched_req_id("ok") is None
+        assert self.scheduler.get_sched_req_id("dup") == original_req_id
+        assert list(self.scheduler._waiting) == [original_req_id]
+        assert list(self.scheduler._request_states) == [original_req_id]
+
 
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self) -> None:
