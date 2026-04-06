@@ -1279,6 +1279,11 @@ class CacheDiTBackend(CacheBackend):
         self.enabled = True
         logger.info(f"Cache-dit enabled successfully on {pipeline_name}")
 
+        # Monkey-patch CachePattern classes to support batch mode.
+        from vllm_omni.diffusion.cache.cache_dit_batch import patch_cache_dit_for_batching
+
+        patch_cache_dit_for_batching()
+
     def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context with new num_inference_steps.
 

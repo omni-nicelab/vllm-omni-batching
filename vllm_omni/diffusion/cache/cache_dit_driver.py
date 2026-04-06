@@ -11,8 +11,12 @@ from typing import Any
 import torch
 from cache_dit.caching.cache_contexts.cache_manager import CachedContextManager
 
+from vllm_omni.diffusion.cache.cache_dit_batch import (
+    clear_batch_contexts,
+    set_batch_contexts,
+)
 from vllm_omni.diffusion.cache.cache_manager import CacheStateDriver
-from vllm_omni.diffusion.worker.utils import CacheBackendSlot
+from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,30 @@ class CacheDiTStateDriver(CacheStateDriver):
                     seen_tensor_ids.add(value_id)
                     total_bytes += value.nelement() * value.element_size()
         return total_bytes
+
+    # ── Batch-mode support ──
+
+    def install_batch_slots(self, states: list[DiffusionRequestState]) -> None:
+        """Install multiple request slots in batch mode.
+
+        For each context-manager handle, collects the per-request context dicts
+        and calls ``set_batch_contexts`` with the corresponding row counts.
+        """
+        row_counts = [int(state.latents.shape[0]) for state in states]
+        for handle_idx, handle in enumerate(self._handles):
+            batch_context_list: list[dict[str, Any]] = []
+            for state in states:
+                payload = self._get_payload(state.cache_slot)
+                contexts = payload[handle_idx]
+                batch_context_list.append(contexts)
+            set_batch_contexts(handle.context_manager, batch_context_list, row_counts)
+
+    def deactivate_batch_slots(self) -> None:
+        """Exit batch mode on all context-manager handles."""
+        for handle in self._handles:
+            clear_batch_contexts(handle.context_manager)
+
+    # ── Handle discovery ──
 
     def _discover_handles(self, pipeline: Any) -> tuple[_CacheDiTHandle, ...]:
         grouped: dict[int, dict[str, Any]] = {}

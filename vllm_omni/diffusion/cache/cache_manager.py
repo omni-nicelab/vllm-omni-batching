@@ -48,24 +48,72 @@ class CacheStateDriver(ABC):
 
 
 class CacheManager:
-    """Runner-facing lifecycle manager for backend resident cache state."""
+    """Runner-facing lifecycle manager for backend resident cache state.
+
+    ``activate`` / ``deactivate`` accept either a single
+    ``DiffusionRequestState`` or a list.  When a list with more than one
+    element is passed, the driver's batch-mode API
+    (``install_batch_slots`` / ``deactivate_batch_slots``) is used so that
+    cache-dit can run a single forward pass over the whole batch while
+    keeping per-request cache decisions.
+    """
 
     def __init__(self, driver: CacheStateDriver):
         self.driver = driver
+        # Single-request tracking (used when activate receives one state).
         self._active_req_id: str | None = None
         self._active_slot: CacheBackendSlot | None = None
+        # Batch tracking (used when activate receives >1 states).
+        self._batch_active: bool = False
 
-    def activate(self, state: DiffusionRequestState) -> bool:
-        """Install or restore the backend cache slot for ``state``.
+    # ── Public API ──
+
+    def activate(
+        self,
+        state: DiffusionRequestState | list[DiffusionRequestState],
+    ) -> bool | list[bool]:
+        """Install or restore cache slot(s).
+
+        Args:
+            state: A single request state **or** a list of states.
 
         Returns:
-            ``True`` when an existing compatible slot is resumed, ``False`` when
-            a fresh slot is created/reinitialized.
+            ``True``/``False`` per request — ``True`` when an existing
+            compatible slot was resumed.
         """
+        if isinstance(state, list):
+            if len(state) == 1:
+                return [self._activate_single(state[0])]
+            return self._activate_batch(state)
+        return self._activate_single(state)
 
+    def deactivate(
+        self,
+        state: DiffusionRequestState | list[DiffusionRequestState] | None = None,
+    ) -> None:
+        """Deactivate slot(s) after a denoise step finishes."""
+        if self._batch_active:
+            self._deactivate_batch(state if isinstance(state, list) else None)
+        else:
+            self._deactivate_single(state if not isinstance(state, list) else None)
+
+    def free(self, state: DiffusionRequestState) -> None:
+        """Release any resident cache state owned by ``state``."""
+        if state.cache_slot is None:
+            return
+
+        if self._active_req_id == state.req_id:
+            self._deactivate_single(state)
+
+        self.driver.clear_slot(state.cache_slot)
+        state.cache_slot = None
+
+    # ── Single-request internals ──
+
+    def _activate_single(self, state: DiffusionRequestState) -> bool:
         num_inference_steps = self._get_num_inference_steps(state)
         if self._active_req_id is not None and self._active_req_id != state.req_id:
-            self.deactivate()
+            self._deactivate_single()
 
         slot = state.cache_slot
         restored_existing = True
@@ -91,12 +139,9 @@ class CacheManager:
         self._active_slot = slot
         return restored_existing
 
-    def deactivate(self, state: DiffusionRequestState | None = None) -> None:
-        """Deactivate the current slot after one denoise step finishes."""
-
+    def _deactivate_single(self, state: DiffusionRequestState | None = None) -> None:
         if self._active_slot is None:
             return
-
         if state is not None and self._active_req_id != state.req_id:
             return
 
@@ -105,17 +150,58 @@ class CacheManager:
         self._active_req_id = None
         self._active_slot = None
 
-    def free(self, state: DiffusionRequestState) -> None:
-        """Release any resident cache state owned by ``state``."""
+    # ── Batch internals ──
 
-        if state.cache_slot is None:
-            return
+    def _activate_batch(self, states: list[DiffusionRequestState]) -> list[bool]:
+        # Clean up any leftover single-request activation.
+        if self._active_req_id is not None:
+            self._deactivate_single()
 
-        if self._active_req_id == state.req_id:
-            self.deactivate(state)
+        restored_flags: list[bool] = []
+        for state in states:
+            num_inference_steps = self._get_num_inference_steps(state)
+            slot = state.cache_slot
+            restored = True
 
-        self.driver.clear_slot(state.cache_slot)
-        state.cache_slot = None
+            if slot is None or slot.backend_name != self.driver.backend_name:
+                if slot is not None:
+                    self.driver.clear_slot(slot)
+                slot = self.driver.create_empty_slot()
+                state.cache_slot = slot
+                restored = False
+            elif not self.driver.is_slot_compatible(slot, num_inference_steps):
+                self.driver.clear_slot(slot)
+                slot = self.driver.create_empty_slot()
+                state.cache_slot = slot
+                restored = False
+
+            if not restored:
+                # Fresh slot: must install + init *before* entering batch mode
+                # because initialize_fresh_slot calls install_slot + force_refresh
+                # which operate in single-request mode.
+                self.driver.install_slot(slot)
+                self.driver.initialize_fresh_slot(slot, num_inference_steps)
+                slot.metadata["num_inference_steps"] = num_inference_steps
+
+            slot.resident_bytes = self.driver.estimate_slot_bytes(slot)
+            restored_flags.append(restored)
+
+        # Switch into batch mode (sets _batch_contexts on context managers).
+        self.driver.install_batch_slots(states)
+        self._batch_active = True
+        return restored_flags
+
+    def _deactivate_batch(self, states: list[DiffusionRequestState] | None = None) -> None:
+        self.driver.deactivate_batch_slots()
+        if states is not None:
+            for state in states:
+                if state.cache_slot is not None:
+                    state.cache_slot.resident_bytes = self.driver.estimate_slot_bytes(
+                        state.cache_slot
+                    )
+        self._batch_active = False
+
+    # ── Helpers ──
 
     @staticmethod
     def _get_num_inference_steps(state: DiffusionRequestState) -> int:

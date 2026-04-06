@@ -534,7 +534,7 @@ class DiffusionModelRunner:
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
             scheduled_states: list[DiffusionRequestState] = []
-            active_state: DiffusionRequestState | None = None
+            cache_activated: bool = False
             try:
                 scheduled_states, new_req_ids = self._update_states(scheduler_output)
                 input_batch = self._prepare_inputs(scheduled_states, new_req_ids)
@@ -547,12 +547,8 @@ class DiffusionModelRunner:
                 attn_metadata = self._prepare_attn_metadata(input_batch)
 
                 if self.cache_manager is not None:
-                    if len(scheduled_states) != 1:
-                        raise ValueError(
-                            "Step mode cache manager does not support multi-request batching yet."
-                        )
-                    active_state = scheduled_states[0]
-                    self.cache_manager.activate(active_state)
+                    self.cache_manager.activate(scheduled_states)
+                    cache_activated = True
 
                 with set_forward_context(
                     vllm_config=self.vllm_config,
@@ -579,5 +575,5 @@ class DiffusionModelRunner:
                 self._cleanup_states_after_failure(scheduled_states)
                 raise
             finally:
-                if active_state is not None and self.cache_manager is not None:
-                    self.cache_manager.deactivate(active_state)
+                if cache_activated and self.cache_manager is not None:
+                    self.cache_manager.deactivate(scheduled_states)
