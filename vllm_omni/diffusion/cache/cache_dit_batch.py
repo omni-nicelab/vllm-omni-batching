@@ -26,6 +26,20 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+_BATCH_ALIGNED_KWARG_NAMES = frozenset(
+    {
+        "temb",
+        "modulate_index",
+        "encoder_hidden_states_mask",
+        "hidden_states_mask",
+        "timestep",
+        "guidance",
+        "pooled_projections",
+        "attention_mask",
+        "encoder_attention_mask",
+    }
+)
+
 # ---------------------------------------------------------------------------
 # Batch-context helpers (operate on CachedContextManager instances)
 # ---------------------------------------------------------------------------
@@ -55,6 +69,108 @@ def clear_batch_contexts(context_manager: Any) -> None:
 
 def _is_batch_mode(context_manager: Any) -> bool:
     return getattr(context_manager, "_batch_contexts", None) is not None
+
+
+def _slice_compute_tensor(
+    value: Any,
+    compute_row_t: torch.Tensor,
+    total_rows: int,
+) -> Any:
+    if not isinstance(value, torch.Tensor) or value.ndim == 0:
+        return value
+
+    index = compute_row_t.to(device=value.device)
+    leading_dim = int(value.shape[0])
+
+    if leading_dim == total_rows:
+        return torch.index_select(value, 0, index)
+
+    if leading_dim == total_rows * 2:
+        doubled_index = torch.cat([index, index + total_rows], dim=0)
+        return torch.index_select(value, 0, doubled_index)
+
+    return value
+
+
+def _slice_batch_aligned_kwargs(
+    kwargs: dict[str, Any],
+    compute_row_t: torch.Tensor,
+    total_rows: int,
+) -> dict[str, Any]:
+    if not kwargs:
+        return kwargs
+
+    sliced_kwargs = dict(kwargs)
+    for key in _BATCH_ALIGNED_KWARG_NAMES:
+        if key not in sliced_kwargs:
+            continue
+        sliced_kwargs[key] = _slice_compute_tensor(
+            sliced_kwargs[key],
+            compute_row_t,
+            total_rows,
+        )
+    return sliced_kwargs
+
+
+def _get_request_encoder_seq_len(
+    kwargs: dict[str, Any],
+    request_index: int,
+    row_start: int,
+    row_end: int,
+    fallback_seq_len: int,
+) -> int:
+    encoder_mask = kwargs.get("encoder_hidden_states_mask")
+    if isinstance(encoder_mask, torch.Tensor) and encoder_mask.ndim >= 2 and int(encoder_mask.shape[0]) >= row_end:
+        mask_slice = encoder_mask[row_start:row_end]
+        if mask_slice.numel() > 0:
+            seq_len = int(mask_slice.sum(dim=1, dtype=torch.int64).max().item())
+            return max(0, min(seq_len, fallback_seq_len))
+
+    txt_seq_lens = kwargs.get("txt_seq_lens")
+    if isinstance(txt_seq_lens, (list, tuple)) and request_index < len(txt_seq_lens):
+        try:
+            seq_len = int(txt_seq_lens[request_index])
+            return max(0, min(seq_len, fallback_seq_len))
+        except (TypeError, ValueError):
+            pass
+
+    return fallback_seq_len
+
+
+def _trim_encoder_slice(
+    encoder_slice: torch.Tensor | None,
+    kwargs: dict[str, Any],
+    request_index: int,
+    row_start: int,
+    row_end: int,
+) -> tuple[torch.Tensor | None, int | None]:
+    if encoder_slice is None:
+        return None, None
+
+    seq_len = _get_request_encoder_seq_len(
+        kwargs,
+        request_index,
+        row_start,
+        row_end,
+        int(encoder_slice.shape[1]),
+    )
+    return encoder_slice[:, :seq_len], seq_len
+
+
+def _restore_encoder_slice(
+    encoder_slice: torch.Tensor | None,
+    reference_slice: torch.Tensor | None,
+    seq_len: int | None,
+) -> torch.Tensor | None:
+    if encoder_slice is None or reference_slice is None:
+        return encoder_slice
+    if seq_len is None:
+        return encoder_slice
+
+    restored = reference_slice.clone()
+    clipped_len = min(int(seq_len), int(restored.shape[1]), int(encoder_slice.shape[1]))
+    restored[:, :clipped_len] = encoder_slice[:, :clipped_len]
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +241,11 @@ def _forward_batched_base(
         for i in compute_indices:
             compute_rows.extend(range(row_offsets[i], row_offsets[i] + row_counts[i]))
         compute_row_t = torch.tensor(compute_rows, dtype=torch.long, device=hidden_states.device)
+        compute_kwargs = _slice_batch_aligned_kwargs(
+            kwargs,
+            compute_row_t,
+            int(hidden_states.shape[0]),
+        )
 
         compute_hs = torch.index_select(hidden_states, 0, compute_row_t)
         compute_enc = (
@@ -134,7 +255,7 @@ def _forward_batched_base(
         )
 
         mn_hs, mn_enc, mn_hs_residual, mn_enc_residual = self.call_Mn_blocks(
-            compute_hs, compute_enc, *args, **kwargs,
+            compute_hs, compute_enc, *args, **compute_kwargs,
         )
 
         # Write Mn outputs back into full-batch tensor
@@ -173,12 +294,25 @@ def _forward_batched_base(
 
             # Encoder Bn buffer
             if mn_enc_residual is not None:
-                req_enc_residual = mn_enc_residual[local_offset : local_offset + nr]
+                req_enc_residual, _ = _trim_encoder_slice(
+                    mn_enc_residual[local_offset : local_offset + nr],
+                    kwargs,
+                    i,
+                    bs,
+                    bs + nr,
+                )
                 if cm.is_encoder_cache_residual():
                     cm.set_Bn_encoder_buffer(req_enc_residual, prefix=f"{self.cache_prefix}_Bn_residual")
                 else:
-                    cm.set_Bn_encoder_buffer(
+                    req_mn_enc, _ = _trim_encoder_slice(
                         mn_enc[local_offset : local_offset + nr],
+                        kwargs,
+                        i,
+                        bs,
+                        bs + nr,
+                    )
+                    cm.set_Bn_encoder_buffer(
+                        req_mn_enc,
                         prefix=f"{self.cache_prefix}_Bn_hidden_states",
                     )
 
@@ -194,10 +328,18 @@ def _forward_batched_base(
 
         start = row_offsets[i]
         end = start + row_counts[i]
+        encoder_slice = encoder_hidden_states[start:end] if encoder_hidden_states is not None else None
+        trimmed_encoder_slice, seq_len = _trim_encoder_slice(
+            encoder_slice,
+            kwargs,
+            i,
+            start,
+            end,
+        )
 
         cached_hs, cached_enc = cm.apply_cache(
             hidden_states[start:end],
-            encoder_hidden_states[start:end] if encoder_hidden_states is not None else None,
+            trimmed_encoder_slice,
             prefix=(
                 f"{self.cache_prefix}_Bn_residual"
                 if cm.is_cache_residual()
@@ -211,7 +353,11 @@ def _forward_batched_base(
         )
         hidden_states[start:end] = cached_hs
         if encoder_hidden_states is not None and cached_enc is not None:
-            encoder_hidden_states[start:end] = cached_enc
+            encoder_hidden_states[start:end] = _restore_encoder_slice(
+                cached_enc,
+                encoder_slice,
+                seq_len,
+            )
 
     # --- Stage 4: Bn blocks on full batch ---
     hidden_states, encoder_hidden_states = self.call_Bn_blocks(
@@ -292,11 +438,16 @@ def _forward_batched_345(
         for i in compute_indices:
             compute_rows.extend(range(row_offsets[i], row_offsets[i] + row_counts[i]))
         compute_row_t = torch.tensor(compute_rows, dtype=torch.long, device=hidden_states.device)
+        compute_kwargs = _slice_batch_aligned_kwargs(
+            kwargs,
+            compute_row_t,
+            int(hidden_states.shape[0]),
+        )
 
         compute_hs = torch.index_select(hidden_states, 0, compute_row_t)
 
         # Pattern 3/4/5: call_Mn_blocks returns (hs, new_enc_hs, hs_residual)
-        mn_hs, mn_enc, mn_hs_residual = self.call_Mn_blocks(compute_hs, *args, **kwargs)
+        mn_hs, mn_enc, mn_hs_residual = self.call_Mn_blocks(compute_hs, *args, **compute_kwargs)
 
         # Write back
         hidden_states = hidden_states.clone()
@@ -337,7 +488,20 @@ def _forward_batched_345(
                     if new_encoder_hidden_states is not None
                     else None
                 )
-                req_enc = mn_enc[local_offset : local_offset + nr]
+                old_enc_slice, _ = _trim_encoder_slice(
+                    old_enc_slice,
+                    kwargs,
+                    i,
+                    bs,
+                    bs + nr,
+                )
+                req_enc, _ = _trim_encoder_slice(
+                    mn_enc[local_offset : local_offset + nr],
+                    kwargs,
+                    i,
+                    bs,
+                    bs + nr,
+                )
                 if old_enc_slice is not None:
                     req_enc_residual = req_enc - old_enc_slice
                 else:
@@ -369,10 +533,18 @@ def _forward_batched_345(
 
         start = row_offsets[i]
         end = start + row_counts[i]
+        encoder_slice = new_encoder_hidden_states[start:end] if new_encoder_hidden_states is not None else None
+        trimmed_encoder_slice, seq_len = _trim_encoder_slice(
+            encoder_slice,
+            kwargs,
+            i,
+            start,
+            end,
+        )
 
         cached_hs, cached_enc = cm.apply_cache(
             hidden_states[start:end],
-            new_encoder_hidden_states[start:end] if new_encoder_hidden_states is not None else None,
+            trimmed_encoder_slice,
             prefix=(
                 f"{self.cache_prefix}_Bn_residual"
                 if cm.is_cache_residual()
@@ -386,7 +558,11 @@ def _forward_batched_345(
         )
         hidden_states[start:end] = cached_hs
         if new_encoder_hidden_states is not None and cached_enc is not None:
-            new_encoder_hidden_states[start:end] = cached_enc
+            new_encoder_hidden_states[start:end] = _restore_encoder_slice(
+                cached_enc,
+                encoder_slice,
+                seq_len,
+            )
 
     # --- Stage 4: Bn blocks on full batch ---
     if cm.Bn_compute_blocks() > 0:
