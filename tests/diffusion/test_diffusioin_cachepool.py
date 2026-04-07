@@ -238,6 +238,7 @@ def _make_cache_dit_runner():
     runner.vllm_config = object()
     runner.od_config = SimpleNamespace(
         cache_backend="cache_dit",
+        enable_cache_dit_summary=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
     )
     runner.device = torch.device("cpu")
@@ -732,6 +733,7 @@ def _make_batch_cache_dit_runner():
     runner.vllm_config = object()
     runner.od_config = SimpleNamespace(
         cache_backend="cache_dit",
+        enable_cache_dit_summary=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
     )
     runner.device = torch.device("cpu")
@@ -985,6 +987,7 @@ def _make_teacache_runner():
     runner.vllm_config = object()
     runner.od_config = SimpleNamespace(
         cache_backend="tea_cache",
+        enable_cache_dit_summary=False,
         parallel_config=SimpleNamespace(use_hsdp=False),
     )
     runner.device = torch.device("cpu")
@@ -1118,16 +1121,19 @@ class TestExecuteStepwiseCacheDiTCachePool:
         assert runner.input_batch is None
 
 
-    def test_stepwise_cache_backend_requires_experiment_cachepool(self, monkeypatch):
+    def test_stepwise_cache_backend_no_longer_requires_experiment_cachepool(self, monkeypatch):
         runner = _make_cache_dit_runner()
         monkeypatch.setattr(diffusion_experimental, "EXPERIMENT_CACHEPOOL", False)
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
-        with pytest.raises(ValueError, match="global EXPERIMENT_CACHEPOOL=True"):
-            DiffusionModelRunner.execute_stepwise(
-                runner,
-                _make_new_scheduler_output(_make_request("req-a", num_inference_steps=3), step_id=0),
-            )
+        output = DiffusionModelRunner.execute_stepwise(
+            runner,
+            _make_new_scheduler_output(_make_request("req-a", num_inference_steps=3), step_id=0),
+        )
+
+        assert output.req_id == "req-a"
+        assert output.finished is False
+        assert output.step_index == 1
 
 
 class TestCacheManagerBatchLifecycle:
@@ -1468,6 +1474,137 @@ class TestCacheDiTBatchedForward:
         assert batch_pattern.mn_call_shapes == [(3, 2)]
         assert [ctx["ctx"].cached_step_calls for ctx in batch_contexts] == [1, 0, 1, 0, 0]
         _assert_context_maps_match(batch_contexts, serial_contexts)
+
+    def test_forward_batched_base_slices_batch_aligned_kwargs_for_compute_subset(self):
+        hidden_states = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        encoder_hidden_states = torch.arange(8, dtype=torch.float32).reshape(4, 2) + 100
+        base_contexts = [
+            {"ctx": _BatchCacheContext(name="req-0", cache_decision=True)},
+            {"ctx": _BatchCacheContext(name="req-1", cache_decision=False)},
+            {"ctx": _BatchCacheContext(name="req-2", cache_decision=True)},
+            {"ctx": _BatchCacheContext(name="req-3", cache_decision=False)},
+        ]
+        _seed_cached_buffers(base_contexts[0]["ctx"], hidden_shape=(1, 2), encoder_shape=(1, 2))
+        _seed_cached_buffers(base_contexts[2]["ctx"], hidden_shape=(1, 2), encoder_shape=(1, 2))
+
+        class _KwargInspectPattern(_FakeBatchedPatternBase):
+            def __init__(self, context_manager):
+                super().__init__(context_manager)
+                self.mn_kwargs = None
+
+            def call_Mn_blocks(self, hidden_states, encoder_hidden_states, *args, **kwargs):
+                del args
+                self.mn_kwargs = {
+                    key: value.clone() if isinstance(value, torch.Tensor) else value
+                    for key, value in kwargs.items()
+                }
+                return super().call_Mn_blocks(hidden_states, encoder_hidden_states, **kwargs)
+
+        batch_contexts = _clone_batch_contexts(base_contexts)
+        batch_manager = _BatchContextManager()
+        batch_pattern = _KwargInspectPattern(batch_manager)
+
+        temb = torch.arange(24, dtype=torch.float32).reshape(8, 3)
+        modulate_index = torch.arange(8, dtype=torch.int64).reshape(4, 2)
+        encoder_hidden_states_mask = torch.tensor(
+            [
+                [True, True, False],
+                [True, False, False],
+                [True, True, True],
+                [False, True, True],
+            ],
+            dtype=torch.bool,
+        )
+        hidden_states_mask = torch.tensor(
+            [
+                [True, False],
+                [True, True],
+                [False, False],
+                [False, True],
+            ],
+            dtype=torch.bool,
+        )
+
+        set_batch_contexts(batch_manager, batch_contexts, [1, 1, 1, 1])
+        try:
+            _forward_batched_base(
+                batch_pattern,
+                hidden_states.clone(),
+                encoder_hidden_states.clone(),
+                temb=temb,
+                modulate_index=modulate_index,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                hidden_states_mask=hidden_states_mask,
+            )
+        finally:
+            clear_batch_contexts(batch_manager)
+
+        compute_index = torch.tensor([1, 3], dtype=torch.long)
+        doubled_compute_index = torch.tensor([1, 3, 5, 7], dtype=torch.long)
+
+        assert batch_pattern.mn_call_shapes == [(2, 2)]
+        assert batch_pattern.mn_kwargs is not None
+        assert torch.equal(batch_pattern.mn_kwargs["temb"], temb[doubled_compute_index])
+        assert torch.equal(batch_pattern.mn_kwargs["modulate_index"], modulate_index[compute_index])
+        assert torch.equal(
+            batch_pattern.mn_kwargs["encoder_hidden_states_mask"],
+            encoder_hidden_states_mask[compute_index],
+        )
+        assert torch.equal(
+            batch_pattern.mn_kwargs["hidden_states_mask"],
+            hidden_states_mask[compute_index],
+        )
+
+    def test_forward_batched_base_trims_encoder_cache_to_request_seq_len(self):
+        hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+        encoder_hidden_states = torch.arange(20, dtype=torch.float32).reshape(2, 5, 2) + 100
+        base_contexts = [
+            {
+                "ctx": _BatchCacheContext(
+                    name="req-0",
+                    cache_decision=True,
+                    encoder_cache_residual=True,
+                )
+            },
+            {"ctx": _BatchCacheContext(name="req-1", cache_decision=False)},
+        ]
+        _seed_cached_buffers(
+            base_contexts[0]["ctx"],
+            hidden_shape=(1, 2),
+            encoder_shape=(1, 3, 2),
+            encoder_cache_residual=True,
+        )
+
+        batch_contexts = _clone_batch_contexts(base_contexts)
+        batch_manager = _BatchContextManager(encoder_cache_residual=True)
+        batch_pattern = _FakeBatchedPatternBase(batch_manager)
+
+        encoder_hidden_states_mask = torch.tensor(
+            [
+                [True, True, True, False, False],
+                [True, True, True, True, True],
+            ],
+            dtype=torch.bool,
+        )
+
+        set_batch_contexts(batch_manager, batch_contexts, [1, 1])
+        try:
+            out_hs, out_enc = _forward_batched_base(
+                batch_pattern,
+                hidden_states.clone(),
+                encoder_hidden_states.clone(),
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+            )
+        finally:
+            clear_batch_contexts(batch_manager)
+
+        expected_cached_prefix = encoder_hidden_states[0:1, :3] + 10 + 70 + 30
+        expected_cached_tail = encoder_hidden_states[0:1, 3:] + 10 + 30
+
+        assert out_hs.shape == hidden_states.shape
+        assert out_enc.shape == encoder_hidden_states.shape
+        assert torch.equal(out_enc[0:1, :3], expected_cached_prefix)
+        assert torch.equal(out_enc[0:1, 3:], expected_cached_tail)
 
     def test_forward_batched_345_partial_hit_matches_serial_without_bn(self):
         hidden_states = torch.arange(6, dtype=torch.float32).reshape(3, 2)

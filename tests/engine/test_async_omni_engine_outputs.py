@@ -4,6 +4,7 @@ Focuses on the critical behavior: when the orchestrator thread dies,
 subsequent attempts to collect output raise RuntimeError.
 """
 
+import asyncio
 import queue
 from unittest.mock import MagicMock
 
@@ -46,20 +47,23 @@ def test_try_get_output_raises_after_orchestrator_dies():
         engine.try_get_output()
 
 
-@pytest.mark.asyncio
-async def test_try_get_output_async_raises_after_orchestrator_dies():
+def test_try_get_output_async_raises_after_orchestrator_dies():
     """Same scenario as above but for the async variant."""
-    mock_queue = MagicMock()
-    mock_queue.sync_q.get_nowait.side_effect = [
-        {"type": "output", "request_id": "r1"},
-        queue.Empty,
-    ]
 
-    engine = _make_engine(mock_queue, thread_alive=True)
+    async def _run() -> None:
+        mock_queue = MagicMock()
+        mock_queue.sync_q.get_nowait.side_effect = [
+            {"type": "output", "request_id": "r1"},
+            queue.Empty,
+        ]
 
-    assert (await engine.try_get_output_async())["request_id"] == "r1"
+        engine = _make_engine(mock_queue, thread_alive=True)
 
-    engine.orchestrator_thread.is_alive.return_value = False
+        assert (await engine.try_get_output_async())["request_id"] == "r1"
 
-    with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
-        await engine.try_get_output_async()
+        engine.orchestrator_thread.is_alive.return_value = False
+
+        with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
+            await engine.try_get_output_async()
+
+    asyncio.run(_run())

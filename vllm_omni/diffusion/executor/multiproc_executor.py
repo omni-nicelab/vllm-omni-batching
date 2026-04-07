@@ -206,6 +206,17 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 f"Request mode currently supports batch_size=1, "
                 f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
             )
+        if scheduler_output.scheduled_cached_reqs.sched_req_ids:
+            raise ValueError(
+                "Request mode received cached scheduled requests, which indicates "
+                "an invalid scheduler/engine state. Request mode must execute a "
+                "new request via execute_model()."
+            )
+        if len(scheduler_output.scheduled_new_reqs) != 1:
+            raise ValueError(
+                "Request mode expected exactly one newly scheduled request, "
+                f"but got {len(scheduler_output.scheduled_new_reqs)}."
+            )
 
         new_req = scheduler_output.scheduled_new_reqs[0]
         result = self.collective_rpc(

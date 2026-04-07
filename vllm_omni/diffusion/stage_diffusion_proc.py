@@ -10,6 +10,7 @@ import asyncio
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _HANDSHAKE_POLL_TIMEOUT_S = 600
+
+
+@dataclass
+class _PendingStageRequest:
+    request_id: str
+    batch_mode: bool
+    submitted: Any
+    aborted: bool = False
 
 
 class StageDiffusionProc:
@@ -123,41 +132,15 @@ class StageDiffusionProc:
 
         return OmniDiffusionSamplingParams(**sampling_params_dict)
 
-    async def _process_request(
-        self,
-        request_id: str,
-        prompt: Any,
-        sampling_params_dict: dict,
-    ) -> OmniRequestOutput:
-        """Build a diffusion request and run DiffusionEngine.step()."""
-        sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
-
-        request = OmniDiffusionRequest(
-            prompts=[prompt],
-            sampling_params=sampling_params,
-            request_ids=[request_id],
-        )
-
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(self._executor, self._engine.step, request)
-        result = results[0]
-        if not result.request_id:
-            result.request_id = request_id
-        return result
-
-    async def _process_batch_request(
+    def _submit_stage_request(
         self,
         request_id: str,
         prompts: list[Any],
         sampling_params_dict: dict,
-    ) -> OmniRequestOutput:
-        """Build a batched diffusion request and run DiffusionEngine.step().
-
-        All prompts are processed in a single step() call.  The per-prompt
-        results are merged into one :class:`OmniRequestOutput` whose
-        ``images`` list contains every generated image, matching the
-        contract expected by the orchestrator and tests.
-        """
+        *,
+        batch_mode: bool,
+    ) -> _PendingStageRequest:
+        """Build an engine request and enqueue it into DiffusionEngine."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
 
         request = OmniDiffusionRequest(
@@ -165,11 +148,16 @@ class StageDiffusionProc:
             sampling_params=sampling_params,
             request_ids=[request_id] * len(prompts),
         )
+        submitted = self._engine.submit_request(request)
+        return _PendingStageRequest(
+            request_id=request_id,
+            batch_mode=batch_mode,
+            submitted=submitted,
+        )
 
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(self._executor, self._engine.step, request)
-
-        # Merge per-prompt results into a single combined output.
+    @staticmethod
+    def _merge_batch_outputs(request_id: str, outputs: list[OmniRequestOutput]) -> OmniRequestOutput:
+        """Merge per-prompt outputs into the batched stage response."""
         all_images: list = []
         merged_mm: dict[str, Any] = {}
         merged_metrics: dict[str, Any] = {}
@@ -178,21 +166,22 @@ class StageDiffusionProc:
         latents = None
         final_output_type = "image"
 
-        for r in results:
-            all_images.extend(r.images)
-            merged_mm.update(r._multimodal_output)
-            merged_metrics.update(r.metrics)
-            merged_durations.update(r.stage_durations)
-            peak_mem = max(peak_mem, r.peak_memory_mb)
-            if latents is None and r.latents is not None:
-                latents = r.latents
-            if r.final_output_type != "image":
-                final_output_type = r.final_output_type
+        for output in outputs:
+            all_images.extend(output.images)
+            merged_mm.update(output._multimodal_output)
+            merged_metrics.update(output.metrics)
+            merged_durations.update(output.stage_durations)
+            peak_mem = max(peak_mem, output.peak_memory_mb)
+            if latents is None and output.latents is not None:
+                latents = output.latents
+            if output.final_output_type != "image":
+                final_output_type = output.final_output_type
 
+        prompt = outputs[0].prompt if len(outputs) == 1 and outputs else None
         return OmniRequestOutput.from_diffusion(
             request_id=request_id,
             images=all_images,
-            prompt=prompts[0] if len(prompts) == 1 else None,
+            prompt=prompt,
             metrics=merged_metrics,
             latents=latents,
             multimodal_output=merged_mm or None,
@@ -200,6 +189,66 @@ class StageDiffusionProc:
             stage_durations=merged_durations,
             peak_memory_mb=peak_mem,
         )
+
+    async def _drain_completed_requests(
+        self,
+        pending_requests: dict[str, _PendingStageRequest],
+        pending_requests_by_handle: dict[str, _PendingStageRequest],
+        response_socket,
+        encoder: OmniMsgpackEncoder,
+    ) -> None:
+        for request_handle, output in self._engine.drain_completed_results_nowait():
+            pending = pending_requests_by_handle.pop(request_handle, None)
+            if pending is None:
+                continue
+
+            request_id = pending.request_id
+            pending_requests.pop(request_id, None)
+            if pending.aborted or output.aborted:
+                logger.info(
+                    "request_id: %s aborted: %s",
+                    request_id,
+                    output.abort_message or "aborted",
+                )
+                continue
+
+            if output.error:
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "error",
+                            "request_id": request_id,
+                            "error": output.error,
+                        }
+                    )
+                )
+                continue
+
+            try:
+                request_outputs = self._engine.build_outputs_from_submitted_request(
+                    pending.submitted,
+                    output,
+                )
+                if pending.batch_mode:
+                    result = self._merge_batch_outputs(request_id, request_outputs)
+                else:
+                    result = request_outputs[0]
+                    if not result.request_id:
+                        result.request_id = request_id
+                await response_socket.send(encoder.encode({"type": "result", "output": result}))
+            except DiffusionRequestAbortedError as e:
+                logger.info("request_id: %s aborted during postprocess: %s", request_id, str(e))
+            except Exception as e:
+                logger.exception("Diffusion request %s failed during finalize: %s", request_id, e)
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "error",
+                            "request_id": request_id,
+                            "error": str(e),
+                        }
+                    )
+                )
 
     # ------------------------------------------------------------------
     # Collective RPC dispatch
@@ -323,132 +372,120 @@ class StageDiffusionProc:
         encoder = OmniMsgpackEncoder()
         decoder = OmniMsgpackDecoder()
 
-        tasks: dict[str, asyncio.Task] = {}
-
-        async def _dispatch_request(request_id: str, prompt: Any, sampling_params_dict: dict) -> None:
-            """Process a single diffusion request and send the response."""
-            try:
-                result = await self._process_request(request_id, prompt, sampling_params_dict)
-                await response_socket.send(encoder.encode({"type": "result", "output": result}))
-            except DiffusionRequestAbortedError as e:
-                logger.info(
-                    "request_id: %s aborted: %s",
-                    request_id,
-                    str(e),
-                )
-            except Exception as e:
-                logger.exception("Diffusion request %s failed: %s", request_id, e)
-                await response_socket.send(
-                    encoder.encode(
-                        {
-                            "type": "error",
-                            "request_id": request_id,
-                            "error": str(e),
-                        }
-                    )
-                )
-            finally:
-                tasks.pop(request_id, None)
+        pending_requests: dict[str, _PendingStageRequest] = {}
+        pending_requests_by_handle: dict[str, _PendingStageRequest] = {}
+        poller = zmq.asyncio.Poller()
+        poller.register(request_socket, zmq.POLLIN)
+        shutdown_requested = False
 
         try:
-            while True:
-                raw = await request_socket.recv()
-                msg = decoder.decode(raw)
-                msg_type = msg.get("type")
-
-                if msg_type == "add_request":
-                    request_id = msg["request_id"]
-                    task = asyncio.create_task(
-                        _dispatch_request(
-                            request_id,
-                            msg["prompt"],
-                            msg["sampling_params"],
-                        )
-                    )
-                    tasks[request_id] = task
-
-                elif msg_type == "add_batch_request":
-                    request_id = msg["request_id"]
-
-                    async def _dispatch_batch(rid: str, prompts: list, sp_dict: dict) -> None:
+            while not shutdown_requested:
+                events = dict(await poller.poll(timeout=10))
+                if request_socket in events:
+                    while True:
                         try:
-                            result = await self._process_batch_request(rid, prompts, sp_dict)
-                            await response_socket.send(encoder.encode({"type": "result", "output": result}))
-                        except DiffusionRequestAbortedError as e:
-                            logger.info(
-                                "request_id: %s aborted: %s",
-                                rid,
-                                str(e),
-                            )
-                        except Exception as e:
-                            logger.exception("Batch diffusion request %s failed: %s", rid, e)
-                            await response_socket.send(
-                                encoder.encode(
-                                    {
-                                        "type": "error",
-                                        "request_id": rid,
-                                        "error": str(e),
-                                    }
+                            raw = await request_socket.recv(flags=zmq.NOBLOCK)
+                        except zmq.Again:
+                            break
+
+                        msg = decoder.decode(raw)
+                        msg_type = msg.get("type")
+
+                        if msg_type == "add_request":
+                            request_id = msg["request_id"]
+                            try:
+                                pending = self._submit_stage_request(
+                                    request_id,
+                                    [msg["prompt"]],
+                                    msg["sampling_params"],
+                                    batch_mode=False,
                                 )
-                            )
-                        finally:
-                            tasks.pop(rid, None)
+                                pending_requests[request_id] = pending
+                                pending_requests_by_handle[pending.submitted.request_handle] = pending
+                            except Exception as e:
+                                logger.exception("Diffusion request %s failed to submit: %s", request_id, e)
+                                await response_socket.send(
+                                    encoder.encode(
+                                        {
+                                            "type": "error",
+                                            "request_id": request_id,
+                                            "error": str(e),
+                                        }
+                                    )
+                                )
 
-                    task = asyncio.create_task(
-                        _dispatch_batch(
-                            request_id,
-                            msg["prompts"],
-                            msg["sampling_params"],
-                        )
-                    )
-                    tasks[request_id] = task
+                        elif msg_type == "add_batch_request":
+                            request_id = msg["request_id"]
+                            try:
+                                pending = self._submit_stage_request(
+                                    request_id,
+                                    msg["prompts"],
+                                    msg["sampling_params"],
+                                    batch_mode=True,
+                                )
+                                pending_requests[request_id] = pending
+                                pending_requests_by_handle[pending.submitted.request_handle] = pending
+                            except Exception as e:
+                                logger.exception("Batch diffusion request %s failed to submit: %s", request_id, e)
+                                await response_socket.send(
+                                    encoder.encode(
+                                        {
+                                            "type": "error",
+                                            "request_id": request_id,
+                                            "error": str(e),
+                                        }
+                                    )
+                                )
 
-                elif msg_type == "abort":
-                    for rid in msg.get("request_ids", []):
-                        task = tasks.pop(rid, None)
-                        if task:
-                            task.cancel()
-                        self._engine.abort(rid)
+                        elif msg_type == "abort":
+                            for rid in msg.get("request_ids", []):
+                                pending = pending_requests.get(rid)
+                                if pending is not None:
+                                    pending.aborted = True
+                                self._engine.abort(rid)
 
-                elif msg_type == "collective_rpc":
-                    rpc_id = msg["rpc_id"]
-                    try:
-                        result = await self._handle_collective_rpc(
-                            msg["method"],
-                            msg.get("timeout"),
-                            tuple(msg.get("args", ())),
-                            msg.get("kwargs", {}),
-                        )
-                        await response_socket.send(
-                            encoder.encode(
-                                {
-                                    "type": "rpc_result",
-                                    "rpc_id": rpc_id,
-                                    "result": result,
-                                }
-                            )
-                        )
-                    except Exception as e:
-                        logger.exception("Collective RPC %s failed: %s", msg["method"], e)
-                        await response_socket.send(
-                            encoder.encode(
-                                {
-                                    "type": "error",
-                                    "rpc_id": rpc_id,
-                                    "error": str(e),
-                                }
-                            )
-                        )
+                        elif msg_type == "collective_rpc":
+                            rpc_id = msg["rpc_id"]
+                            try:
+                                result = await self._handle_collective_rpc(
+                                    msg["method"],
+                                    msg.get("timeout"),
+                                    tuple(msg.get("args", ())),
+                                    msg.get("kwargs", {}),
+                                )
+                                await response_socket.send(
+                                    encoder.encode(
+                                        {
+                                            "type": "rpc_result",
+                                            "rpc_id": rpc_id,
+                                            "result": result,
+                                        }
+                                    )
+                                )
+                            except Exception as e:
+                                logger.exception("Collective RPC %s failed: %s", msg["method"], e)
+                                await response_socket.send(
+                                    encoder.encode(
+                                        {
+                                            "type": "error",
+                                            "rpc_id": rpc_id,
+                                            "error": str(e),
+                                        }
+                                    )
+                                )
 
-                elif msg_type == "shutdown":
-                    break
+                        elif msg_type == "shutdown":
+                            shutdown_requested = True
+                            break
+
+                await self._drain_completed_requests(
+                    pending_requests,
+                    pending_requests_by_handle,
+                    response_socket,
+                    encoder,
+                )
 
         finally:
-            for task in tasks.values():
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks.values(), return_exceptions=True)
-
             request_socket.close()
             response_socket.close()
             ctx.term()

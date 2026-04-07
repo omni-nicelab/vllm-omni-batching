@@ -9,6 +9,7 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -164,3 +165,40 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+
+
+def test_stepwise_cache_dit_logs_include_request_prompt_and_seed(monkeypatch):
+    class _Context:
+        def get_cached_steps(self):
+            return [4, 5, 7]
+
+        def get_cfg_cached_steps(self):
+            return [4, 5, 7]
+
+    runner = object.__new__(DiffusionModelRunner)
+    runner.od_config = SimpleNamespace(cache_backend="cache_dit")
+
+    request_state = DiffusionRequestState(
+        req_id="req-123",
+        sampling=SimpleNamespace(seed=321, num_inference_steps=50, generator=None),
+        prompts=["a playful corgi puppy chasing bubbles in a flower garden"],
+        cache_slot=CacheBackendSlot(
+            backend_name="cache_dit",
+            payload=({"transformer_blocks": _Context()},),
+        ),
+    )
+    request_state.timesteps = [0] * 50
+
+    log_messages = []
+
+    def _record_log(message, *args):
+        log_messages.append(message % args if args else message)
+
+    monkeypatch.setattr(model_runner_module.logger, "info", _record_log)
+    DiffusionModelRunner._log_cache_dit_stepwise_request_stats(runner, request_state)
+
+    log_text = "\n".join(log_messages)
+    assert "req-123" in log_text
+    assert "seed=321" in log_text
+    assert "playful corgi puppy" in log_text
+    assert "skipped_step_ids=[4, 5, 7]" in log_text

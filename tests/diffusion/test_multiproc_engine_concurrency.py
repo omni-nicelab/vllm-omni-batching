@@ -12,6 +12,7 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.sched import RequestScheduler
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
@@ -28,6 +29,8 @@ def _mock_request(tag: str) -> Mock:
     """Return a mock ``OmniDiffusionRequest`` identifiable by *tag*."""
     req = Mock()
     req.request_ids = [tag]
+    req.prompts = [f"prompt_{tag}"]
+    req.sampling_params = OmniDiffusionSamplingParams(num_inference_steps=1)
     return req
 
 

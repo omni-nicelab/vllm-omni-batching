@@ -691,6 +691,16 @@ class TestWorker:
 class TestExecutor:
     """MultiprocDiffusionExecutor.execute_step"""
 
+    def test_execute_request_rejects_cached_scheduler_output(self):
+        executor = object.__new__(MultiprocDiffusionExecutor)
+        executor._ensure_open = lambda: None
+        executor.collective_rpc = Mock()
+
+        scheduler_output = _make_cached_scheduler_output("req-cached")
+
+        with pytest.raises(ValueError, match="cached scheduled requests"):
+            MultiprocDiffusionExecutor.execute_request(executor, scheduler_output)
+
     def test_execute_step_passes_through_runner_output(self):
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._ensure_open = lambda: None
@@ -847,6 +857,31 @@ class TestIPC:
         unpacked = unpack_diffusion_output_shm(packed)
         assert isinstance(unpacked.result.output, torch.Tensor)
         torch.testing.assert_close(unpacked.result.output, tensor)
+
+    def test_pack_unpack_batched_runner_output_shm(self):
+        tensor_a = torch.zeros(300_000, dtype=torch.float32)
+        tensor_b = torch.ones(300_000, dtype=torch.float32)
+        output = RunnerOutput(
+            req_id=["req-1", "req-2"],
+            step_index=[1, 1],
+            finished=[True, True],
+            result=[
+                DiffusionOutput(output=tensor_a),
+                DiffusionOutput(output=tensor_b),
+            ],
+        )
+
+        packed = pack_diffusion_output_shm(output)
+        assert isinstance(packed.result[0].output, dict)
+        assert isinstance(packed.result[1].output, dict)
+        assert packed.result[0].output["__tensor_shm__"] is True
+        assert packed.result[1].output["__tensor_shm__"] is True
+
+        unpacked = unpack_diffusion_output_shm(packed)
+        assert isinstance(unpacked.result[0].output, torch.Tensor)
+        assert isinstance(unpacked.result[1].output, torch.Tensor)
+        torch.testing.assert_close(unpacked.result[0].output, tensor_a)
+        torch.testing.assert_close(unpacked.result[1].output, tensor_b)
 
 
 @pytest.mark.cpu
