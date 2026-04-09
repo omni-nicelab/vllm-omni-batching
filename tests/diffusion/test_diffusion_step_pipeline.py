@@ -265,6 +265,8 @@ def _make_runner():
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        enable_cache_dit_summary=False,
+        enable_diffusion_pipeline_profiler=False,
     )
     runner.device = torch.device("cpu")
     runner.pipeline = _StepPipeline()
@@ -284,6 +286,8 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
+        enable_cache_dit_summary=False,
+        enable_diffusion_pipeline_profiler=False,
     )
     runner.device = device
     runner.pipeline = _DistributedStepPipeline(mode=mode, device=device)
@@ -326,7 +330,16 @@ def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:
     engine.post_process_func = None
     engine.scheduler = scheduler
     engine.execute_fn = execute_fn
+    engine._state_lock = threading.RLock()
     engine._rpc_lock = threading.RLock()
+    engine._results_map = {}
+    engine._handle_to_sched_req_id = {}
+    engine._sched_req_id_to_handle = {}
+    engine._request_id_to_handle = {}
+    engine._handle_to_request_ids = {}
+    engine._cancelled_handles = set()
+    engine._input_queue = queue.Queue()
+    engine._output_queue = queue.Queue()
     engine.abort_queue = queue.Queue()
     return engine
 
