@@ -24,7 +24,6 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.utils.tf_utils import get_transformer_from_pipeline
 
 logger = init_logger(__name__)
 
@@ -534,7 +533,7 @@ def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], No
 
 def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for LTX2 pipelines (audio-video transformer blocks)."""
-    transformer = get_transformer_from_pipeline(pipeline)
+    transformer = pipeline.transformer
 
     db_cache_config = _build_db_cache_config(cache_config)
 
@@ -567,12 +566,11 @@ def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], N
     )
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
-        transformer = get_transformer_from_pipeline(pipeline)
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
             cache_dit.refresh_context(
-                transformer,
+                pipeline.transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
@@ -615,9 +613,8 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
     )
 
     # Enable cache-dit on the transformer
-    transformer = get_transformer_from_pipeline(pipeline)
     cache_dit.enable_cache(
-        transformer,
+        pipeline.transformer,
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,
     )
@@ -629,12 +626,11 @@ def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], No
             pipeline: The diffusion pipeline instance.
             num_inference_steps: New number of inference steps.
         """
-        transformer = get_transformer_from_pipeline(pipeline)
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
             cache_dit.refresh_context(
-                transformer,
+                pipeline.transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
@@ -1215,8 +1211,6 @@ CUSTOM_DIT_ENABLERS.update(
         "StableDiffusion3Pipeline": enable_cache_for_sd3,
         "LTX2Pipeline": enable_cache_for_ltx2,
         "LTX2ImageToVideoPipeline": enable_cache_for_ltx2,
-        "LTX2TwoStagesPipeline": enable_cache_for_ltx2,
-        "LTX2ImageToVideoTwoStagesPipeline": enable_cache_for_ltx2,
         "BagelPipeline": enable_cache_for_bagel,
         "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,
@@ -1285,6 +1279,11 @@ class CacheDiTBackend(CacheBackend):
         self.enabled = True
         logger.info(f"Cache-dit enabled successfully on {pipeline_name}")
 
+        # Monkey-patch CachePattern classes to support batch mode.
+        from vllm_omni.diffusion.cache.cache_dit_batch import patch_cache_dit_for_batching
+
+        patch_cache_dit_for_batching()
+
     def refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context with new num_inference_steps.
 
@@ -1307,6 +1306,32 @@ class CacheDiTBackend(CacheBackend):
                 logger.info(f"Refreshing cache context for transformer with num_inference_steps: {num_inference_steps}")
             self._refresh_func(pipeline, num_inference_steps, verbose)
             self._last_num_inference_steps = num_inference_steps
+
+    def force_refresh(self, pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        """Refresh cache context unconditionally.
+
+        Stepwise serving needs this path for fresh request initialization even when
+        another request already used the same ``num_inference_steps``.
+        """
+
+        if not self.enabled or self._refresh_func is None:
+            logger.warning("Cache-dit is not enabled. Cannot refresh cache context.")
+            return
+
+        if verbose:
+            logger.info(
+                "Force refreshing cache context for transformer with num_inference_steps: %s",
+                num_inference_steps,
+            )
+        self._refresh_func(pipeline, num_inference_steps, verbose)
+        self._last_num_inference_steps = num_inference_steps
+
+    def create_state_driver(self, pipeline: Any) -> Any | None:
+        from vllm_omni.diffusion.cache.cache_dit_driver import CacheDiTStateDriver
+
+        if not self.enabled:
+            return None
+        return CacheDiTStateDriver(self, pipeline)
 
     def is_enabled(self) -> bool:
         """Check if cache-dit is enabled on this pipeline.
