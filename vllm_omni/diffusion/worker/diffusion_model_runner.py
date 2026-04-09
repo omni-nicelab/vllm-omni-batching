@@ -20,10 +20,11 @@ import torch
 from torch.profiler import record_function
 from vllm.config import LoadConfig
 from vllm.logger import init_logger
-from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.mem_utils import DeviceMemoryProfiler
 
-from vllm_omni.diffusion.cache.cache_manager import CacheManager
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.cache_manager import CacheManager
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -205,7 +206,8 @@ class DiffusionModelRunner:
                 )
                 if cfg_cached_steps:
                     logger.info(
-                        "[Cache-DiT] Request %s seed=%s prompt=%s for %s: cfg_skipped %d / %d steps (%.2f%%), cfg_skipped_step_ids=%s",
+                        "[Cache-DiT] Request %s seed=%s prompt=%s for %s: cfg_skipped %d / %d steps (%.2f%%),"
+                        " cfg_skipped_step_ids=%s",
                         request_id,
                         seed_value,
                         prompt_preview,
@@ -231,9 +233,7 @@ class DiffusionModelRunner:
         if not isinstance(payload, tuple):
             return
 
-        total_steps = request_state.total_steps or int(
-            getattr(request_state.sampling, "num_inference_steps", 0) or 0
-        )
+        total_steps = request_state.total_steps or int(getattr(request_state.sampling, "num_inference_steps", 0) or 0)
         prompt_preview = self._prompt_preview_for_log(request_state.prompts)
         seed_value = self._sampling_seed_for_log(request_state.sampling)
         seen_context_ids: set[int] = set()
@@ -275,7 +275,8 @@ class DiffusionModelRunner:
                 )
                 if cfg_cached_steps:
                     logger.info(
-                        "[Cache-DiT][stepwise] Request %s seed=%s prompt=%s for %s: cfg_skipped %d / %d steps (%.2f%%), cfg_skipped_step_ids=%s",
+                        "[Cache-DiT][stepwise] Request %s seed=%s prompt=%s for %s: cfg_skipped %d / %d steps (%.2f%%),"
+                        " cfg_skipped_step_ids=%s",
                         request_state.req_id,
                         seed_value,
                         prompt_preview,
@@ -625,16 +626,41 @@ class DiffusionModelRunner:
             gen_device = self.device
         sampling.generator = torch.Generator(device=gen_device).manual_seed(sampling.seed)
 
+    # ── stepwise profiling helpers ──────────────────────────────────
+
+    def _stepwise_profiling_enabled(self) -> bool:
+        return bool(getattr(self.od_config, "enable_diffusion_pipeline_profiler", False)) and hasattr(
+            self.pipeline, "clear_profiler_records"
+        )
+
+    def _sync_and_time(self) -> float:
+        if current_omni_platform.is_available():
+            current_omni_platform.synchronize()
+        return time.perf_counter()
+
     def _prepare_inputs(
         self,
         states: list[DiffusionRequestState],
         new_req_ids: set[str],
     ) -> InputBatch:
+        profiling = self._stepwise_profiling_enabled()
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             for state in states:
                 self._ensure_sampling_generator(state)
                 if state.req_id in new_req_ids:
+                    if profiling:
+                        self.pipeline.clear_profiler_records()
+                        t0 = self._sync_and_time()
+
                     self.pipeline.prepare_encode(state)
+
+                    if profiling:
+                        elapsed = self._sync_and_time() - t0
+                        sub_stages = self.pipeline.stage_durations
+                        state.extra["_stage_durations"] = {
+                            "prepare_encode": elapsed,
+                            **sub_stages,
+                        }
 
         input_batch = InputBatch.make_batch(
             states,
@@ -704,9 +730,21 @@ class DiffusionModelRunner:
         self.input_batch = input_batch
         scatter_latents(scheduled_states, input_batch)
 
+        profiling = self._stepwise_profiling_enabled()
         for idx, (request_state, finished) in enumerate(zip(scheduled_states, finished_flags, strict=True)):
             if finished and results[idx] is None:
+                if profiling:
+                    self.pipeline.clear_profiler_records()
+                    t0 = self._sync_and_time()
+
                 results[idx] = self.pipeline.post_decode(request_state)
+
+                if profiling:
+                    elapsed = self._sync_and_time() - t0
+                    d = request_state.extra.get("_stage_durations", {})
+                    d["post_decode"] = elapsed
+                    d.update(self.pipeline.stage_durations)
+                    results[idx].stage_durations = d
 
         for request_state, finished in zip(scheduled_states, finished_flags, strict=True):
             if not finished:
@@ -793,12 +831,26 @@ class DiffusionModelRunner:
                     self.cache_manager.activate(scheduled_states)
                     cache_activated = True
 
+                profiling = self._stepwise_profiling_enabled()
+
                 with set_forward_context(
                     vllm_config=self.vllm_config,
                     omni_diffusion_config=self.od_config,
                     attn_metadata=attn_metadata,
                 ):
+                    if profiling:
+                        t0 = self._sync_and_time()
+
                     noise_pred = self.pipeline.denoise_step(input_batch)
+
+                    if profiling:
+                        elapsed = self._sync_and_time() - t0
+                        batch_size = len(scheduled_states)
+                        amortized = elapsed / batch_size
+                        for state in scheduled_states:
+                            d = state.extra.setdefault("_stage_durations", {})
+                            d["denoise_step"] = d.get("denoise_step", 0.0) + elapsed
+                            d["denoise_step_amortized"] = d.get("denoise_step_amortized", 0.0) + amortized
                 finished_flags, results = self._postprocess_step(
                     scheduled_states,
                     noise_pred,
