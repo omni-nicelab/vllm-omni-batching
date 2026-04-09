@@ -78,18 +78,16 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     return tensor
 
 
-def _pack_tensor_if_large(val: torch.Tensor) -> torch.Tensor | dict:
-    """Replace a tensor with an SHM handle if it exceeds the threshold."""
-    if val.nelement() * val.element_size() > _SHM_TENSOR_THRESHOLD:
-        return _tensor_to_shm(val)
-    return val
+def _pack_tensor_if_large(value: torch.Tensor) -> torch.Tensor | dict[str, Any]:
+    if value.nelement() * value.element_size() > _SHM_TENSOR_THRESHOLD:
+        return _tensor_to_shm(value)
+    return value
 
 
-def _unpack_if_shm_handle(val: object) -> object:
-    """Reconstruct a tensor from an SHM handle dict, or return as-is."""
-    if isinstance(val, dict) and val.get("__tensor_shm__"):
-        return _tensor_from_shm(val)
-    return val
+def _unpack_if_shm_handle(value: object) -> object:
+    if isinstance(value, dict) and value.get("__tensor_shm__"):
+        return _tensor_from_shm(value)
+    return value
 
 
 def _pack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
@@ -104,6 +102,14 @@ def _pack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
     return output
 
 
+def _pack_runner_result(result: object) -> object:
+    if isinstance(result, DiffusionOutput):
+        return _pack_diffusion_fields(result)
+    if isinstance(result, list):
+        return [_pack_runner_result(item) for item in result]
+    return result
+
+
 def pack_diffusion_output_shm(output: object) -> object:
     """Replace large tensors in diffusion worker outputs with SHM handles.
 
@@ -114,8 +120,8 @@ def pack_diffusion_output_shm(output: object) -> object:
         return _pack_diffusion_fields(output)
 
     result = getattr(output, "result", None)
-    if isinstance(result, DiffusionOutput):
-        output.result = _pack_diffusion_fields(result)
+    if result is not None:
+        output.result = _pack_runner_result(result)
     return output
 
 
@@ -127,12 +133,20 @@ def _unpack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
     return output
 
 
+def _unpack_runner_result(result: object) -> object:
+    if isinstance(result, DiffusionOutput):
+        return _unpack_diffusion_fields(result)
+    if isinstance(result, list):
+        return [_unpack_runner_result(item) for item in result]
+    return result
+
+
 def unpack_diffusion_output_shm(output: object) -> object:
     """Reconstruct tensors from SHM handles in diffusion worker outputs."""
     if isinstance(output, DiffusionOutput):
         return _unpack_diffusion_fields(output)
 
     result = getattr(output, "result", None)
-    if isinstance(result, DiffusionOutput):
-        output.result = _unpack_diffusion_fields(result)
+    if result is not None:
+        output.result = _unpack_runner_result(result)
     return output

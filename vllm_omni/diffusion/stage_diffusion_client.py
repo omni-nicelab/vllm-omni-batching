@@ -75,11 +75,11 @@ class StageDiffusionClient:
         self._decoder = OmniMsgpackDecoder()
 
         # Buffers for demultiplexing response messages.
-        self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
+        self._output_queue: asyncio.Queue[OmniRequestOutput | dict[str, Any]] = asyncio.Queue()
         self._rpc_results: dict[str, Any] = {}
         self._pending_rpcs: set[str] = set()
-        self._tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = False
+        self.engine_outputs: Any = None
 
         logger.info("[StageDiffusionClient] Stage-%s initialized (batch_size=%d)", self.stage_id, batch_size)
 
@@ -118,6 +118,14 @@ class StageDiffusionClient:
                         "error": True,
                         "reason": error_msg,
                     }
+                elif req_id is not None:
+                    self._output_queue.put_nowait(
+                        {
+                            "type": "error",
+                            "request_id": req_id,
+                            "error": error_msg,
+                        }
+                    )
 
     # Fields that are subprocess-local and cannot be serialized across
     # process boundaries.  They are recreated in the subprocess with
@@ -174,6 +182,10 @@ class StageDiffusionClient:
     # Public API (matches the interface the Orchestrator expects)
     # ------------------------------------------------------------------
 
+    def set_engine_outputs(self, engine_outputs: Any) -> None:
+        """Mirror StageEngineCoreClient's runtime interface for orchestration."""
+        self.engine_outputs = engine_outputs
+
     async def add_request_async(
         self,
         request_id: str,
@@ -204,59 +216,28 @@ class StageDiffusionClient:
     ) -> None:
         """Submit a list of prompts as a single batched engine call.
 
-        All prompts are processed in one ``DiffusionEngine.step()`` call
-        and the combined result is placed on the output queue with a single
-        *request_id*.
+        The subprocess keeps batching/group semantics; this client only
+        enqueues the logical batch request.
         """
-        task = asyncio.create_task(
-            self._run_batch(
-                request_id,
-                prompts,
-                sampling_params,
-                kv_sender_info,
-            ),
-            name=f"diffusion-batch-{request_id}",
+        self._request_socket.send(
+            self._encoder.encode(
+                {
+                    "type": "add_batch_request",
+                    "request_id": request_id,
+                    "prompts": prompts,
+                    "sampling_params": self._sampling_params_to_dict(sampling_params),
+                    "kv_sender_info": kv_sender_info,
+                }
+            )
         )
-        self._tasks[request_id] = task
 
-    async def _run_batch(
-        self,
-        request_id: str,
-        prompts: list[OmniPromptType],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info: dict[int, dict[str, Any]] | None = None,
-    ) -> None:
-        try:
-            self._request_socket.send(
-                self._encoder.encode(
-                    {
-                        "type": "add_batch_request",
-                        "request_id": request_id,
-                        "prompts": prompts,
-                        "sampling_params": self._sampling_params_to_dict(sampling_params),
-                        "kv_sender_info": kv_sender_info,
-                    }
-                )
-            )
-        except Exception as e:
-            logger.exception(
-                "[StageDiffusionClient] Stage-%s batch req=%s failed: %s",
-                self.stage_id,
-                request_id,
-                e,
-            )
-        finally:
-            self._tasks.pop(request_id, None)
-
-    def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
+    def get_diffusion_output_nowait(self) -> OmniRequestOutput | dict[str, Any] | None:
         self._drain_responses()
         try:
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
             if not self._shutting_down and self._proc is not None and not self._proc.is_alive():
                 exitcode = self._proc.exitcode
-                # One final drain – the last ZMQ frame may have arrived
-                # between the first drain and the is_alive() check.
                 self._drain_responses()
                 try:
                     return self._output_queue.get_nowait()
