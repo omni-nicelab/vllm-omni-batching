@@ -62,9 +62,6 @@ class StepScheduler(_BaseScheduler):
         )
         return sched_req_id
 
-    def schedule(self) -> DiffusionSchedulerOutput:
-        return super().schedule()
-
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_req_ids = sched_output.scheduled_req_ids
         if not scheduled_req_ids:
@@ -77,16 +74,24 @@ class StepScheduler(_BaseScheduler):
             progress = self._request_progress.get(sched_req_id)
             if state is None or progress is None or state.is_finished():
                 continue
-
             req_output = output.get_req_output(sched_req_id)
-            output_error = req_output.result.error if req_output is not None and req_output.result is not None else None
+            if req_output is None:
+                logger.warning(
+                    "No RunnerOutput for request %s, treating as error",
+                    sched_req_id,
+                )
+                terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
+                terminal_errors[sched_req_id] = "No output for request"
+                continue
 
+            req_result = req_output.result
+            output_error = req_result.error if req_result is not None else None
             if output_error is not None:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[sched_req_id] = output_error
                 continue
 
-            if req_output is None or req_output.step_index is None:
+            if req_output.step_index is None:
                 logger.warning(
                     "Received RunnerOutput with no step_index for request %s, treating as error",
                     sched_req_id,
