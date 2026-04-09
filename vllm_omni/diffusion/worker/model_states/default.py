@@ -30,9 +30,7 @@ def _prepare_attention_metadata(
     if txt_seq_lens is not None:
         seq_lens = torch.tensor(txt_seq_lens, dtype=torch.int32, device=device)
         if inferred_seq_lens is not None and not torch.equal(seq_lens, inferred_seq_lens):
-            raise ValueError(
-                "Attention metadata txt_seq_lens does not match prompt_embeds_mask."
-            )
+            raise ValueError("Attention metadata txt_seq_lens does not match prompt_embeds_mask.")
     elif inferred_seq_lens is not None:
         seq_lens = inferred_seq_lens
     else:

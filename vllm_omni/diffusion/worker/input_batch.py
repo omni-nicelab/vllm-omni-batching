@@ -76,9 +76,7 @@ def _select_states(
     selected_states: list[DiffusionRequestState] = []
     for batch_idx, state_idx in enumerate(idx_mapping.tolist()):
         if state_idx < 0 or state_idx >= len(states):
-            raise ValueError(
-                f"idx_mapping[{batch_idx}]={state_idx} is out of range for states."
-            )
+            raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
         selected_states.append(states[state_idx])
     return selected_states, idx_mapping, idx_mapping.detach().cpu().numpy()
 
@@ -119,12 +117,7 @@ def _prepare_reused_buffer(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    if (
-        current is not None
-        and tuple(current.shape) == shape
-        and current.dtype == dtype
-        and current.device == device
-    ):
+    if current is not None and tuple(current.shape) == shape and current.dtype == dtype and current.device == device:
         return current
     return torch.empty(shape, dtype=dtype, device=device)
 
@@ -150,8 +143,7 @@ def _validate_gather_tensors(
             raise ValueError(f"Mixed devices in {field_name} batch.")
         if tuple(value.shape[1:]) != suffix_shape:
             raise ValueError(
-                f"Mixed trailing shapes in {field_name} batch: "
-                f"expected {suffix_shape}, got {tuple(value.shape[1:])}."
+                f"Mixed trailing shapes in {field_name} batch: expected {suffix_shape}, got {tuple(value.shape[1:])}."
             )
         total_rows += int(value.shape[0])
 
@@ -204,10 +196,7 @@ def _get_request_prompt_seq_lens(
 
     if mask is not None:
         if mask.shape[0] != embeds.shape[0]:
-            raise ValueError(
-                f"{mask_attr} batch dimension does not match {embeds_attr} "
-                f"for request {state.req_id}."
-            )
+            raise ValueError(f"{mask_attr} batch dimension does not match {embeds_attr} for request {state.req_id}.")
         return _get_seq_lens_from_mask(mask)
 
     seq_lens = getattr(state, seq_lens_attr)
@@ -360,9 +349,7 @@ def _require_state_latents(
 ) -> torch.Tensor:
     latents = state.latents
     if latents is None:
-        raise ValueError(
-            f"Request {state.req_id} has no latents while preparing {for_field}."
-        )
+        raise ValueError(f"Request {state.req_id} has no latents while preparing {for_field}.")
     return latents
 
 
@@ -375,16 +362,13 @@ def _expand_scalar_or_vector(
     if value.ndim == 0:
         return value.reshape(1).expand(num_rows)
     if value.ndim != 1:
-        raise ValueError(
-            f"{field_name} must be scalar or 1D, got ndim={value.ndim}."
-        )
+        raise ValueError(f"{field_name} must be scalar or 1D, got ndim={value.ndim}.")
     if value.shape[0] == num_rows:
         return value
     if value.shape[0] == 1:
         return value.expand(num_rows)
     raise ValueError(
-        f"Per-request {field_name} must have either 1 element "
-        f"or {num_rows} elements; got {value.shape[0]}."
+        f"Per-request {field_name} must have either 1 element or {num_rows} elements; got {value.shape[0]}."
     )
 
 
@@ -399,9 +383,7 @@ def _prepare_timesteps(
         if timestep is None:
             raise ValueError("All requests must have a current timestep initialized.")
         if not torch.is_tensor(timestep):
-            raise ValueError(
-                "InputBatch expects tensor timesteps; normalize them before batching."
-            )
+            raise ValueError("InputBatch expects tensor timesteps; normalize them before batching.")
         latents = _require_state_latents(state, for_field="timesteps")
         timestep_values.append(
             _expand_scalar_or_vector(
@@ -429,9 +411,7 @@ def _prepare_cfg_scalars(
     scalars = _cfg_scalars(states[0])
     for state in states[1:]:
         if _cfg_scalars(state) != scalars:
-            raise ValueError(
-                "Mixed CFG settings in one diffusion batch are not supported."
-            )
+            raise ValueError("Mixed CFG settings in one diffusion batch are not supported.")
     return scalars
 
 
@@ -480,9 +460,7 @@ def _prepare_image_latents(
     if all(image_latent is None for image_latent in image_latents):
         return None
     if any(image_latent is None for image_latent in image_latents):
-        raise ValueError(
-            "Mixed image_latent presence in one diffusion batch is not supported."
-        )
+        raise ValueError("Mixed image_latent presence in one diffusion batch is not supported.")
     return _gather_tensor_rows(
         [image_latent for image_latent in image_latents if image_latent is not None],
         field_name="image_latents",
@@ -547,7 +525,7 @@ def _prepare_negative_prompt_embeds(
 
 
 def _same_composition(
-    cached_batch: "InputBatch" | None,
+    cached_batch: InputBatch | None,
     req_ids: list[str],
     idx_mapping_np: np.ndarray,
 ) -> bool:
@@ -568,9 +546,7 @@ def _scatter_batch_tensor_by_mapping(
     row_offset = 0
     for batch_idx, state_idx in enumerate(idx_mapping_np.tolist()):
         if state_idx < 0 or state_idx >= len(states):
-            raise ValueError(
-                f"idx_mapping[{batch_idx}]={state_idx} is out of range for states."
-            )
+            raise ValueError(f"idx_mapping[{batch_idx}]={state_idx} is out of range for states.")
         state = states[state_idx]
         state_value = getattr(state, attr_name)
         num_rows = 1 if state_value is None else int(state_value.shape[0])
@@ -590,8 +566,7 @@ def _scatter_batch_tensor_by_mapping(
 
     if row_offset != int(value.shape[0]):
         raise ValueError(
-            f"Scatter for {attr_name} consumed {row_offset} rows, "
-            f"but batch has {int(value.shape[0])} rows."
+            f"Scatter for {attr_name} consumed {row_offset} rows, but batch has {int(value.shape[0])} rows."
         )
 
 
@@ -640,9 +615,7 @@ class InputBatch:
         self,
         states: Sequence[DiffusionRequestState],
     ) -> None:
-        self.do_true_cfg, self.true_cfg_scale, self.cfg_normalize = _prepare_cfg_scalars(
-            states
-        )
+        self.do_true_cfg, self.true_cfg_scale, self.cfg_normalize = _prepare_cfg_scalars(states)
         self.guidance = _prepare_guidance(states, out=self.guidance)
         self.image_latents = _prepare_image_latents(states, out=self.image_latents)
         self.prompt_embeds, self.prompt_embeds_mask = _prepare_prompt_embeds(
@@ -674,7 +647,7 @@ class InputBatch:
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
         req_ids: list[str],
-    ) -> "InputBatch":
+    ) -> InputBatch:
         self.req_ids = req_ids
         self.num_reqs = len(req_ids)
         self.num_reqs_after_padding = len(req_ids)
@@ -691,8 +664,8 @@ class InputBatch:
         cls,
         states: Sequence[DiffusionRequestState],
         idx_mapping: torch.Tensor | None = None,
-        cached_batch: "InputBatch" | None = None,
-    ) -> "InputBatch":
+        cached_batch: InputBatch | None = None,
+    ) -> InputBatch:
         """Build a temporary step-local batch view from request states."""
         selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping)
         req_ids = _prepare_req_ids(selected_states)
@@ -711,12 +684,8 @@ class InputBatch:
             )
 
         prompt_embeds, prompt_embeds_mask = _prepare_prompt_embeds(selected_states)
-        negative_prompt_embeds, negative_prompt_embeds_mask = _prepare_negative_prompt_embeds(
-            selected_states
-        )
-        do_true_cfg, true_cfg_scale, cfg_normalize = _prepare_cfg_scalars(
-            selected_states
-        )
+        negative_prompt_embeds, negative_prompt_embeds_mask = _prepare_negative_prompt_embeds(selected_states)
+        do_true_cfg, true_cfg_scale, cfg_normalize = _prepare_cfg_scalars(selected_states)
         return cls(
             req_ids=req_ids,
             num_reqs=len(selected_states),

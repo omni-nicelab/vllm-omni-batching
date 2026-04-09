@@ -196,9 +196,7 @@ class CacheManager:
         if states is not None:
             for state in states:
                 if state.cache_slot is not None:
-                    state.cache_slot.resident_bytes = self.driver.estimate_slot_bytes(
-                        state.cache_slot
-                    )
+                    state.cache_slot.resident_bytes = self.driver.estimate_slot_bytes(state.cache_slot)
         self._batch_active = False
 
     # ── Helpers ──

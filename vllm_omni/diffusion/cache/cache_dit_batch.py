@@ -204,7 +204,10 @@ def _forward_batched_base(
     # --- Stage 1: Fn blocks on full batch ---
     original_hidden_states = hidden_states
     hidden_states, encoder_hidden_states = self.call_Fn_blocks(
-        hidden_states, encoder_hidden_states, *args, **kwargs,
+        hidden_states,
+        encoder_hidden_states,
+        *args,
+        **kwargs,
     )
     fn_residual_full = self._get_Fn_residual(original_hidden_states, hidden_states)
     fn_hidden_states_full = hidden_states.clone() if cm.is_l1_diff_enabled() else None
@@ -213,11 +216,7 @@ def _forward_batched_base(
     # --- Stage 2: per-request can_cache decisions ---
     use_l1 = cm.is_l1_diff_enabled()
     parallelized = self._is_parallelized()
-    prefix_fn = (
-        f"{self.cache_prefix}_Fn_hidden_states"
-        if use_l1
-        else f"{self.cache_prefix}_Fn_residual"
-    )
+    prefix_fn = f"{self.cache_prefix}_Fn_hidden_states" if use_l1 else f"{self.cache_prefix}_Fn_residual"
 
     cache_decisions: list[bool] = []
     for i in range(num_requests):
@@ -249,13 +248,14 @@ def _forward_batched_base(
 
         compute_hs = torch.index_select(hidden_states, 0, compute_row_t)
         compute_enc = (
-            torch.index_select(encoder_hidden_states, 0, compute_row_t)
-            if encoder_hidden_states is not None
-            else None
+            torch.index_select(encoder_hidden_states, 0, compute_row_t) if encoder_hidden_states is not None else None
         )
 
         mn_hs, mn_enc, mn_hs_residual, mn_enc_residual = self.call_Mn_blocks(
-            compute_hs, compute_enc, *args, **compute_kwargs,
+            compute_hs,
+            compute_enc,
+            *args,
+            **compute_kwargs,
         )
 
         # Write Mn outputs back into full-batch tensor
@@ -361,7 +361,10 @@ def _forward_batched_base(
 
     # --- Stage 4: Bn blocks on full batch ---
     hidden_states, encoder_hidden_states = self.call_Bn_blocks(
-        hidden_states, encoder_hidden_states, *args, **kwargs,
+        hidden_states,
+        encoder_hidden_states,
+        *args,
+        **kwargs,
     )
 
     cm._current_context = None
@@ -401,7 +404,9 @@ def _forward_batched_345(
     # --- Stage 1: Fn blocks on full batch ---
     original_hidden_states = hidden_states
     hidden_states, new_encoder_hidden_states = self.call_Fn_blocks(
-        hidden_states, *args, **kwargs,
+        hidden_states,
+        *args,
+        **kwargs,
     )
     fn_residual_full = self._get_Fn_residual(original_hidden_states, hidden_states)
     fn_hidden_states_full = hidden_states.clone() if cm.is_l1_diff_enabled() else None
@@ -410,11 +415,7 @@ def _forward_batched_345(
     # --- Stage 2: per-request can_cache decisions ---
     use_l1 = cm.is_l1_diff_enabled()
     parallelized = self._is_parallelized()
-    prefix_fn = (
-        f"{self.cache_prefix}_Fn_hidden_states"
-        if use_l1
-        else f"{self.cache_prefix}_Fn_residual"
-    )
+    prefix_fn = f"{self.cache_prefix}_Fn_hidden_states" if use_l1 else f"{self.cache_prefix}_Fn_residual"
 
     cache_decisions: list[bool] = []
     for i in range(num_requests):
@@ -484,9 +485,7 @@ def _forward_batched_345(
             if mn_enc is not None:
                 # Compute encoder residual for this request
                 old_enc_slice = (
-                    new_encoder_hidden_states[bs : bs + nr]
-                    if new_encoder_hidden_states is not None
-                    else None
+                    new_encoder_hidden_states[bs : bs + nr] if new_encoder_hidden_states is not None else None
                 )
                 old_enc_slice, _ = _trim_encoder_slice(
                     old_enc_slice,
@@ -567,7 +566,9 @@ def _forward_batched_345(
     # --- Stage 4: Bn blocks on full batch ---
     if cm.Bn_compute_blocks() > 0:
         hidden_states, new_encoder_hidden_states = self.call_Bn_blocks(
-            hidden_states, *args, **kwargs,
+            hidden_states,
+            *args,
+            **kwargs,
         )
 
     cm._current_context = None
@@ -585,17 +586,14 @@ def patch_cache_dit_for_batching() -> None:
     Safe to call multiple times (idempotent via ``_batch_patched`` flag).
     """
     try:
-        from cache_dit.caching.cache_blocks.pattern_base import (
-            CachedBlocks_Pattern_Base,
-        )
         from cache_dit.caching.cache_blocks.pattern_3_4_5 import (
             CachedBlocks_Pattern_3_4_5,
         )
-    except ImportError:
-        logger.warning(
-            "cache-dit CachePattern classes not found; "
-            "batch-mode monkey-patch skipped."
+        from cache_dit.caching.cache_blocks.pattern_base import (
+            CachedBlocks_Pattern_Base,
         )
+    except ImportError:
+        logger.warning("cache-dit CachePattern classes not found; batch-mode monkey-patch skipped.")
         return
 
     if not getattr(CachedBlocks_Pattern_Base, "_batch_patched", False):
@@ -610,7 +608,11 @@ def patch_cache_dit_for_batching() -> None:
         ) -> Any:
             if _is_batch_mode(self.context_manager):
                 return _forward_batched_base(
-                    self, hidden_states, encoder_hidden_states, *args, **kwargs,
+                    self,
+                    hidden_states,
+                    encoder_hidden_states,
+                    *args,
+                    **kwargs,
                 )
             return _orig_base(self, hidden_states, encoder_hidden_states, *args, **kwargs)
 

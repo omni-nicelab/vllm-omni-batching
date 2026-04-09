@@ -139,6 +139,25 @@ def _cached_ids(sched_output) -> list[str]:
     return list(sched_output.scheduled_cached_reqs.sched_req_ids)
 
 
+def _make_engine(
+    scheduler: SchedulerInterface | None = None,
+) -> DiffusionEngine:
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.scheduler = scheduler or RequestScheduler()
+    engine._state_lock = threading.RLock()
+    engine._rpc_lock = threading.RLock()
+    engine._input_queue = queue.Queue()
+    engine._output_queue = queue.Queue()
+    engine.abort_queue = queue.Queue()
+    engine._results_map = {}
+    engine._handle_to_sched_req_id = {}
+    engine._sched_req_id_to_handle = {}
+    engine._request_id_to_handle = {}
+    engine._handle_to_request_ids = {}
+    engine._cancelled_handles = set()
+    return engine
+
+
 class _StubScheduler(SchedulerInterface):
     def __init__(self, request: OmniDiffusionRequest, output) -> None:
         self._request = request
@@ -374,11 +393,8 @@ class TestRequestScheduler:
 
 class TestDiffusionEngine:
     def test_add_req_and_wait_for_response_single_path(self) -> None:
-        engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.scheduler = RequestScheduler()
+        engine = _make_engine()
         engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
-        engine._rpc_lock = threading.RLock()
-        engine.abort_queue = queue.Queue()
 
         request = _make_request("engine")
         runner_output = _make_request_output("engine")
@@ -394,10 +410,7 @@ class TestDiffusionEngine:
         runner_output = _make_request_output("engine_iface")
         scheduler = _StubScheduler(request, runner_output)
 
-        engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.scheduler = scheduler
-        engine._rpc_lock = threading.RLock()
-        engine.abort_queue = queue.Queue()
+        engine = _make_engine(scheduler)
         engine.execute_fn = Mock(return_value=runner_output)
 
         output = engine.add_req_and_wait_for_response(request)
@@ -452,10 +465,8 @@ class TestDiffusionEngine:
             engine.step(_make_request("req-abort"))
 
     def test_abort_queue_marks_request_finished_aborted(self) -> None:
-        engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.scheduler = RequestScheduler()
+        engine = _make_engine()
         engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
-        engine.abort_queue = queue.Queue()
 
         req_id = engine.scheduler.add_request(_make_request("req-abort"))
         engine.abort("req-abort")
@@ -584,9 +595,7 @@ class TestDiffusionEngine:
             assert fake_executor.first_step_started.wait(5)
 
             def _submit_second() -> None:
-                second_submitted["value"] = engine.submit_request(
-                    _make_step_request("second", num_inference_steps=2)
-                )
+                second_submitted["value"] = engine.submit_request(_make_step_request("second", num_inference_steps=2))
                 second_submit_done.set()
 
             submit_thread = threading.Thread(target=_submit_second, daemon=True)
@@ -599,8 +608,7 @@ class TestDiffusionEngine:
 
             second_request = second_submitted["value"]
             assert any(
-                len(call) == 2
-                and set(call) == {first_submitted.request_handle, second_request.request_handle}
+                len(call) == 2 and set(call) == {first_submitted.request_handle, second_request.request_handle}
                 for call in fake_executor.calls
             )
             assert engine.wait_for_submitted_request(first_submitted, timeout=5).error is None

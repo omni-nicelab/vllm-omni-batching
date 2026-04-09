@@ -54,11 +54,7 @@ class _BatchingPipeline:
         )
         state.prompt_embeds = torch.zeros((1, 2, 4), dtype=torch.float32)
         state.prompt_embeds_mask = torch.tensor([[True, True]])
-        state.guidance = (
-            None
-            if sampling.guidance is None
-            else torch.as_tensor(sampling.guidance, dtype=torch.float32)
-        )
+        state.guidance = None if sampling.guidance is None else torch.as_tensor(sampling.guidance, dtype=torch.float32)
         state.do_true_cfg = bool(getattr(sampling, "do_true_cfg", False))
         if getattr(sampling, "true_cfg_scale", None) is not None:
             state.sampling.true_cfg_scale = sampling.true_cfg_scale
@@ -86,9 +82,7 @@ class _BatchingPipeline:
                 "true_cfg_scale": input_batch.true_cfg_scale,
                 "cfg_normalize": input_batch.cfg_normalize,
                 "image_latents": (
-                    None
-                    if input_batch.image_latents is None
-                    else input_batch.image_latents.detach().clone()
+                    None if input_batch.image_latents is None else input_batch.image_latents.detach().clone()
                 ),
             }
         )
@@ -161,10 +155,7 @@ def _make_runner():
 def _scheduler_output_for_new_reqs(new_reqs: list[tuple[str, object]], step_id: int) -> DiffusionSchedulerOutput:
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        scheduled_new_reqs=[
-            NewRequestData(sched_req_id=req_id, req=req)
-            for req_id, req in new_reqs
-        ],
+        scheduled_new_reqs=[NewRequestData(sched_req_id=req_id, req=req) for req_id, req in new_reqs],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         finished_req_ids=set(),
         num_running_reqs=len(new_reqs),
@@ -180,10 +171,7 @@ def _scheduler_output_mixed(
 ) -> DiffusionSchedulerOutput:
     return DiffusionSchedulerOutput(
         step_id=step_id,
-        scheduled_new_reqs=[
-            NewRequestData(sched_req_id=req_id, req=req)
-            for req_id, req in new_reqs
-        ],
+        scheduled_new_reqs=[NewRequestData(sched_req_id=req_id, req=req) for req_id, req in new_reqs],
         scheduled_cached_reqs=CachedRequestData(sched_req_ids=cached_req_ids),
         finished_req_ids=set(),
         num_running_reqs=len(new_reqs) + len(cached_req_ids),

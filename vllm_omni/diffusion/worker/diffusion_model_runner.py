@@ -450,9 +450,7 @@ class DiffusionModelRunner:
         if not self.supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
         if self.od_config.cache_backend not in (None, "none") and self.cache_manager is None:
-            raise ValueError(
-                f"Step mode cache backend '{self.od_config.cache_backend}' has no resident-state driver."
-            )
+            raise ValueError(f"Step mode cache backend '{self.od_config.cache_backend}' has no resident-state driver.")
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
