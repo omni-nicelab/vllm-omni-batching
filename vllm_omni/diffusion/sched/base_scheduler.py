@@ -42,10 +42,7 @@ class _BaseScheduler(SchedulerInterface):
         self._waiting.clear()
         self._running.clear()
         self._finished_req_ids.clear()
-        # The current DiffusionEngine execution mode does not support real
-        # request batching well, so we keep this fixed at 1 for now.
-        # TODO: Add support for multiple concurrent requests
-        self.max_num_running_reqs = 1
+        self.max_num_running_reqs = od_config.max_num_seqs
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
