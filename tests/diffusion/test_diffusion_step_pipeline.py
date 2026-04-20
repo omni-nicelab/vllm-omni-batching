@@ -231,7 +231,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
         return DiffusionOutput(output=state.latents.detach().cpu())
 
 
-def _make_step_request(num_inference_steps: int = 2):
+def _make_step_request(num_inference_steps: int = 2, profile: bool = False):
     return SimpleNamespace(
         prompts=["a prompt"],
         request_ids=["req-1"],
@@ -240,6 +240,7 @@ def _make_step_request(num_inference_steps: int = 2):
             seed=None,
             generator_device=None,
             num_inference_steps=num_inference_steps,
+            profile=profile,
         ),
     )
 
@@ -525,20 +526,88 @@ class TestRunner:
         assert runner.pipeline.decode_calls == 1
         assert runner.input_batch is None
 
-    def test_pipeline_error_cleans_state_and_allows_same_req_id_retry(self, monkeypatch):
+    def test_profile_true_collects_raw_step_records(self, monkeypatch):
         runner = _make_runner()
-        runner.pipeline = _FailingStepPipeline()
-        req = _make_step_request()
+        req_1 = _make_step_request(profile=True)
+        req_2 = _make_step_request(profile=True)
+        req_2.request_ids = ["req-2"]
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        timeline = iter([0.000, 0.005, 0.005, 0.012, 0.012, 0.052, 0.052, 0.072, 0.072, 0.075, 0.075, 0.079])
+        monkeypatch.setattr(runner, "_sync_and_time", lambda: next(timeline))
+
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=0,
+            scheduled_new_reqs=[
+                NewRequestData(sched_req_id="req-1", req=req_1),
+                NewRequestData(sched_req_id="req-2", req=req_2),
+            ],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids=set(),
+            num_running_reqs=2,
+            num_waiting_reqs=0,
+        )
+
+        first = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+        second = DiffusionModelRunner.execute_stepwise(
+            runner,
+            DiffusionSchedulerOutput(
+                step_id=1,
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData(sched_req_ids=["req-1", "req-2"]),
+                finished_req_ids=set(),
+                num_running_reqs=2,
+                num_waiting_reqs=0,
+            ),
+        )
+
+        assert first.finished == [False, False]
+        assert first.result == [None, None]
+
+        assert second.finished == [True, True]
+        assert second.result is not None
+        for result in second.result:
+            assert result is not None
+            records = result.custom_output["step_profile"]["records"]
+            assert len(records) == 2
+            assert [record["batch_size"] for record in records] == [2, 2]
+            assert [record["batched_wall_ms"] for record in records] == pytest.approx([40.0, 20.0])
+            assert [record["amortized_wall_ms"] for record in records] == pytest.approx([20.0, 10.0])
+            assert "summary" not in result.custom_output["step_profile"]
+            assert result.stage_durations["denoise_step"] == pytest.approx(0.06)
+            assert result.stage_durations["denoise_step_amortized"] == pytest.approx(0.03)
+
+        assert runner.state_cache == {}
+        assert runner.input_batch is None
+
+    def test_pipeline_error_cleans_state_and_allows_same_req_id_retry(self, monkeypatch):
+        class _CapturingFailingStepPipeline(_FailingStepPipeline):
+            def __init__(self):
+                super().__init__()
+                self.captured_state = None
+
+            def prepare_encode(self, state, **kwargs):
+                self.captured_state = super().prepare_encode(state, **kwargs)
+                return self.captured_state
+
+        runner = _make_runner()
+        runner.pipeline = _CapturingFailingStepPipeline()
+        req = _make_step_request(profile=True)
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        timeline = iter([0.00, 0.01, 0.01])
+        monkeypatch.setattr(runner, "_sync_and_time", lambda: next(timeline))
 
         with pytest.raises(RuntimeError, match="denoise boom"):
             DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
 
         assert runner.state_cache == {}
         assert runner.input_batch is None
+        assert runner.pipeline.captured_state is not None
+        assert "_step_profile_records" not in runner.pipeline.captured_state.extra
+        assert "_stage_durations" not in runner.pipeline.captured_state.extra
 
         runner.pipeline = _StepPipeline()
-        output = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=1))
+        output = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=1))
         assert output.req_id == "req-1"
         assert output.step_index == 1
         assert output.finished is False

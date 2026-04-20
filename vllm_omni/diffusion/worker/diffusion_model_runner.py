@@ -628,39 +628,107 @@ class DiffusionModelRunner:
 
     # ── stepwise profiling helpers ──────────────────────────────────
 
-    def _stepwise_profiling_enabled(self) -> bool:
+    def _stepwise_pipeline_profiling_enabled(self) -> bool:
         return bool(getattr(self.od_config, "enable_diffusion_pipeline_profiler", False)) and hasattr(
             self.pipeline, "clear_profiler_records"
         )
+
+    @staticmethod
+    def _request_step_profiling_enabled(state: DiffusionRequestState) -> bool:
+        return bool(getattr(state.sampling, "profile", False))
+
+    def _stepwise_timing_enabled(self, states: list[DiffusionRequestState]) -> bool:
+        return self._stepwise_pipeline_profiling_enabled() or any(
+            self._request_step_profiling_enabled(state) for state in states
+        )
+
+    def _should_collect_stage_durations(
+        self,
+        state: DiffusionRequestState,
+        pipeline_profiling: bool,
+    ) -> bool:
+        return pipeline_profiling or self._request_step_profiling_enabled(state)
 
     def _sync_and_time(self) -> float:
         if current_omni_platform.is_available():
             current_omni_platform.synchronize()
         return time.perf_counter()
 
+    def _build_request_step_profile(self, request_state: DiffusionRequestState) -> dict[str, Any] | None:
+        records = request_state.extra.get("_step_profile_records")
+        if not records:
+            return None
+
+        return {"records": [dict(record) for record in records]}
+
+    def _append_step_profile_records(
+        self,
+        scheduled_states: list[DiffusionRequestState],
+        scheduler_step_id: int,
+        elapsed: float,
+    ) -> None:
+        batch_size = len(scheduled_states)
+        if batch_size == 0:
+            return
+
+        batched_wall_ms = elapsed * 1000.0
+        amortized_wall_ms = (elapsed / batch_size) * 1000.0
+        for state in scheduled_states:
+            if not self._request_step_profiling_enabled(state):
+                continue
+            state.extra.setdefault("_step_profile_records", []).append(
+                {
+                    "scheduler_step_id": int(scheduler_step_id),
+                    "request_step_index": int(state.step_index),
+                    "total_steps": int(state.total_steps),
+                    "batch_size": batch_size,
+                    "batched_wall_ms": batched_wall_ms,
+                    "amortized_wall_ms": amortized_wall_ms,
+                }
+            )
+
+    @staticmethod
+    def _clear_step_profile_state(request_state: DiffusionRequestState) -> None:
+        request_state.extra.pop("_step_profile_records", None)
+        request_state.extra.pop("_stage_durations", None)
+
+    def _finalize_finished_request_output(
+        self,
+        request_state: DiffusionRequestState,
+        result: DiffusionOutput,
+    ) -> None:
+        stage_durations = request_state.extra.get("_stage_durations")
+        if stage_durations:
+            result.stage_durations = dict(stage_durations)
+
+        step_profile = self._build_request_step_profile(request_state)
+        if step_profile is not None:
+            result.custom_output["step_profile"] = step_profile
+
     def _prepare_inputs(
         self,
         states: list[DiffusionRequestState],
         new_req_ids: set[str],
     ) -> InputBatch:
-        profiling = self._stepwise_profiling_enabled()
+        pipeline_profiling = self._stepwise_pipeline_profiling_enabled()
         with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
             for state in states:
                 self._ensure_sampling_generator(state)
                 if state.req_id in new_req_ids:
-                    if profiling:
+                    collect_stage_durations = self._should_collect_stage_durations(state, pipeline_profiling)
+                    if pipeline_profiling:
                         self.pipeline.clear_profiler_records()
+                    if collect_stage_durations:
                         t0 = self._sync_and_time()
 
                     self.pipeline.prepare_encode(state)
 
-                    if profiling:
+                    if collect_stage_durations:
                         elapsed = self._sync_and_time() - t0
-                        sub_stages = self.pipeline.stage_durations
-                        state.extra["_stage_durations"] = {
-                            "prepare_encode": elapsed,
-                            **sub_stages,
-                        }
+                        stage_durations = state.extra.setdefault("_stage_durations", {})
+                        stage_durations["prepare_encode"] = elapsed
+                        if pipeline_profiling:
+                            stage_durations.update(self.pipeline.stage_durations)
 
         input_batch = InputBatch.make_batch(
             states,
@@ -730,21 +798,26 @@ class DiffusionModelRunner:
         self.input_batch = input_batch
         scatter_latents(scheduled_states, input_batch)
 
-        profiling = self._stepwise_profiling_enabled()
+        pipeline_profiling = self._stepwise_pipeline_profiling_enabled()
         for idx, (request_state, finished) in enumerate(zip(scheduled_states, finished_flags, strict=True)):
             if finished and results[idx] is None:
-                if profiling:
+                collect_stage_durations = self._should_collect_stage_durations(request_state, pipeline_profiling)
+                if pipeline_profiling:
                     self.pipeline.clear_profiler_records()
+                if collect_stage_durations:
                     t0 = self._sync_and_time()
 
                 results[idx] = self.pipeline.post_decode(request_state)
 
-                if profiling:
+                if collect_stage_durations:
                     elapsed = self._sync_and_time() - t0
-                    d = request_state.extra.get("_stage_durations", {})
-                    d["post_decode"] = elapsed
-                    d.update(self.pipeline.stage_durations)
-                    results[idx].stage_durations = d
+                    stage_durations = request_state.extra.setdefault("_stage_durations", {})
+                    stage_durations["post_decode"] = elapsed
+                    if pipeline_profiling:
+                        stage_durations.update(self.pipeline.stage_durations)
+
+            if finished and results[idx] is not None:
+                self._finalize_finished_request_output(request_state, results[idx])
 
         for request_state, finished in zip(scheduled_states, finished_flags, strict=True):
             if not finished:
@@ -754,6 +827,7 @@ class DiffusionModelRunner:
                 self._log_cache_dit_stepwise_request_stats(request_state)
             if self.cache_manager is not None:
                 self.cache_manager.free(request_state)
+            self._clear_step_profile_state(request_state)
             self.state_cache.pop(request_state.req_id, None)
         if not self.state_cache:
             self.input_batch = None
@@ -796,6 +870,7 @@ class DiffusionModelRunner:
         for request_state in scheduled_states:
             if self.cache_manager is not None:
                 self.cache_manager.free(request_state)
+            self._clear_step_profile_state(request_state)
             self.state_cache.pop(request_state.req_id, None)
         self.input_batch = None
 
@@ -831,26 +906,32 @@ class DiffusionModelRunner:
                     self.cache_manager.activate(scheduled_states)
                     cache_activated = True
 
-                profiling = self._stepwise_profiling_enabled()
+                pipeline_profiling = self._stepwise_pipeline_profiling_enabled()
+                timing_enabled = self._stepwise_timing_enabled(scheduled_states)
 
                 with set_forward_context(
                     vllm_config=self.vllm_config,
                     omni_diffusion_config=self.od_config,
                     attn_metadata=attn_metadata,
                 ):
-                    if profiling:
+                    if timing_enabled:
                         t0 = self._sync_and_time()
 
                     noise_pred = self.pipeline.denoise_step(input_batch)
 
-                    if profiling:
+                    if timing_enabled:
                         elapsed = self._sync_and_time() - t0
                         batch_size = len(scheduled_states)
                         amortized = elapsed / batch_size
                         for state in scheduled_states:
-                            d = state.extra.setdefault("_stage_durations", {})
-                            d["denoise_step"] = d.get("denoise_step", 0.0) + elapsed
-                            d["denoise_step_amortized"] = d.get("denoise_step_amortized", 0.0) + amortized
+                            if not self._should_collect_stage_durations(state, pipeline_profiling):
+                                continue
+                            stage_durations = state.extra.setdefault("_stage_durations", {})
+                            stage_durations["denoise_step"] = stage_durations.get("denoise_step", 0.0) + elapsed
+                            stage_durations["denoise_step_amortized"] = (
+                                stage_durations.get("denoise_step_amortized", 0.0) + amortized
+                            )
+                        self._append_step_profile_records(scheduled_states, scheduler_output.step_id, elapsed)
                 finished_flags, results = self._postprocess_step(
                     scheduled_states,
                     noise_pred,
