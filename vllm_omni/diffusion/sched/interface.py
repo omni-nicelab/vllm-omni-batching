@@ -42,14 +42,9 @@ class DiffusionRequestStatus(enum.IntEnum):
 class SamplingParamsKey:
     """Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
 
-    Only requests with an identical key can share a forward pass.
-    Each field here must match exactly; any difference forces separate batches.
-
-    Excluded from the key (allowed to differ within a batch):
-    RNG fields (seed/generator), per-request tensor inputs (latents/embeds),
-    preprocessing flags (height_not_provided, etc.), unused sampling fields
-    (prompt_template, n_tokens, VSA_sparsity), and side-effect-only flags
-    (save_output, profile, debug, return_trajectory_*, return_frames).
+    Only requests with the same key can be batched together.
+    Fields not included here are treated as request-local and do not
+    participate in the current homogeneous batching policy.
     """
 
     # -- Spatial / temporal shape --
@@ -59,10 +54,7 @@ class SamplingParamsKey:
     resolution: str | None = None
     fps: int | None = None
     frame_rate: int | None = None
-
-    # -- Denoising schedule --
-    num_inference_steps: int | None = None
-    num_outputs_per_prompt: int = 1
+    boundary_ratio: float = 0.0
 
     # -- CFG / guidance --
     do_classifier_free_guidance: bool = False
@@ -72,19 +64,6 @@ class SamplingParamsKey:
     guidance_rescale: float = 0.0
     true_cfg_scale: float = 0.0
     cfg_normalize: bool = False
-
-    # -- Output format --
-    output_type: str | None = None
-
-    # -- Pipeline behaviour flags --
-    max_sequence_length: int | None = None
-    layers: int | None = None
-    use_en_prompt: bool = False
-    boundary_ratio: float = 0.0
-    decode_timestep: float = 0.0
-    decode_noise_scale: float = 0.0
-    eta: float = 0.0
-    lora_scale: float = 1.0
 
 
 @dataclass
@@ -162,7 +141,7 @@ class DiffusionSchedulerOutput:
 
 class SchedulerInterface(ABC):
     """Abstract lifecycle contract for diffusion schedulers."""
-
+    # TODO: DELETE
     def _make_sched_req_id(self, request: OmniDiffusionRequest) -> str:
         """
         Generate a unique scheduler request ID for the given request.

@@ -53,6 +53,7 @@ class _BaseScheduler(SchedulerInterface):
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
+        self._running_sampling_params_key: SamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
         # Default to 1; overwritten by initialize() from od_config.max_num_seqs.
         self.max_num_running_reqs: int = 1
@@ -64,6 +65,7 @@ class _BaseScheduler(SchedulerInterface):
         self._step_id = 0
         self._waiting.clear()
         self._running.clear()
+        self._running_sampling_params_key = None
         self._finished_req_ids.clear()
         # Diffusion now uses max_num_seqs as a fixed scheduler-side batch cap.
         max_num_seqs = getattr(od_config, "max_num_seqs", 1)
@@ -107,6 +109,8 @@ class _BaseScheduler(SchedulerInterface):
 
             self._waiting.popleft()
             was_new_request = state.status == DiffusionRequestStatus.WAITING
+            if not self._running:
+                self._running_sampling_params_key = state.sampling_params_key
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(sched_req_id)
             if was_new_request:
@@ -149,6 +153,8 @@ class _BaseScheduler(SchedulerInterface):
             return False
         if sched_req_id in self._running:
             self._running.remove(sched_req_id)
+            if not self._running:
+                self._running_sampling_params_key = None
             self._waiting.appendleft(sched_req_id)
             self._request_states[sched_req_id].status = DiffusionRequestStatus.PREEMPTED
             return True
@@ -165,6 +171,7 @@ class _BaseScheduler(SchedulerInterface):
         self._request_id_to_sched_req_id.clear()
         self._waiting.clear()
         self._running.clear()
+        self._running_sampling_params_key = None
         self._finished_req_ids.clear()
         self._reset_scheduler_state()
 
@@ -194,6 +201,8 @@ class _BaseScheduler(SchedulerInterface):
 
         if running_to_remove:
             self._running = [sched_req_id for sched_req_id in self._running if sched_req_id not in running_to_remove]
+            if not self._running:
+                self._running_sampling_params_key = None
         if waiting_to_remove:
             self._waiting = deque(
                 sched_req_id for sched_req_id in self._waiting if sched_req_id not in waiting_to_remove
@@ -250,10 +259,11 @@ class _BaseScheduler(SchedulerInterface):
         return current_key is not None and current_key == state.sampling_params_key
 
     def _current_sampling_params_key(self):
-        if not self._running:
-            return None
+        if self._running_sampling_params_key is not None or not self._running:
+            return self._running_sampling_params_key
         state = self._request_states.get(self._running[0])
-        return None if state is None else state.sampling_params_key
+        self._running_sampling_params_key = None if state is None else state.sampling_params_key
+        return self._running_sampling_params_key
 
     def _register_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:
         for request_id in request_ids:
