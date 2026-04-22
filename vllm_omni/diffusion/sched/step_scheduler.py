@@ -62,6 +62,9 @@ class StepScheduler(_BaseScheduler):
         )
         return sched_req_id
 
+    def schedule(self) -> DiffusionSchedulerOutput:
+        return super().schedule()
+
     def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         scheduled_req_ids = sched_output.scheduled_req_ids
         if not scheduled_req_ids:
