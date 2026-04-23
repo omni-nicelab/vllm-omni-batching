@@ -165,6 +165,30 @@ class BatchRunnerOutput(BaseRunnerOutput):
     def req_ids(self) -> list[str]:
         return list(self._id_to_idx.keys())
 
+    @property
+    def req_id(self) -> str | list[str]:
+        if len(self.runner_outputs) == 1:
+            return self.runner_outputs[0].req_id
+        return [out.req_id for out in self.runner_outputs]
+
+    @property
+    def step_index(self) -> int | None | list[int | None]:
+        if len(self.runner_outputs) == 1:
+            return self.runner_outputs[0].step_index
+        return [out.step_index for out in self.runner_outputs]
+
+    @property
+    def finished(self) -> bool | list[bool]:
+        if len(self.runner_outputs) == 1:
+            return self.runner_outputs[0].finished
+        return [out.finished for out in self.runner_outputs]
+
+    @property
+    def result(self) -> Any | list[Any]:
+        if len(self.runner_outputs) == 1:
+            return self.runner_outputs[0].result
+        return [out.result for out in self.runner_outputs]
+
     def __len__(self) -> int:
         return len(self.runner_outputs)
 

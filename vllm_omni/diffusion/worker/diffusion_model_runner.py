@@ -560,7 +560,9 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> tuple[list[DiffusionRequestState], list[str]]:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for req_id in scheduler_output.finished_req_ids:
-            self.state_cache.pop(req_id, None)
+            state = self.state_cache.pop(req_id, None)
+            if state is not None and self.cache_manager is not None:
+                self.cache_manager.free(state)
 
         resolved: list[DiffusionRequestState] = []
         new_req_id: list[str] = []
@@ -656,7 +658,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         return prepare_attn(input_batch)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
-        """Execute one step for one scheduled request and return runner output."""
+        """Execute one denoise step for all scheduled requests and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not self.supports_step_mode():
             raise ValueError("Current pipeline does not support step execution.")
@@ -669,57 +671,98 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            states, new_request_ids = self._update_states(scheduler_output)
-            input_batch = self._prepare_batch_inputs(states, new_request_ids)
-            attn_metadata = self._prepare_attn_metadata(input_batch)
+            states: list[DiffusionRequestState] = []
+            cache_states: list[DiffusionRequestState] = []
+            runner_output_list: list[RunnerOutput] = []
+            pipeline_interrupted = False
 
-            with set_forward_context(
-                vllm_config=self.vllm_config,
-                omni_diffusion_config=self.od_config,
-                attn_metadata=attn_metadata,
-            ):
-                noise_pred = self.pipeline.denoise_step(input_batch)
+            try:
+                states, new_request_ids = self._update_states(scheduler_output)
+                input_batch = self._prepare_batch_inputs(states, new_request_ids)
 
-                runner_output_list = []
-                pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
+                # Without a cache manager, concurrent batching is not safe: per-request
+                # cache state cannot be preserved across requests.
+                if self.cache_manager is None and len(states) > 1:
+                    raise ValueError(
+                        f"Step mode without a cache manager requires batch_size=1, "
+                        f"got batch_size={len(states)}. Enable a cache backend to serve concurrent requests."
+                    )
+
+                attn_metadata = self._prepare_attn_metadata(input_batch)
+
+                # Activate per-request cache slots before the denoise step so that
+                # cache-dit context managers reference the correct per-request buffers.
+                if self.cache_manager is not None:
+                    cache_states = [s for s in states if s.req_id != "dummy_req_id"]
+                    if cache_states:
+                        self.cache_manager.activate(cache_states)
+
+                with set_forward_context(
+                    vllm_config=self.vllm_config,
+                    omni_diffusion_config=self.od_config,
+                    attn_metadata=attn_metadata,
+                ):
+                    noise_pred = self.pipeline.denoise_step(input_batch)
+
+                    pipeline_interrupted = getattr(self.pipeline, "interrupt", False)
+                    if noise_pred is None:
+                        error_msg = "stepwise denoise interrupted" if pipeline_interrupted else "stepwise denoise returned None"
+                        for state in states:
+                            runner_output_list.append(
+                                RunnerOutput(
+                                    req_id=state.req_id,
+                                    step_index=state.step_index,
+                                    finished=True,
+                                    result=DiffusionOutput(error=error_msg),
+                                )
+                            )
+                        pipeline_interrupted = True
+
+                    else:
+                        offset = 0
+                        for req in states:
+                            row_num = req.latents.shape[0]
+                            self.pipeline.step_scheduler(
+                                req, noise_pred[offset : offset + row_num]
+                            )
+                            offset = offset + row_num
+                            if req.denoise_completed:
+                                result = self.pipeline.post_decode(req)
+                            else:
+                                result = None
+                            runner_output_list.append(
+                                RunnerOutput(
+                                    req_id=req.req_id,
+                                    step_index=req.step_index,
+                                    finished=req.denoise_completed,
+                                    result=result,
+                                )
+                            )
+
+                        if offset != noise_pred.shape[0]:
+                            raise ValueError(
+                                f"Stepwise noise_pred consumed {offset} rows, "
+                                f"but batched noise_pred has {noise_pred.shape[0]} rows."
+                            )
+
+                    self._update_states_after(states, input_batch, pipeline_interrupted)
+                    if not self.state_cache:
+                        self.input_batch = None
+
+            except Exception:
+                for state in states:
+                    self.state_cache.pop(state.req_id, None)
+                self.input_batch = None
+                raise
+
+            finally:
+                # Always deactivate cache after the step, even on exception.
+                if cache_states and self.cache_manager is not None:
+                    self.cache_manager.deactivate(cache_states)
+                # Free slots for requests that finished this step.
+                if self.cache_manager is not None:
                     for state in states:
-                        runner_output_list.append(
-                            RunnerOutput(
-                                req_id=state.req_id,
-                                step_index=state.step_index,
-                                finished=True,
-                                result=DiffusionOutput(error="Denoise step return None."),
-                            )
-                        )
+                        if state.denoise_completed or pipeline_interrupted:
+                            self.cache_manager.free(state)
 
-                else:
-                    offset = 0
-                    for req in states:
-                        row_num = req.latents.shape[0]
-                        self.pipeline.step_scheduler(
-                            req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                        )
-                        offset = offset + row_num
-                        if req.denoise_completed:
-                            result = self.pipeline.post_decode(req)
-                        else:
-                            result = None
-                        runner_output_list.append(
-                            RunnerOutput(
-                                req_id=req.req_id,
-                                step_index=req.step_index,
-                                finished=req.denoise_completed,
-                                result=result,
-                            )
-                        )
-
-                    if noise_pred is not None and offset != noise_pred.shape[0]:
-                        raise ValueError(
-                            f"Stepwise noise_pred consumed {offset} rows, "
-                            f"but batched noise_pred has {noise_pred.shape[0]} rows."
-                        )
-
-                self._update_states_after(states, input_batch, pipeline_interrupted)
-
-                return BatchRunnerOutput.from_list(runner_output_list)
+            return BatchRunnerOutput.from_list(runner_output_list)
