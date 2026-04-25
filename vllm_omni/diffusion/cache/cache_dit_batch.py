@@ -167,6 +167,9 @@ def _forward_batched(
     ctx_name: str = self.cache_context
     prefix: str = self.cache_prefix
 
+    cm._current_context = batch_contexts[0][ctx_name]
+    self._check_cache_params()
+
     use_l1 = cm.is_l1_diff_enabled()
     parallelized = self._is_parallelized()
     fn_check_prefix = f"{prefix}_Fn_hidden_states" if use_l1 else f"{prefix}_Fn_residual"
@@ -174,9 +177,6 @@ def _forward_batched(
     bn_enc_prefix = (
         f"{prefix}_Bn_residual" if cm.is_encoder_cache_residual() else f"{prefix}_Bn_hidden_states"
     )
-
-    cm._current_context = batch_contexts[0][ctx_name]
-    self._check_cache_params()
 
     # Stage 1: Fn blocks on full batch.
     original_hs = hidden_states

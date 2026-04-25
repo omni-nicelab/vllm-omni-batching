@@ -22,8 +22,8 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.cache.cache_manager import CacheManager
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.cache_manager import CacheManager
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -680,6 +680,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             try:
                 states, new_request_ids = self._update_states(scheduler_output)
                 input_batch = self._prepare_batch_inputs(states, new_request_ids)
+                # Stepwise e2e visibility: log one concise batch line per scheduler tick.
+                try:
+                    self._log_stepwise_batch(scheduler_output, states, new_request_ids)
+                except Exception:
+                    logger.debug("Failed to emit stepwise batch log.", exc_info=True)
 
                 # Without a cache manager, concurrent batching is not safe: per-request
                 # cache state cannot be preserved across requests.
@@ -749,6 +754,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     self._update_states_after(states, input_batch, pipeline_interrupted)
                     if not self.state_cache:
                         self.input_batch = None
+                    if self.od_config.cache_backend == "cache_dit":
+                        for state in states:
+                            if state.req_id != "dummy_req_id" and (state.denoise_completed or pipeline_interrupted):
+                                self._log_cache_dit_stepwise_request_stats(state)
 
             except Exception:
                 for state in states:
