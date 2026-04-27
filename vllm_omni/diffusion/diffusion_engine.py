@@ -83,6 +83,27 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def build_model_specific_dummy_run_request(
+    od_config: OmniDiffusionConfig,
+    *,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+) -> OmniDiffusionRequest | None:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+    if model_cls is None:
+        return None
+    builder = getattr(model_cls, "build_dummy_run_request", None)
+    if not callable(builder):
+        return None
+    return builder(
+        od_config,
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+    )
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -212,6 +233,27 @@ class DiffusionEngine:
         exec_total_time: float,
     ) -> list[OmniRequestOutput]:
         if output.output is None:
+            if output.multimodal_output:
+                final_output_type = (
+                    f"stage_{getattr(self.od_config, 'model_stage', None)}"
+                    if getattr(self.od_config, "model_stage", None)
+                    else "latents"
+                )
+                return [
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request.request_ids[i] if i < len(request.request_ids) else "",
+                        images=[],
+                        prompt=prompt,
+                        metrics={},
+                        latents=None,
+                        multimodal_output=output.multimodal_output,
+                        final_output_type=final_output_type,
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
+                    )
+                    for i, prompt in enumerate(request.prompts)
+                ]
+
             logger.warning("Output is None, returning empty OmniRequestOutput")
             return [
                 OmniRequestOutput.from_diffusion(
@@ -623,6 +665,32 @@ class DiffusionEngine:
         num_inference_steps = 1
         height = 1024
         width = 1024
+        req = build_model_specific_dummy_run_request(
+            self.od_config,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+        )
+        if req is None:
+            req = self._build_default_dummy_run_request(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+            )
+
+        logger.info("dummy run to warm up the model")
+        request = self.pre_process_func(req) if self.pre_process_func is not None else req
+        output = self.add_req_and_wait_for_response(request)
+        if output.error:
+            raise RuntimeError(f"Dummy run failed: {output.error}")
+
+    def _build_default_dummy_run_request(
+        self,
+        *,
+        height: int,
+        width: int,
+        num_inference_steps: int,
+    ) -> OmniDiffusionRequest:
         if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
@@ -642,7 +710,7 @@ class DiffusionEngine:
             "prompt": "dummy run",
             "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
         }
-        req = OmniDiffusionRequest(
+        return OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],
             sampling_params=OmniDiffusionSamplingParams(
@@ -659,11 +727,6 @@ class DiffusionEngine:
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
             ),
         )
-        logger.info("dummy run to warm up the model")
-        request = self.pre_process_func(req) if self.pre_process_func is not None else req
-        output = self.add_req_and_wait_for_response(request)
-        if output.error:
-            raise RuntimeError(f"Dummy run failed: {output.error}")
 
     def collective_rpc(
         self,

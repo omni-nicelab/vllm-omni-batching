@@ -373,12 +373,26 @@ class TestRequestScheduler:
 
 
 class TestDiffusionEngine:
+    @staticmethod
+    def _init_engine_state(engine: DiffusionEngine) -> None:
+        engine._state_lock = threading.RLock()
+        engine._rpc_lock = threading.RLock()
+        engine._input_queue = queue.Queue()
+        engine._output_queue = queue.Queue()
+        engine.abort_queue = queue.Queue()
+        engine._results_map = {}
+        engine._handle_to_sched_req_id = {}
+        engine._sched_req_id_to_handle = {}
+        engine._request_id_to_handle = {}
+        engine._handle_to_request_ids = {}
+        engine._cancelled_handles = set()
+        engine._shutdown_event = threading.Event()
+
     def test_add_req_and_wait_for_response_single_path(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
-        engine._rpc_lock = threading.RLock()
-        engine.abort_queue = queue.Queue()
+        self._init_engine_state(engine)
 
         request = _make_request("engine")
         runner_output = _make_request_output("engine")
@@ -396,8 +410,7 @@ class TestDiffusionEngine:
 
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = scheduler
-        engine._rpc_lock = threading.RLock()
-        engine.abort_queue = queue.Queue()
+        self._init_engine_state(engine)
         engine.execute_fn = Mock(return_value=runner_output)
 
         output = engine.add_req_and_wait_for_response(request)
@@ -447,7 +460,7 @@ class TestDiffusionEngine:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace(max_num_seqs=1))
-        engine.abort_queue = queue.Queue()
+        self._init_engine_state(engine)
 
         req_id = engine.scheduler.add_request(_make_request("req-abort"))
         engine.abort("req-abort")
@@ -485,6 +498,29 @@ class TestDiffusionEngine:
         assert isinstance(engine.scheduler, StepScheduler)
         assert engine.execute_fn is fake_executor.execute_step
         fake_executor_cls.assert_called_once_with(od_config)
+        engine.close()
+
+    def test_denoise_stage_still_runs_dummy_warmup(self) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            model_stage="denoise",
+            step_execution=True,
+            max_num_seqs=1,
+        )
+        fake_executor = Mock()
+        fake_executor_cls = Mock(return_value=fake_executor)
+
+        with (
+            patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func", return_value=None),
+            patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func", return_value=None),
+            patch("vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class", return_value=fake_executor_cls),
+            patch.object(DiffusionEngine, "_dummy_run", return_value=None) as dummy_run,
+        ):
+            engine = DiffusionEngine(od_config)
+
+        dummy_run.assert_called_once_with()
+        assert isinstance(engine.scheduler, StepScheduler)
+        assert engine.execute_fn is fake_executor.execute_step
         engine.close()
 
     def test_request_mode_caps_scheduler_to_single_running_request(self) -> None:

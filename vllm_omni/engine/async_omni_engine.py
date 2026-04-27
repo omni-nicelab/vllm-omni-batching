@@ -59,6 +59,7 @@ from vllm_omni.engine.stage_init_utils import (
     finalize_initialized_stages,
     get_stage_connector_spec,
     initialize_diffusion_stage,
+    initialize_submodule_stage,
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
@@ -448,7 +449,7 @@ class AsyncOmniEngine:
         async_chunk = self.async_chunk
         prompt_expand_func = None
         llm_stage_count = sum(
-            1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
+            1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") == "llm"
         )
 
         prepare_engine_environment()
@@ -473,26 +474,35 @@ class AsyncOmniEngine:
 
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
 
-                    if metadata.stage_type == "diffusion":
+                    if metadata.stage_type in ("diffusion", "submodule"):
                         with llm_stage_launch_lock:
                             previous_visible_devices = os.environ.get(device_control_env)
                             try:
                                 setup_stage_devices(stage_id, metadata.runtime_cfg)
                                 omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-                                if omni_conn_cfg:
+                                if metadata.stage_type == "diffusion" and omni_conn_cfg:
                                     from vllm_omni.entrypoints.utils import inject_omni_kv_config
 
                                     inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                                _inject_kv_stage_info(stage_cfg, stage_id)
-                                stage_clients[stage_id] = initialize_diffusion_stage(
-                                    self.model,
-                                    stage_cfg,
-                                    metadata,
-                                    batch_size=self.diffusion_batch_size,
-                                )
+                                if metadata.stage_type == "diffusion":
+                                    _inject_kv_stage_info(stage_cfg, stage_id)
+                                    stage_clients[stage_id] = initialize_diffusion_stage(
+                                        self.model,
+                                        stage_cfg,
+                                        metadata,
+                                        batch_size=self.diffusion_batch_size,
+                                    )
+                                else:
+                                    stage_clients[stage_id] = initialize_submodule_stage(
+                                        self.model,
+                                        stage_cfg,
+                                        metadata,
+                                        batch_size=self.diffusion_batch_size,
+                                    )
                                 logger.info(
-                                    "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
+                                    "[AsyncOmniEngine] Stage %s initialized (%s, batch_size=%d)",
                                     stage_id,
+                                    metadata.stage_type,
                                     self.diffusion_batch_size,
                                 )
                             finally:
@@ -651,7 +661,7 @@ class AsyncOmniEngine:
         original_prompt = prompt
 
         stage_type = self.stage_metadata[0].get("stage_type")
-        if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+        if stage_type not in ("diffusion", "submodule") and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
                 _inject_global_id(prompt, request_id)
@@ -854,7 +864,9 @@ class AsyncOmniEngine:
                     "devices": devices,
                 },
                 "engine_args": {
-                    "max_num_seqs": 1,
+                    "max_num_seqs": kwargs.get(
+                        "max_num_seqs", kwargs.get("diffusion_batch_size", 1)
+                    ),
                     "parallel_config": parallel_config,
                     "model_class_name": kwargs.get("model_class_name", None),
                     "step_execution": kwargs.get("step_execution", False),

@@ -3,11 +3,17 @@
 
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
@@ -393,23 +399,43 @@ def main():
         extra_args["lora_request"] = lora_request
         extra_args["lora_scale"] = args.lora_scale
 
-    outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
-        },
-        OmniDiffusionSamplingParams(
-            height=args.height,
-            width=args.width,
-            generator=generator,
-            true_cfg_scale=args.cfg_scale,
-            guidance_scale=args.guidance_scale,
-            guidance_scale_2=args.guidance_scale_2,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_images_per_prompt,
-            extra_args=extra_args,
-        ),
-    )
+    prompt_payload = {
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+    }
+    if omni.num_stages > 1:
+        if lora_request:
+            raise ValueError("LoRA is not supported by the Qwen-Image 3-stage disaggregated VAE path.")
+        sampling_params_list = [params.clone() for params in omni.default_sampling_params_list]
+        for params in sampling_params_list:
+            params.height = args.height
+            params.width = args.width
+            params.seed = args.seed
+            params.generator = None
+            params.true_cfg_scale = args.cfg_scale
+            params.guidance_scale = args.guidance_scale
+            params.guidance_scale_provided = True
+            params.guidance_scale_2 = args.guidance_scale_2
+            params.num_inference_steps = args.num_inference_steps
+            params.num_outputs_per_prompt = args.num_images_per_prompt
+            params.extra_args = dict(extra_args)
+        outputs = omni.generate([prompt_payload], sampling_params_list, use_tqdm=False)
+    else:
+        outputs = omni.generate(
+            prompt_payload,
+            OmniDiffusionSamplingParams(
+                height=args.height,
+                width=args.width,
+                generator=generator,
+                true_cfg_scale=args.cfg_scale,
+                guidance_scale=args.guidance_scale,
+                guidance_scale_provided=True,
+                guidance_scale_2=args.guidance_scale_2,
+                num_inference_steps=args.num_inference_steps,
+                num_outputs_per_prompt=args.num_images_per_prompt,
+                extra_args=extra_args,
+            ),
+        )
 
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
@@ -440,14 +466,14 @@ def main():
     logger.info(f"Outputs: {outputs}")
 
     first_output = outputs[0]
-    if not hasattr(first_output, "request_output") or not first_output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
-
-    req_out = first_output.request_output
-    if not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images'.")
-
-    images = req_out.images
+    images = getattr(first_output, "images", None) or []
+    if not images:
+        if not hasattr(first_output, "request_output") or not first_output.request_output:
+            raise ValueError("No request_output found in OmniRequestOutput")
+        req_out = first_output.request_output
+        if not hasattr(req_out, "images"):
+            raise ValueError("Invalid request_output structure or missing 'images'.")
+        images = req_out.images
     if not images:
         raise ValueError("No images found in request_output")
 

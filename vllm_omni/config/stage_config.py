@@ -46,6 +46,7 @@ class StageType(str, Enum):
 
     LLM = "llm"
     DIFFUSION = "diffusion"
+    SUBMODULE = "submodule"
 
 
 @dataclass

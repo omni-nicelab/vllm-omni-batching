@@ -314,6 +314,10 @@ class DiffusersPipelineLoader:
                     module.to(module_device)
 
     def load_weights(self, model: nn.Module) -> None:
+        if not self._get_weight_sources(model):
+            logger.info("No explicit diffusers weight sources found; assuming model components loaded themselves.")
+            return
+
         weights_to_load = self._get_expected_parameter_names(model)
         loaded_weights = model.load_weights(self.get_all_weights(model))
 

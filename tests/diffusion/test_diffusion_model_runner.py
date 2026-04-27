@@ -4,12 +4,14 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.utils import CacheBackendSlot, DiffusionRequestState
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -108,6 +110,41 @@ def test_execute_model_emits_cache_summary_with_active_cache_dit_backend(monkeyp
     assert cache_summary_calls == [(runner.pipeline, True)]
 
 
+def test_update_states_after_uses_pipeline_intermediate_output_hook():
+    runner = object.__new__(DiffusionModelRunner)
+    state = DiffusionRequestState(
+        req_id="req-1",
+        sampling=SimpleNamespace(),
+        prompts=[],
+        latents=torch.ones((1, 2), dtype=torch.float32),
+    )
+    input_batch = SimpleNamespace(latents=state.latents.clone(), idx_mapping_np=np.array([0], dtype=np.int32))
+    runner.pipeline = SimpleNamespace(
+        produces_intermediate_stage_output=True,
+        post_intermediate_output=lambda request_state: DiffusionOutput(
+            output=None,
+            multimodal_output={"req_id": request_state.req_id},
+        ),
+        post_decode=lambda request_state: DiffusionOutput(output=f"decoded:{request_state.req_id}"),
+    )
+    runner.cache_manager = None
+    runner.state_cache = {"req-1": state}
+    runner.input_batch = input_batch
+
+    results = DiffusionModelRunner._update_states_after(
+        runner,
+        [state],
+        input_batch,
+        [True],
+        [None],
+    )
+
+    assert results[0].multimodal_output == {"req_id": "req-1"}
+    assert state.latents.tolist() == [[1.0, 1.0]]
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
+
+
 def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
@@ -165,40 +202,3 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
-
-
-def test_stepwise_cache_dit_logs_include_request_prompt_and_seed(monkeypatch):
-    class _Context:
-        def get_cached_steps(self):
-            return [4, 5, 7]
-
-        def get_cfg_cached_steps(self):
-            return [4, 5, 7]
-
-    runner = object.__new__(DiffusionModelRunner)
-    runner.od_config = SimpleNamespace(cache_backend="cache_dit")
-
-    request_state = DiffusionRequestState(
-        req_id="req-123",
-        sampling=SimpleNamespace(seed=321, num_inference_steps=50, generator=None),
-        prompts=["a playful corgi puppy chasing bubbles in a flower garden"],
-        cache_slot=CacheBackendSlot(
-            backend_name="cache_dit",
-            payload=({"transformer_blocks": _Context()},),
-        ),
-    )
-    request_state.timesteps = [0] * 50
-
-    log_messages = []
-
-    def _record_log(message, *args):
-        log_messages.append(message % args if args else message)
-
-    monkeypatch.setattr(model_runner_module.logger, "info", _record_log)
-    DiffusionModelRunner._log_cache_dit_stepwise_request_stats(runner, request_state)
-
-    log_text = "\n".join(log_messages)
-    assert "req-123" in log_text
-    assert "seed=321" in log_text
-    assert "playful corgi puppy" in log_text
-    assert "skipped_step_ids=[4, 5, 7]" in log_text

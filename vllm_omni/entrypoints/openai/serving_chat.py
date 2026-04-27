@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import time
 import uuid
@@ -2080,7 +2081,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
             seed = extra_body.get("seed")
             negative_prompt = extra_body.get("negative_prompt")
-            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+            num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt")
 
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
@@ -2113,37 +2114,52 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "prompt": prompt,
                 "negative_prompt": negative_prompt,
             }
-            gen_params = OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_outputs_per_prompt=num_outputs_per_prompt,
-                seed=seed,
-            )
+            diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
+            default_params_list = getattr(diffusion_engine, "default_sampling_params_list", None) or []
+            if default_params_list:
+                gen_params_list = [
+                    params.clone() if hasattr(params, "clone") else copy.deepcopy(params)
+                    for params in default_params_list
+                ]
+            else:
+                gen_params_list = [OmniDiffusionSamplingParams()]
 
-            # Only override defaults when the user explicitly provides values
-            if num_inference_steps is not None:
-                gen_params.num_inference_steps = num_inference_steps
-            if guidance_scale is not None:
-                gen_params.guidance_scale = guidance_scale
-            if true_cfg_scale is not None:
-                gen_params.true_cfg_scale = true_cfg_scale
-            if num_frames is not None:
-                gen_params.num_frames = num_frames
-            if guidance_scale_2 is not None:
-                gen_params.guidance_scale_2 = guidance_scale_2
-            if layers is not None:
-                gen_params.layers = layers
-            if resolution is not None:
-                gen_params.resolution = resolution
+            # Only override defaults when the user explicitly provides values.
+            # Multi-stage diffusion engines require one params object per stage.
+            for gen_params in gen_params_list:
+                if height is not None:
+                    gen_params.height = height
+                if width is not None:
+                    gen_params.width = width
+                if num_outputs_per_prompt is not None:
+                    gen_params.num_outputs_per_prompt = num_outputs_per_prompt
+                if seed is not None:
+                    gen_params.seed = seed
+                if num_inference_steps is not None:
+                    gen_params.num_inference_steps = num_inference_steps
+                if guidance_scale is not None:
+                    gen_params.guidance_scale = guidance_scale
+                if true_cfg_scale is not None:
+                    gen_params.true_cfg_scale = true_cfg_scale
+                if num_frames is not None:
+                    gen_params.num_frames = num_frames
+                if guidance_scale_2 is not None:
+                    gen_params.guidance_scale_2 = guidance_scale_2
+                if layers is not None:
+                    gen_params.layers = layers
+                if resolution is not None:
+                    gen_params.resolution = resolution
 
             # Parse per-request LoRA.
             if lora_body and isinstance(lora_body, dict):
                 try:
                     lora_req, lora_scale = parse_lora_request(lora_body)
                     if lora_req is not None:
-                        gen_params.lora_request = lora_req
+                        for gen_params in gen_params_list:
+                            gen_params.lora_request = lora_req
                         if lora_scale is not None:
-                            gen_params.lora_scale = lora_scale
+                            for gen_params in gen_params_list:
+                                gen_params.lora_scale = lora_scale
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 
@@ -2170,11 +2186,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
 
             # Generate image
-            diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             result = None
             async for output in diffusion_engine.generate(
                 prompt=gen_prompt,
-                sampling_params_list=[gen_params],  # Pass as single-stage params
+                sampling_params_list=gen_params_list,
                 request_id=request_id,
             ):
                 result = output

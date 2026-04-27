@@ -22,8 +22,8 @@ from vllm.config import LoadConfig
 from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
 
-from vllm_omni.diffusion.cache.cache_manager import CacheManager
 from vllm_omni.diffusion.cache.cache_dit_backend import cache_summary
+from vllm_omni.diffusion.cache.cache_manager import CacheManager
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -462,14 +462,18 @@ class DiffusionModelRunner:
 
         for idx, (request_state, finished) in enumerate(zip(scheduled_states, finished_flags, strict=True)):
             if finished and results[idx] is None:
-                results[idx] = self.pipeline.post_decode(request_state)
+                post_intermediate_output = getattr(self.pipeline, "post_intermediate_output", None)
+                if getattr(self.pipeline, "produces_intermediate_stage_output", False) and callable(
+                    post_intermediate_output
+                ):
+                    results[idx] = post_intermediate_output(request_state)
+                else:
+                    results[idx] = self.pipeline.post_decode(request_state)
 
         for request_state, finished in zip(scheduled_states, finished_flags, strict=True):
             if not finished:
                 continue
 
-            if self.od_config.enable_cache_dit_summary:
-                self._log_cache_dit_stepwise_request_stats(request_state)
             if self.cache_manager is not None:
                 self.cache_manager.free(request_state)
             self.state_cache.pop(request_state.req_id, None)
@@ -535,7 +539,6 @@ class DiffusionModelRunner:
             cache_activated: bool = False
             try:
                 scheduled_states, new_req_ids = self._update_states(scheduler_output)
-                self._log_stepwise_batch(scheduler_output, scheduled_states, new_req_ids)
                 input_batch = self._prepare_inputs(scheduled_states, new_req_ids)
 
                 # NOTE: This runner-level `attn_metadata` is intentionally kept as an
