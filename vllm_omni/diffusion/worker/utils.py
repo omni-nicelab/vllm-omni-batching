@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +14,15 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
+
+@dataclass
+class CacheBackendSlot:
+    """Backend-owned resident cache state for one diffusion request."""
+
+    backend_name: str
+    resident_bytes: int = 0
+    payload: Any = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class DiffusionRequestState:
@@ -70,6 +80,7 @@ class DiffusionRequestState:
     # become part of the shared step-execution contract.
     # For example: Wan condition tensors / masks, or Bagel KV contexts.
     extra: dict[str, Any] = field(default_factory=dict)
+    cache_slot: CacheBackendSlot | None = None
 
     # ── Properties ──
 
@@ -109,8 +120,14 @@ class DiffusionRequestState:
         return self.step_index == 0 or self.timesteps is None
 
 
+class BaseRunnerOutput(ABC):
+    @abstractmethod
+    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
+        pass
+
+
 @dataclass
-class RunnerOutput:
+class RunnerOutput(BaseRunnerOutput):
     """Output of a single denoising step for a request.
 
     NOTE: `latents` may be None when returned through IPC to avoid
@@ -122,3 +139,34 @@ class RunnerOutput:
     step_index: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
+
+    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
+        return self if self.req_id == sched_req_id else None
+
+
+@dataclass
+class BatchRunnerOutput(BaseRunnerOutput):
+    runner_outputs: list[RunnerOutput]
+    _id_to_idx: dict[str, int] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._id_to_idx = {out.req_id: i for i, out in enumerate(self.runner_outputs)}
+
+    def __getitem__(self, req_id: str) -> RunnerOutput | None:
+        """access single RunnerOutput by req_id"""
+        idx = self._id_to_idx.get(req_id)
+        return self.runner_outputs[idx] if idx is not None else None
+
+    def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
+        return self[sched_req_id]
+
+    @property
+    def req_ids(self) -> list[str]:
+        return list(self._id_to_idx.keys())
+
+    def __len__(self) -> int:
+        return len(self.runner_outputs)
+
+    @classmethod
+    def from_list(cls, runner_output_list: list[RunnerOutput]) -> BatchRunnerOutput:
+        return cls(runner_outputs=runner_output_list)
