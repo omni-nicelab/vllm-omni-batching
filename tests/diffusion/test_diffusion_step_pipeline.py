@@ -452,6 +452,24 @@ class TestRunner:
         assert runner.pipeline.last_denoise_kwargs == {}
         assert runner.pipeline.last_scheduler_kwargs == {}
 
+    def test_logs_host_stepwise_timings_when_enabled(self, monkeypatch, caplog):
+        runner = _make_runner()
+        req = _make_step_request()
+        monkeypatch.setenv("VLLM_OMNI_LOG_STEPWISE_TIMING", "1")
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        with caplog.at_level("INFO"):
+            output = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+
+        assert output.finished is False
+        timing_logs = [record.message for record in caplog.records if "[StepBatchTiming][host][no-cuda-sync]" in record.message]
+        assert len(timing_logs) == 1
+        assert "prepare_inputs_ms=" in timing_logs[0]
+        assert "prepare_encode_ms=" in timing_logs[0]
+        assert "make_batch_ms=" in timing_logs[0]
+        assert "denoise_step_ms=" in timing_logs[0]
+        assert "finalize_ms=" in timing_logs[0]
+
     def test_supports_multi_request_step_batch(self, monkeypatch):
         runner = _make_runner()
         req_1 = _make_step_request()

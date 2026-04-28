@@ -1,0 +1,4 @@
+interface:
+  display_name: "BitDecode hdim96 Debug"
+  short_description: "Debug hdim96 BitDecoding Flash/CUTLASS e2e failures"
+  default_prompt: "Use this skill to debug or stabilize hdim96 BitDecoding Flash/CUTLASS tensor-core decode, ShapeOPT e2e NaN/inf failures, qpack/dequant layouts, and packed-prefix LSE issues."

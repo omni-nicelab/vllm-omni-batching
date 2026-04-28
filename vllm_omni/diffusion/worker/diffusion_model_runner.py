@@ -11,6 +11,7 @@ model-related operations.
 from __future__ import annotations
 
 import copy
+import os
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -297,6 +298,42 @@ class DiffusionModelRunner:
             return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         except Exception:
             return True
+
+    def _stepwise_timing_enabled(self) -> bool:
+        return bool(getattr(self.od_config, "enable_stepwise_timing", False)) or (
+            os.getenv("VLLM_OMNI_LOG_STEPWISE_TIMING", "0") == "1"
+        )
+
+    def _log_stepwise_timings(
+        self,
+        scheduler_output: DiffusionSchedulerOutput,
+        scheduled_states: list[DiffusionRequestState],
+        prepare_inputs_ms: float,
+        prepare_encode_ms: float,
+        make_batch_ms: float,
+        denoise_step_ms: float,
+        finalize_ms: float,
+    ) -> None:
+        if not self._stepwise_timing_enabled() or not scheduled_states or not self._should_log_on_this_rank():
+            return
+
+        req_ids = [state.req_id for state in scheduled_states if state.req_id != "dummy_req_id"]
+        if not req_ids:
+            return
+
+        logger.info(
+            "[StepBatchTiming][host][no-cuda-sync] scheduler_step=%d batch_size=%d req_ids=%s "
+            "prepare_inputs_ms=%.3f prepare_encode_ms=%.3f make_batch_ms=%.3f "
+            "denoise_step_ms=%.3f finalize_ms=%.3f",
+            scheduler_output.step_id,
+            len(req_ids),
+            req_ids,
+            prepare_inputs_ms,
+            prepare_encode_ms,
+            make_batch_ms,
+            denoise_step_ms,
+            finalize_ms,
+        )
 
     def _log_stepwise_batch(
         self,
@@ -643,6 +680,34 @@ class DiffusionModelRunner:
         self.input_batch = input_batch
         return input_batch
 
+    def _prepare_inputs_with_timing(
+        self,
+        states: list[DiffusionRequestState],
+        new_req_ids: set[str],
+    ) -> tuple[InputBatch, float, float]:
+        prepare_encode_ms = 0.0
+        make_batch_ms = 0.0
+
+        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+            with record_function("stepwise_prepare_encode"):
+                prepare_encode_start = time.perf_counter()
+                for state in states:
+                    self._ensure_sampling_generator(state)
+                    if state.req_id in new_req_ids:
+                        self.pipeline.prepare_encode(state)
+                prepare_encode_ms = (time.perf_counter() - prepare_encode_start) * 1000.0
+
+        with record_function("stepwise_make_batch"):
+            make_batch_start = time.perf_counter()
+            input_batch = InputBatch.make_batch(
+                states,
+                cached_batch=getattr(self, "input_batch", None),
+            )
+            make_batch_ms = (time.perf_counter() - make_batch_start) * 1000.0
+
+        self.input_batch = input_batch
+        return input_batch, prepare_encode_ms, make_batch_ms
+
     def _postprocess_step(
         self,
         scheduled_states: list[DiffusionRequestState],
@@ -777,10 +842,25 @@ class DiffusionModelRunner:
         with grad_context:
             scheduled_states: list[DiffusionRequestState] = []
             cache_activated: bool = False
+            collect_stepwise_timing = self._stepwise_timing_enabled()
+            prepare_inputs_ms = 0.0
+            prepare_encode_ms = 0.0
+            make_batch_ms = 0.0
+            denoise_step_ms = 0.0
+            finalize_ms = 0.0
             try:
                 scheduled_states, new_req_ids = self._update_states(scheduler_output)
                 self._log_stepwise_batch(scheduler_output, scheduled_states, new_req_ids)
-                input_batch = self._prepare_inputs(scheduled_states, new_req_ids)
+                if collect_stepwise_timing:
+                    with record_function("stepwise_prepare_inputs"):
+                        prepare_inputs_start = time.perf_counter()
+                        input_batch, prepare_encode_ms, make_batch_ms = self._prepare_inputs_with_timing(
+                            scheduled_states,
+                            new_req_ids,
+                        )
+                        prepare_inputs_ms = (time.perf_counter() - prepare_inputs_start) * 1000.0
+                else:
+                    input_batch = self._prepare_inputs(scheduled_states, new_req_ids)
 
                 # NOTE: This runner-level `attn_metadata` is intentionally kept as an
                 # extension hook for future heterogeneous batching. The naming may be
@@ -798,17 +878,48 @@ class DiffusionModelRunner:
                     omni_diffusion_config=self.od_config,
                     attn_metadata=attn_metadata,
                 ):
-                    noise_pred = self.pipeline.denoise_step(input_batch)
-                finished_flags, results = self._postprocess_step(
-                    scheduled_states,
-                    noise_pred,
-                )
-                results = self._update_states_after(
-                    scheduled_states,
-                    input_batch,
-                    finished_flags,
-                    results,
-                )
+                    if collect_stepwise_timing:
+                        with record_function("stepwise_denoise_step"):
+                            denoise_step_start = time.perf_counter()
+                            noise_pred = self.pipeline.denoise_step(input_batch)
+                            denoise_step_ms = (time.perf_counter() - denoise_step_start) * 1000.0
+                    else:
+                        noise_pred = self.pipeline.denoise_step(input_batch)
+                if collect_stepwise_timing:
+                    with record_function("stepwise_finalize"):
+                        finalize_start = time.perf_counter()
+                        finished_flags, results = self._postprocess_step(
+                            scheduled_states,
+                            noise_pred,
+                        )
+                        results = self._update_states_after(
+                            scheduled_states,
+                            input_batch,
+                            finished_flags,
+                            results,
+                        )
+                        finalize_ms = (time.perf_counter() - finalize_start) * 1000.0
+                else:
+                    finished_flags, results = self._postprocess_step(
+                        scheduled_states,
+                        noise_pred,
+                    )
+                    results = self._update_states_after(
+                        scheduled_states,
+                        input_batch,
+                        finished_flags,
+                        results,
+                    )
+                if collect_stepwise_timing:
+                    self._log_stepwise_timings(
+                        scheduler_output,
+                        scheduled_states,
+                        prepare_inputs_ms,
+                        prepare_encode_ms,
+                        make_batch_ms,
+                        denoise_step_ms,
+                        finalize_ms,
+                    )
                 return self._build_runner_output(
                     scheduled_states,
                     finished_flags,

@@ -1,0 +1,4 @@
+interface:
+  display_name: "PBR FP8 DMD Profiler"
+  short_description: "PBR FP8, DMD2, and profiling playbook"
+  default_prompt: "Use $pbr-fp8-dmd-profiler to modify pbr-material-edit FP8 inference, DMD2 logging, or torch profiler export paths."
