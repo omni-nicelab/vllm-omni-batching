@@ -1029,26 +1029,32 @@ class TestInitializeStagesRouting:
         assert mock_local_diff.call_args.args[1].stage_id == 0
         mock_remote_diff.assert_not_called()
 
-    def test_non_matching_diffusion_stage_uses_remote_diffusion_client(self, mocker: MockerFixture):
-        """A non-local diffusion stage should attach via the remote diffusion path."""
-        stage_cfgs = [_make_stage_cfg(0), _make_stage_cfg(1, stage_type="diffusion")]
+    @pytest.mark.parametrize("stage_type", ["diffusion", "submodule"])
+    def test_non_matching_request_output_stage_uses_remote_client(
+        self,
+        mocker: MockerFixture,
+        stage_type: str,
+    ):
+        """A non-local direct-output stage should attach via the remote path."""
+        stage_cfgs = [_make_stage_cfg(0), _make_stage_cfg(1, stage_type=stage_type)]
         engine = self._build_engine_skeleton(stage_cfgs, single_stage_mode=True, stage_id_filter=0)
         mock_oms = mocker.Mock(spec=OmniMasterServer)
-        remote_diffusion_client = mocker.Mock(stage_type="diffusion")
+        remote_client = mocker.Mock(stage_type=stage_type)
         finalized = (
-            [mocker.Mock(), remote_diffusion_client],
+            [mocker.Mock(), remote_client],
             [mocker.Mock(), mocker.Mock()],
             [
                 {"final_output": False, "final_output_type": None, "stage_type": "llm"},
-                {"final_output": False, "final_output_type": None, "stage_type": "diffusion"},
+                {"final_output": False, "final_output_type": None, "stage_type": stage_type},
             ],
         )
 
         mock_local_diff = mocker.patch.object(engine, "_launch_diffusion_stage")
+        mock_initialize_submodule = mocker.patch("vllm_omni.engine.async_omni_engine.initialize_submodule_stage")
         mock_remote_diff = mocker.patch.object(
             engine,
             "_create_remote_diffusion_stage",
-            return_value=remote_diffusion_client,
+            return_value=remote_client,
         )
         mocker.patch.object(engine, "_launch_llm_stage", return_value=_make_started_llm_stage(0))
         mocker.patch.object(engine, "_create_remote_llm_stage", return_value=_make_started_llm_stage(0))
@@ -1090,6 +1096,7 @@ class TestInitializeStagesRouting:
         engine._initialize_stages(stage_init_timeout=60)
 
         mock_local_diff.assert_not_called()
+        mock_initialize_submodule.assert_not_called()
         assert mock_remote_diff.call_count == 1
         assert mock_remote_diff.call_args.args[0].stage_id == 1
 

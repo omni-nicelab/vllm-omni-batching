@@ -756,13 +756,12 @@ class AsyncOmniEngine:
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
 
                     if metadata.stage_type in ("diffusion", "submodule"):
-                        is_remote_diffusion_stage = (
-                            metadata.stage_type == "diffusion"
-                            and self.single_stage_mode
+                        is_remote_request_output_stage = (
+                            self.single_stage_mode
                             and self._single_stage_id_filter is not None
                             and configured_stage_id != self._single_stage_id_filter
                         )
-                        if is_remote_diffusion_stage:
+                        if is_remote_request_output_stage:
                             assert self._omni_master_server is not None
                             stage_clients[stage_idx] = self._create_remote_diffusion_stage(
                                 metadata,
