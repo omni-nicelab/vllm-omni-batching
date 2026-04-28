@@ -696,9 +696,7 @@ class AsyncOmniEngine:
 
         async_chunk = self.async_chunk
         prompt_expand_func = None
-        llm_stage_count = sum(
-            1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") == "llm"
-        )
+        llm_stage_count = sum(1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") == "llm")
 
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)

@@ -131,9 +131,7 @@ class StageSubModuleClient:
                 if rpc_id is not None and rpc_id in self._pending_rpcs:
                     self._rpc_results[rpc_id] = {"error": True, "reason": error_msg}
                 elif req_id is not None:
-                    self._output_queue.put_nowait(
-                        {"type": "error", "request_id": req_id, "error": error_msg}
-                    )
+                    self._output_queue.put_nowait({"type": "error", "request_id": req_id, "error": error_msg})
 
     def set_engine_outputs(self, engine_outputs: Any) -> None:
         self.engine_outputs = engine_outputs
@@ -182,9 +180,7 @@ class StageSubModuleClient:
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
-        self._request_socket.send(
-            self._encoder.encode({"type": "abort", "request_ids": list(request_ids)})
-        )
+        self._request_socket.send(self._encoder.encode({"type": "abort", "request_ids": list(request_ids)}))
 
     async def collective_rpc_async(
         self,

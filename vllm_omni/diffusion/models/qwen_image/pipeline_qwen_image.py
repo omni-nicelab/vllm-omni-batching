@@ -335,9 +335,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         )
 
         self.vae_scale_factor = (
-            2 ** len(self.vae.temperal_downsample)
-            if self.vae is not None
-            else self._read_vae_scale_factor(model)
+            2 ** len(self.vae.temperal_downsample) if self.vae is not None else self._read_vae_scale_factor(model)
         )
         # QwenImage latents are turned into 2x2 patches and packed.
         # This means the latent width and height has to be divisible
@@ -972,9 +970,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         state.sampling.cfg_normalize = True
         state.extra["stage_height"] = int(payload["height"])
         state.extra["stage_width"] = int(payload["width"])
-        self._guidance_scale = (
-            float(state.guidance.flatten()[0].item()) if torch.is_tensor(state.guidance) else 1.0
-        )
+        self._guidance_scale = float(state.guidance.flatten()[0].item()) if torch.is_tensor(state.guidance) else 1.0
         self._attention_kwargs = {}
         self._current_timestep = None
         self._interrupt = False

@@ -27,8 +27,7 @@ def _read_mm(output: Any, stage_label: str, req_idx: int) -> dict[str, Any]:
     mm = getattr(output, "multimodal_output", None)
     if not mm or not isinstance(mm, dict):
         raise RuntimeError(
-            f"[qwen_image.{stage_label}] upstream req#{req_idx} is missing multimodal_output "
-            f"(got {type(mm).__name__})."
+            f"[qwen_image.{stage_label}] upstream req#{req_idx} is missing multimodal_output (got {type(mm).__name__})."
         )
     return mm
 
@@ -36,8 +35,7 @@ def _read_mm(output: Any, stage_label: str, req_idx: int) -> dict[str, Any]:
 def _require(mm: dict[str, Any], key: str, stage_label: str, req_idx: int) -> Any:
     if key not in mm or mm[key] is None:
         raise RuntimeError(
-            f"[qwen_image.{stage_label}] upstream req#{req_idx} missing required key "
-            f"{key!r}; have {sorted(mm.keys())}."
+            f"[qwen_image.{stage_label}] upstream req#{req_idx} missing required key {key!r}; have {sorted(mm.keys())}."
         )
     return mm[key]
 
