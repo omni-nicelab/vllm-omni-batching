@@ -1,0 +1,1040 @@
+diff --git a/.gitignore b/.gitignore
+index 3e6e4e5..d0812e4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,10 @@ dist
+ # Third-party links created by `setup.py develop`
+ deep_gemm/include/cute
+ deep_gemm/include/cutlass
++
++
++changes.patch*
++*.so
++*.nsys-rep
++
++.gitignore
+\ No newline at end of file
+diff --git a/csrc/apis/gemm.hpp b/csrc/apis/gemm.hpp
+index 8d06292..625d2f0 100644
+--- a/csrc/apis/gemm.hpp
++++ b/csrc/apis/gemm.hpp
+@@ -15,9 +15,12 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                         const std::pair<torch::Tensor, torch::Tensor>& b,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c,
+-                        std::optional<std::tuple<int, int, int>> recipe,
+-                        const std::string& compiled_dims,
+-                        const bool& disable_ue8m0_cast) {
++                        const std::optional<torch::Tensor>& bias,
++                        const bool& apply_gelu = false,
++                        std::optional<std::tuple<int, int, int>> recipe = std::nullopt,
++                        const std::string& compiled_dims = "nk",
++                        const bool& disable_ue8m0_cast = false,
++                        const bool& is_add = false) {
+     // Shape must be `[M, K] @ [N, K].T`
+     const auto& major_a = get_major_type_ab(a.first);
+     const auto& major_b = get_major_type_ab(b.first);
+@@ -35,15 +38,26 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+     const auto& [m_, n_] = get_shape<2>(d);
+     DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+     DG_HOST_ASSERT(n > 0 and k > 0);
+-    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn);
+-    DG_HOST_ASSERT(b.first.scalar_type() == torch::kFloat8_e4m3fn);
+-    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16 or d.scalar_type() == torch::kFloat);
++    
++    // Determine if INT8 based on tensor dtype
++    const bool is_int8 = (a.first.scalar_type() == torch::kInt8);
++    DG_HOST_ASSERT(a.first.scalar_type() == torch::kFloat8_e4m3fn or a.first.scalar_type() == torch::kInt8);
++    DG_HOST_ASSERT(b.first.scalar_type() == a.first.scalar_type());  // A and B must have same dtype
++    DG_HOST_ASSERT(d.scalar_type() == torch::kFloat16);
+ 
+     // Check C as well
+     if (c.has_value()) {
+         check_major_type_cd(c.value());
+-        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat);
+-        DG_HOST_ASSERT(c.value().scalar_type() == torch::kFloat);
++        DG_HOST_ASSERT(d.scalar_type() == torch::kFloat16);
++        DG_HOST_ASSERT(c.value().scalar_type() == torch::kFloat16);
++    }
++
++    // Check bias (only used by SM90 1d1d normal path; validate here when provided)
++    if (bias.has_value()) {
++        DG_HOST_ASSERT(bias.value().dim() == 1);
++        DG_HOST_ASSERT(static_cast<int64_t>(bias.value().size(0)) == n);
++        DG_HOST_ASSERT(bias.value().scalar_type() == d.scalar_type());
++        DG_HOST_ASSERT(bias.value().is_contiguous());
+     }
+ 
+     // Do nothing if the problem is empty
+@@ -54,20 +68,32 @@ static void fp8_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+     if (not recipe.has_value())
+         recipe = get_default_recipe(a.second.scalar_type(), b.second.scalar_type());
+     DG_HOST_ASSERT(recipe.value() == std::make_tuple(1, 1, 128) or recipe.value() == std::make_tuple(1, 128, 128));
+-    const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), std::nullopt,  true, disable_ue8m0_cast);
+-    const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), std::nullopt, false, disable_ue8m0_cast);
++    // const auto& sfa = layout::transform_sf_into_required_layout(a.second, m, k, recipe.value(), std::nullopt,  true, disable_ue8m0_cast, sf_chunk_size);
++    // const auto& sfb = layout::transform_sf_into_required_layout(b.second, n, k, recipe.value(), std::nullopt, false, disable_ue8m0_cast, sf_chunk_size);
++
++    const auto& sfa = a.second;
++    const auto& sfb = b.second;
++
++    DG_HOST_ASSERT(sfa.size(1) == m);
++    DG_HOST_ASSERT(sfb.size(1) == n);
++
++    // Compute sf_chunk_size from sfa shape: sfa is [k/chunksize, mn], so chunksize = k / sfa.size(0)
++    const int sf_chunk_size = k / sfa.size(0);
+ 
+     // Dispatch into different implements
+     const auto& arch_major = device_runtime->get_arch_major();
+     if (arch_major == 9 and sfa.scalar_type() == torch::kFloat) {
+         if (std::get<1>(recipe.value()) == 1) {
+-            sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
++            sm90_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, bias, d, m, n, k, major_a, major_b, compiled_dims, sf_chunk_size, is_add, apply_gelu, is_int8);
+         } else {
++            DG_HOST_ASSERT(!is_int8);  // INT8 is only supported with 1D1D kernel (recipe with M=1)
+             sm90_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+         }
+     } else if (arch_major == 10 and sfa.scalar_type() == torch::kInt) {
++        DG_HOST_ASSERT(!is_int8);  // INT8 is not yet supported on SM100
+         sm100_fp8_gemm_1d1d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+     } else if (arch_major == 10 and sfa.scalar_type() == torch::kFloat) {
++        DG_HOST_ASSERT(!is_int8);  // INT8 is not yet supported on SM100
+         sm100_fp8_gemm_1d2d(a.first, sfa, b.first, sfb, c, d, m, n, k, major_a, major_b, compiled_dims);
+     } else {
+         DG_HOST_UNREACHABLE("Unsupported architecture or scaling factor types");
+@@ -78,34 +104,43 @@ static void fp8_gemm_nn(const std::pair<torch::Tensor, torch::Tensor>& a,
+                         const std::pair<torch::Tensor, torch::Tensor>& b,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c,
+-                        const std::optional<std::tuple<int, int, int>>& recipe,
+-                        const std::string& compiled_dims,
+-                        const bool& disable_ue8m0_cast) {
++                        const std::optional<torch::Tensor>& bias,
++                        const bool& apply_gelu = false,
++                        const std::optional<std::tuple<int, int, int>>& recipe = std::nullopt,
++                        const std::string& compiled_dims = "nk",
++                        const bool& disable_ue8m0_cast = false,
++                        const bool& is_add = false) {
+     fp8_gemm_nt(a, {b.first.transpose(0, 1), b.second.transpose(0, 1)},
+-                d, c, recipe, compiled_dims, disable_ue8m0_cast);
++                d, c, bias, apply_gelu, recipe, compiled_dims, disable_ue8m0_cast, is_add);
+ }
+ 
+ static void fp8_gemm_tn(const std::pair<torch::Tensor, torch::Tensor>& a,
+                         const std::pair<torch::Tensor, torch::Tensor>& b,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c,
+-                        const std::optional<std::tuple<int, int, int>>& recipe,
+-                        const std::string& compiled_dims,
+-                        const bool& disable_ue8m0_cast) {
++                        const std::optional<torch::Tensor>& bias,
++                        const bool& apply_gelu = false,
++                        const std::optional<std::tuple<int, int, int>>& recipe = std::nullopt,
++                        const std::string& compiled_dims = "mn",
++                        const bool& disable_ue8m0_cast = false,
++                        const bool& is_add = false) {
+     fp8_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)},
+                 {b.first.transpose(0, 1), b.second.transpose(0, 1)},
+-                d, c, recipe, compiled_dims, disable_ue8m0_cast);
++                d, c, bias, apply_gelu, recipe, compiled_dims, disable_ue8m0_cast, is_add);
+ }
+ 
+ static void fp8_gemm_tt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                         const std::pair<torch::Tensor, torch::Tensor>& b,
+                         const torch::Tensor& d,
+                         const std::optional<torch::Tensor>& c,
+-                        const std::optional<std::tuple<int, int, int>>& recipe,
+-                        const std::string& compiled_dims,
+-                        const bool& disable_ue8m0_cast) {
++                        const std::optional<torch::Tensor>& bias,
++                        const bool& apply_gelu = false,
++                        const std::optional<std::tuple<int, int, int>>& recipe = std::nullopt,
++                        const std::string& compiled_dims = "mn",
++                        const bool& disable_ue8m0_cast = false,
++                        const bool& is_add = false) {
+     fp8_gemm_nt({a.first.transpose(0, 1), a.second.transpose(0, 1)}, b,
+-                d, c, recipe, compiled_dims, disable_ue8m0_cast);
++                d, c, bias, apply_gelu, recipe, compiled_dims, disable_ue8m0_cast, is_add);
+ }
+ 
+ static void m_grouped_fp8_gemm_nt_contiguous(const std::pair<torch::Tensor, torch::Tensor>& a,
+@@ -502,26 +537,30 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
+ 
+ static void register_apis(pybind11::module_& m) {
+     // FP8 GEMMs
+-     m.def("fp8_gemm_nt", &fp8_gemm_nt,
+-          py::arg("a"), py::arg("b"), py::arg("d"),
+-          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
++    m.def("fp8_gemm_nt", &fp8_gemm_nt,
++         py::arg("a"), py::arg("b"), py::arg("d"),
++         py::arg("c") = std::nullopt, py::arg("bias") = std::nullopt, py::arg("apply_gelu") = false, py::arg("recipe") = std::nullopt,
+           py::arg("compiled_dims") = "nk",
+-          py::arg("disable_ue8m0_cast") = false);
++          py::arg("disable_ue8m0_cast") = false,
++          py::arg("is_add") = false);
+     m.def("fp8_gemm_nn", &fp8_gemm_nn,
+-          py::arg("a"), py::arg("b"), py::arg("d"),
+-          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
++         py::arg("a"), py::arg("b"), py::arg("d"),
++         py::arg("c") = std::nullopt, py::arg("bias") = std::nullopt, py::arg("apply_gelu") = false, py::arg("recipe") = std::nullopt,
+           py::arg("compiled_dims") = "nk",
+-          py::arg("disable_ue8m0_cast") = false);
++          py::arg("disable_ue8m0_cast") = false,
++          py::arg("is_add") = false);
+     m.def("fp8_gemm_tn", &fp8_gemm_tn,
+-          py::arg("a"), py::arg("b"), py::arg("d"),
+-          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
++         py::arg("a"), py::arg("b"), py::arg("d"),
++         py::arg("c") = std::nullopt, py::arg("bias") = std::nullopt, py::arg("apply_gelu") = false, py::arg("recipe") = std::nullopt,
+           py::arg("compiled_dims") = "mn",
+-          py::arg("disable_ue8m0_cast") = false);
++          py::arg("disable_ue8m0_cast") = false,
++          py::arg("is_add") = false);
+     m.def("fp8_gemm_tt", &fp8_gemm_tt,
+-          py::arg("a"), py::arg("b"), py::arg("d"),
+-          py::arg("c") = std::nullopt, py::arg("recipe") = std::nullopt,
++         py::arg("a"), py::arg("b"), py::arg("d"),
++         py::arg("c") = std::nullopt, py::arg("bias") = std::nullopt, py::arg("apply_gelu") = false, py::arg("recipe") = std::nullopt,
+           py::arg("compiled_dims") = "mn",
+-          py::arg("disable_ue8m0_cast") = false);
++          py::arg("disable_ue8m0_cast") = false,
++          py::arg("is_add") = false);
+     m.def("m_grouped_fp8_gemm_nt_contiguous", &m_grouped_fp8_gemm_nt_contiguous,
+           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("m_indices"),
+           py::arg("recipe") = std::nullopt, py::arg("compiled_dims") = "nk",
+diff --git a/csrc/apis/layout.hpp b/csrc/apis/layout.hpp
+index a9cc0b1..6349b48 100644
+--- a/csrc/apis/layout.hpp
++++ b/csrc/apis/layout.hpp
+@@ -10,13 +10,14 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
+                                                        const std::tuple<int, int, int>& recipe,
+                                                        const std::optional<int>& num_groups,
+                                                        const bool& is_sfa,
+-                                                       const bool& disable_ue8m0_cast) {
++                                                       const bool& disable_ue8m0_cast,
++                                                       const int& sf_chunk_size = 32) {
+     const auto& gran_mn = is_sfa ? std::get<0>(recipe) : std::get<1>(recipe);
+     const auto& gran_k = std::get<2>(recipe);
+     const auto& arch_major = device_runtime->get_arch_major();
+ 
+-    // Pre-transform checks
+-    check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups);
++    // Pre-transform checks (use sf_chunk_size for checking SF dimensions)
++    check_sf_layout(sf, mn, k, gran_mn, sf_chunk_size, num_groups);
+ 
+     // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major
+     if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+@@ -30,7 +31,7 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
+ 
+     // (FP32, 128, 128) on SM90: no need to transform, check shape and contiguous
+     if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and (arch_major == 9 or disable_ue8m0_cast))
+-        return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, false, true, torch::kFloat);
++        return check_sf_layout(sf, mn, k, gran_mn, sf_chunk_size, num_groups, false, true, torch::kFloat);
+ 
+     // (FP32, 128, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major
+     if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and arch_major == 10) {
+@@ -41,7 +42,7 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
+ 
+     // (INT, 1, 128) on SM100: transform to TMA-aligned and MN-major
+     if (sf.scalar_type() == torch::kInt and gran_mn == 1 and gran_k == 128 and arch_major == 10)
+-        return check_sf_layout(sf, mn, k, gran_mn, gran_k, num_groups, true, false, torch::kInt);
++        return check_sf_layout(sf, mn, k, gran_mn, sf_chunk_size, num_groups, true, false, torch::kInt);
+ 
+     DG_HOST_UNREACHABLE("Unknown SF transformation");
+ }
+@@ -73,7 +74,7 @@ static void register_apis(pybind11::module_& m) {
+     m.def("transform_sf_into_required_layout", &transform_sf_into_required_layout,
+       py::arg("sf"), py::arg("mn"), py::arg("k"), py::arg("recipe"),
+       py::arg("num_groups") = std::nullopt, py::arg("is_sfa") = false,
+-      py::arg("disable_ue8m0_cast") = false);
++      py::arg("disable_ue8m0_cast") = false, py::arg("sf_chunk_size") = 32);
+ 
+     m.def("get_tma_aligned_size", &get_tma_aligned_size);
+     m.def("get_mk_alignment_for_contiguous_layout", &get_mk_alignment_for_contiguous_layout);
+diff --git a/csrc/jit_kernels/heuristics/common.hpp b/csrc/jit_kernels/heuristics/common.hpp
+index 455223b..11a3492 100644
+--- a/csrc/jit_kernels/heuristics/common.hpp
++++ b/csrc/jit_kernels/heuristics/common.hpp
+@@ -99,7 +99,8 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
+                                           const int& block_m, const int& block_n, const int& block_k,
+                                           const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                           const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+-                                          const int& num_stages, const MulticastConfig& multicast_config) {
++                                          const int& num_stages, const MulticastConfig& multicast_config,
++                                          const int& sf_chunk_size = 32) {
+     const int& ab_elem_size = static_cast<int>(c10::elementSize(ab_dtype));
+     const int& cd_elem_size = static_cast<int>(c10::elementSize(cd_dtype));
+ 
+@@ -117,8 +118,11 @@ static SharedMemoryConfig get_smem_config(const GemmType& gemm_type, const Kerne
+     const int& smem_b_per_stage = load_block_n * block_k * ab_elem_size;
+ 
+     // SF shared memory
+-    const auto& [smem_sfa_per_stage, smem_sfb_per_stage] =
++    const auto& [smem_sfa_per_stage_base, smem_sfb_per_stage_base] =
+         ArchSpec::get_sf_smem_size_per_stage(kernel_type, block_m, block_n, block_k, ab_dtype, cd_dtype);
++    const int sf_ratio = block_k / sf_chunk_size;
++    const int smem_sfa_per_stage = smem_sfa_per_stage_base * sf_ratio;
++    const int smem_sfb_per_stage = smem_sfb_per_stage_base * sf_ratio;
+     const int& smem_extra_sfb = ArchSpec::get_extra_sfb_smem_size(m, n, k, block_m, block_n, block_k);
+ 
+     // M-barriers and tensor memory pointers
+@@ -150,10 +154,11 @@ template <typename ArchSpec>
+ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& kernel_type,
+                                   const int& m, const int& n, const int& k, const int& num_groups,
+                                   const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+-                                  const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+-                                  const bool& with_accumulation, const int& num_sms) {
+-    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16);
+-    DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat);
++                                 const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
++                                 const bool& with_accumulation, const int& num_sms,
++                                 const int& sf_chunk_size = 32) {
++    DG_HOST_ASSERT(ab_dtype == torch::kFloat8_e4m3fn or ab_dtype == torch::kBFloat16 or ab_dtype == torch::kInt8);
++    DG_HOST_ASSERT(cd_dtype == torch::kBFloat16 or cd_dtype == torch::kFloat or cd_dtype == torch::kFloat16);
+ 
+     // Select M/N block sizes
+     auto block_ms = std::vector{64, 128, 256};
+@@ -243,7 +248,7 @@ static GemmConfig get_best_config(const GemmType& gemm_type, const KernelType& k
+                                                      best_block_m, best_block_n, block_k,
+                                                      major_a, major_b,
+                                                      ab_dtype, cd_dtype,
+-                                                     num_stages, best_multicast_config);
++                                                     num_stages, best_multicast_config, sf_chunk_size);
+         if (best_smem_config.smem_size <= smem_capacity) {
+             best_num_stages = num_stages;
+             break;
+diff --git a/csrc/jit_kernels/heuristics/sm90.hpp b/csrc/jit_kernels/heuristics/sm90.hpp
+index 133e2da..3b30853 100644
+--- a/csrc/jit_kernels/heuristics/sm90.hpp
++++ b/csrc/jit_kernels/heuristics/sm90.hpp
+@@ -15,7 +15,7 @@ struct SM90ArchSpec {
+         // Avoid bank conflicts for FP32 output
+         const auto& start = cd_dtype == torch::kFloat ? 8 : 16;
+         std::vector<int> candidates;
+-        for (int i = start; i <= 256; i += 16)
++        for (int i = start; i <= 128; i += 16)
+             candidates.push_back(i);
+         return candidates;
+     }
+@@ -45,6 +45,10 @@ struct SM90ArchSpec {
+                                     const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+                                     const at::ScalarType& ab_dtype, const at::ScalarType& cd_dtype,
+                                     const int& block_m, const int& block_n, const int& block_k) {
++        // Kernel1D1D on SM90 FP8/INT8 only supports BLOCK_M in {64, 128}
++        if (kernel_type == KernelType::Kernel1D1D && (ab_dtype == torch::kFloat8_e4m3fn || ab_dtype == torch::kInt8) && block_m == 256)
++            return false;
++
+         // SM90 FP32 output does not support `block_m == 256`
+         if (cd_dtype == at::kFloat and block_m == 256)
+             return false;
+@@ -75,7 +79,8 @@ struct SM90ArchSpec {
+                                     const int& num_stages,
+                                     const int& block_m, const int& block_n, const int& block_k) {
+         // Unrolling both stages and `num_former_iters` will cause large code size
+-        if (ab_dtype == torch::kFloat8_e4m3fn and block_k % block_n != 0 and block_k / std::gcd(block_n, block_k) <= 4)
++        // This applies to both FP8 and INT8
++        if ((ab_dtype == torch::kFloat8_e4m3fn || ab_dtype == torch::kInt8) and block_k % block_n != 0 and block_k / std::gcd(block_n, block_k) <= 4)
+             return num_stages <= 4;
+         return true;
+     }
+diff --git a/csrc/jit_kernels/impls/runtime_utils.hpp b/csrc/jit_kernels/impls/runtime_utils.hpp
+index 3dc5229..dcda358 100644
+--- a/csrc/jit_kernels/impls/runtime_utils.hpp
++++ b/csrc/jit_kernels/impls/runtime_utils.hpp
+@@ -48,6 +48,7 @@ static std::string to_string(const at::ScalarType& dtype) {
+     switch (dtype) {
+         case torch::kInt:           return "int";
+         case torch::kFloat:         return "float";
++        case torch::kFloat16:       return "half";
+         case torch::kBFloat16:      return "cutlass::bfloat16_t";
+         default: DG_HOST_UNREACHABLE("Unsupported dtype");
+     }
+@@ -61,8 +62,10 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType&
+     switch (dtype) {
+         case torch::kInt:           return CU_TENSOR_MAP_DATA_TYPE_INT32;
+         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
++        case torch::kFloat16:       return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
++        case torch::kInt8:          return CU_TENSOR_MAP_DATA_TYPE_UINT8;  // INT8 uses same TMA type as UINT8
+         default: DG_HOST_UNREACHABLE("Unsupported dtype");
+     }
+ }
+@@ -211,10 +214,12 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
+     // TODO: maybe swizzle SF as well
+     DG_HOST_ASSERT(swizzle_mode == 0);
+ 
++    int num_chunk_per_128 = 128 / block_k;
++
+     shape_mn = get_tma_aligned_size(shape_mn, static_cast<int>(t.element_size()));
+     return make_tma_2d_desc(t,
+                             shape_mn, ceil_div(shape_k, block_k * (t.scalar_type() == torch::kFloat ? 1 : 4)) * num_groups,
+-                            block_mn, 1,
++                            block_mn, num_chunk_per_128,
+                             shape_mn,
+                             swizzle_mode, swizzle_base,
+                             allow_tf32);
+diff --git a/csrc/jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp b/csrc/jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp
+index 2f54a35..a0ca603 100644
+--- a/csrc/jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp
++++ b/csrc/jit_kernels/impls/sm90_fp8_gemm_1d1d.hpp
+@@ -23,6 +23,7 @@ public:
+ 
+         void *gmem_a_ptr;
+         void *gmem_b_ptr;
++        void *gmem_bias_ptr;
+         void *grouped_layout;
+         void *tensor_map_buffer;
+         CUtensorMap tensor_map_a_base;
+@@ -30,6 +31,11 @@ public:
+         CUtensorMap tensor_map_sfa;
+         CUtensorMap tensor_map_sfb;
+         CUtensorMap tensor_map_d;
++        bool is_add;
++        bool has_bias;
++        bool apply_gelu;
++        bool is_int8;
++        int sf_chunk_size;
+     };
+ 
+     static std::string generate_impl(const Args& args) {
+@@ -44,21 +50,28 @@ static void __instantiate_kernel() {{
+         {},
+         {}, {}, {},
+         {},
++        {},
++        {}, {},
++        {}, {},
++        {},
+         {}, {},
+         {}, {},
+         {},
+-        {}, {}
++        {},
++        {}
+     >);
+ }};
+ )",
+         get_compiled_dim(args.m, 'm', args.compiled_dims), get_compiled_dim(args.n, 'n', args.compiled_dims), get_compiled_dim(args.k, 'k', args.compiled_dims),
+         args.num_groups,
+         args.gemm_config.block_m, args.gemm_config.block_n, args.gemm_config.block_k,
++        args.gemm_config.smem_config.swizzle_cd_mode,
+         args.gemm_config.num_stages,
+         args.gemm_config.thread_config.num_tma_threads, args.gemm_config.thread_config.num_math_threads,
+         args.gemm_config.multicast_config.num_multicast, args.gemm_config.multicast_config.is_multicast_on_a,
+         args.gemm_config.num_sms, to_string(args.gemm_config.gemm_type),
+-        to_string(args.gemm_config.cd_dtype));
++        to_string(args.gemm_config.cd_dtype), args.is_add, args.has_bias, args.apply_gelu, args.is_int8,
++        args.sf_chunk_size);
+     }
+ 
+     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+@@ -69,25 +82,32 @@ static void __instantiate_kernel() {{
+             args.m, args.n, args.k,
+             args.tensor_map_a_base, args.tensor_map_b_base,
+             args.tensor_map_sfa, args.tensor_map_sfb,
+-            args.tensor_map_d));
++            args.tensor_map_d,
++            args.gmem_bias_ptr));
+     }
+ };
+ 
+ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                const torch::Tensor& b, const torch::Tensor& sfb,
+                                const std::optional<torch::Tensor>& c,
++                               const std::optional<torch::Tensor>& bias,
+                                const torch::Tensor& d,
+                                const int& m, const int& n, const int& k,
+                                const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+-                               const std::string& compiled_dims) {
+-    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
++                               const std::string& compiled_dims,
++                               const int& sf_chunk_size = 32,
++                               const bool& is_add = false,
++                               const bool& apply_gelu = false,
++                               const bool& is_int8 = false) {
++    DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat16);
+     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+ 
++    const auto& ab_dtype = is_int8 ? torch::kInt8 : torch::kFloat8_e4m3fn;
+     const auto& config = get_best_config<SM90ArchSpec>(
+         GemmType::Normal, KernelType::Kernel1D1D,
+         m, n, k, 1, major_a, major_b,
+-        torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
+-        device_runtime->get_num_sms());
++        ab_dtype, d.scalar_type(), c.has_value(),
++        device_runtime->get_num_sms(), sf_chunk_size);
+ 
+     // Requires no TMA splits
+     DG_HOST_ASSERT(config.smem_config.swizzle_a_mode == config.block_k);
+@@ -102,14 +122,14 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                                 config.block_k, k, 1,
+                                                 config.smem_config.swizzle_b_mode);
+     const auto& tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
+-                                                  config.block_m, config.block_k, 1, 0);
++                                                  config.block_m, sf_chunk_size, 1, 0);
+     const auto& tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
+-                                                  config.block_n, config.block_k, 1, 0);
++                                                  config.block_n, sf_chunk_size, 1, 0);
+     const auto& tensor_map_d = make_tma_cd_desc(d, m, n,
+-                                                SM90ArchSpec::get_cd_store_block_m(config.block_m, true),
++                                                SM90ArchSpec::get_cd_store_block_m(config.block_m),
+                                                 SM90ArchSpec::get_cd_store_block_n(config.block_n),
+                                                 static_cast<int>(d.stride(-2)), 1,
+-                                                0);
++                                                config.smem_config.swizzle_cd_mode);
+ 
+     // Launch
+     const SM90FP8Gemm1D1DRuntime::Args& args = {
+@@ -122,6 +142,7 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+                                   config.multicast_config.num_multicast),
+         .gmem_a_ptr = nullptr,
+         .gmem_b_ptr = nullptr,
++        .gmem_bias_ptr = bias.has_value() ? bias.value().data_ptr() : nullptr,
+         .grouped_layout = nullptr,
+         .tensor_map_buffer = nullptr,
+         .tensor_map_a_base = tensor_map_a,
+@@ -129,9 +150,14 @@ static void sm90_fp8_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+         .tensor_map_sfa = tensor_map_sfa,
+         .tensor_map_sfb = tensor_map_sfb,
+         .tensor_map_d = tensor_map_d,
++        .is_add = is_add,
++        .has_bias = bias.has_value(),
++        .apply_gelu = apply_gelu,
++        .is_int8 = is_int8,
++        .sf_chunk_size = sf_chunk_size,
+     };
+     const auto& code = SM90FP8Gemm1D1DRuntime::generate(args);
+-    const auto& runtime = compiler->build("sm90_fp8_gemm_1d1d", code);
++    const auto& runtime = compiler->build(is_int8 ? "sm90_int8_gemm_1d1d" : "sm90_fp8_gemm_1d1d", code);
+ 
+     SM90FP8Gemm1D1DRuntime::launch(runtime, args);
+ }
+@@ -144,17 +170,19 @@ static void sm90_fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Te
+                                          const std::vector<int>& ks, const torch::Tensor& ks_tensor,
+                                          const torch::Tensor& tensor_map_buffer,
+                                          const cute::UMMA::Major& major_a, const cute::UMMA::Major& major_b,
+-                                         const std::string& compiled_dims) {
++                                         const std::string& compiled_dims,
++                                         const bool& is_int8 = false) {
+     DG_HOST_ASSERT(c.has_value() and d.scalar_type() == torch::kFloat);
+     DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+ 
+     // Get config using max K for better performance
+     const auto& num_groups = static_cast<int>(ks.size());
+     const auto& max_k = *std::max_element(ks.begin(), ks.end());
++    const auto& ab_dtype = is_int8 ? torch::kInt8 : torch::kFloat8_e4m3fn;
+     const auto& config = get_best_config<SM90ArchSpec>(
+         GemmType::KGroupedContiguous, KernelType::Kernel1D1D,
+         m, n, max_k, num_groups, major_a, major_b,
+-        torch::kFloat8_e4m3fn, d.scalar_type(), c.has_value(),
++        ab_dtype, d.scalar_type(), c.has_value(),
+         device_runtime->get_num_sms());
+ 
+     // Requires no TMA splits
+@@ -197,6 +225,7 @@ static void sm90_fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Te
+                                   config.multicast_config.num_multicast),
+         .gmem_a_ptr = a.data_ptr(),
+         .gmem_b_ptr = b.data_ptr(),
++        .gmem_bias_ptr = nullptr,
+         .grouped_layout = ks_tensor.data_ptr(),
+         .tensor_map_buffer = tensor_map_buffer.data_ptr(),
+         .tensor_map_a_base = tensor_map_a_base,
+@@ -204,9 +233,14 @@ static void sm90_fp8_k_grouped_gemm_1d1d(const torch::Tensor& a, const torch::Te
+         .tensor_map_sfa = tensor_map_sfa,
+         .tensor_map_sfb = tensor_map_sfb,
+         .tensor_map_d = tensor_map_d,
++        .is_add = false,
++        .has_bias = false,
++        .apply_gelu = false,
++        .is_int8 = is_int8,
++        .sf_chunk_size = config.block_k,
+     };
+     const auto& code = SM90FP8Gemm1D1DRuntime::generate(args);
+-    const auto& runtime = compiler->build("sm90_fp8_gemm_1d1d", code);
++    const auto& runtime = compiler->build(is_int8 ? "sm90_int8_gemm_1d1d" : "sm90_fp8_gemm_1d1d", code);
+ 
+     SM90FP8Gemm1D1DRuntime::launch(runtime, args);
+ }
+diff --git a/csrc/utils/layout.hpp b/csrc/utils/layout.hpp
+index 47d46c4..5b2dff3 100644
+--- a/csrc/utils/layout.hpp
++++ b/csrc/utils/layout.hpp
+@@ -75,8 +75,8 @@ static torch::Tensor check_sf_layout(const torch::Tensor& sf,
+     DG_HOST_ASSERT(sf.dim() == static_cast<int>(num_groups.has_value()) + 2);
+     if (num_groups.has_value())
+         DG_HOST_ASSERT(sf.size(-3) == num_groups.value());
+-    DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
+-    DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4)));
++    // DG_HOST_ASSERT(sf.size(-2) == ceil_div(mn, gran_mn));
++    // DG_HOST_ASSERT(sf.size(-1) == ceil_div(k, gran_k * (sf_dtype == torch::kFloat ? 1 : 4)));
+ 
+     // TMA stride checks: TMA aligned and MN-major
+     if (tma_stride_check) {
+diff --git a/deep_gemm/include/deep_gemm/common/sm90_utils.cuh b/deep_gemm/include/deep_gemm/common/sm90_utils.cuh
+index d910a2d..5353bb8 100644
+--- a/deep_gemm/include/deep_gemm/common/sm90_utils.cuh
++++ b/deep_gemm/include/deep_gemm/common/sm90_utils.cuh
+@@ -93,6 +93,26 @@ struct BF16MMA {
+     static constexpr int kNumAccum = M * N / 128;
+ };
+ 
++template <int N_, typename MMA>
++struct INT8MMA {
++
++    // CUTLASS MMA::fma uses uint32_t& for int32 accumulator (PTX register representation)
++    template <size_t ...Idx>
++    __forceinline__ __device__ static void call_fma_impl(uint64_t const& desc_a, uint64_t const& desc_b, uint32_t* d, bool scale_d, cute::index_sequence<Idx...>) {
++        using namespace cute::SM90::GMMA;
++        MMA::fma(desc_a, desc_b, d[Idx]..., (scale_d ? ScaleOut::One : ScaleOut::Zero));
++    }
++
++    __forceinline__ __device__ static void wgmma(uint64_t const& desc_a, uint64_t const& desc_b, uint32_t* d, bool scale_d) {
++        call_fma_impl(desc_a, desc_b, d, scale_d, cute::make_index_sequence<N_/2>{});
++    }
++
++    static constexpr int M = 64;
++    static constexpr int N = N_;
++    static constexpr int K = 32;
++    static constexpr int kNumAccum = M * N / 128;
++};
++
+ template <int N>
+ struct BF16MMASelector {
+ 
+@@ -139,6 +159,52 @@ struct BF16MMASelector {
+     using type = decltype(select_type());
+ };
+ 
++template <int N>
++struct INT8MMASelector {
++
++    static constexpr auto select_mma() {
++        using namespace cute::SM90::GMMA;
++        if constexpr (N == 8) return MMA_64x8x32_S32S8S8_SS_TN();
++        if constexpr (N == 16) return MMA_64x16x32_S32S8S8_SS_TN();
++        if constexpr (N == 24) return MMA_64x24x32_S32S8S8_SS_TN();
++        if constexpr (N == 32) return MMA_64x32x32_S32S8S8_SS_TN();
++        if constexpr (N == 40) return MMA_64x48x32_S32S8S8_SS_TN();  // fallback to 48 for N=40
++        if constexpr (N == 48) return MMA_64x48x32_S32S8S8_SS_TN();
++        if constexpr (N == 56) return MMA_64x64x32_S32S8S8_SS_TN();  // fallback to 64 for N=56
++        if constexpr (N == 64) return MMA_64x64x32_S32S8S8_SS_TN();
++        if constexpr (N == 72) return MMA_64x80x32_S32S8S8_SS_TN();  // fallback to 80 for N=72
++        if constexpr (N == 80) return MMA_64x80x32_S32S8S8_SS_TN();
++        if constexpr (N == 88) return MMA_64x96x32_S32S8S8_SS_TN();  // fallback to 96 for N=88
++        if constexpr (N == 96) return MMA_64x96x32_S32S8S8_SS_TN();
++        if constexpr (N == 104) return MMA_64x112x32_S32S8S8_SS_TN();  // fallback to 112 for N=104
++        if constexpr (N == 112) return MMA_64x112x32_S32S8S8_SS_TN();
++        if constexpr (N == 120) return MMA_64x128x32_S32S8S8_SS_TN();  // fallback to 128 for N=120
++        if constexpr (N == 128) return MMA_64x128x32_S32S8S8_SS_TN();
++        if constexpr (N == 136) return MMA_64x144x32_S32S8S8_SS_TN();  // fallback to 144 for N=136
++        if constexpr (N == 144) return MMA_64x144x32_S32S8S8_SS_TN();
++        if constexpr (N == 152) return MMA_64x160x32_S32S8S8_SS_TN();  // fallback to 160 for N=152
++        if constexpr (N == 160) return MMA_64x160x32_S32S8S8_SS_TN();
++        if constexpr (N == 168) return MMA_64x176x32_S32S8S8_SS_TN();  // fallback to 176 for N=168
++        if constexpr (N == 176) return MMA_64x176x32_S32S8S8_SS_TN();
++        if constexpr (N == 184) return MMA_64x192x32_S32S8S8_SS_TN();  // fallback to 192 for N=184
++        if constexpr (N == 192) return MMA_64x192x32_S32S8S8_SS_TN();
++        if constexpr (N == 200) return MMA_64x208x32_S32S8S8_SS_TN();  // fallback to 208 for N=200
++        if constexpr (N == 208) return MMA_64x208x32_S32S8S8_SS_TN();
++        if constexpr (N == 216) return MMA_64x224x32_S32S8S8_SS_TN();  // fallback to 224 for N=216
++        if constexpr (N == 224) return MMA_64x224x32_S32S8S8_SS_TN();
++        if constexpr (N == 232) return MMA_64x240x32_S32S8S8_SS_TN();  // fallback to 240 for N=232
++        if constexpr (N == 240) return MMA_64x240x32_S32S8S8_SS_TN();
++        if constexpr (N == 248) return MMA_64x256x32_S32S8S8_SS_TN();  // fallback to 256 for N=248
++        if constexpr (N == 256) return MMA_64x256x32_S32S8S8_SS_TN();
++    }
++
++    static constexpr auto select_type() {
++        return INT8MMA<N, decltype(select_mma())>();
++    }
++
++    using type = decltype(select_type());
++};
++
+ 
+ template <typename dtype_t>
+ struct SM90_U32x2_STSM_N {
+@@ -180,6 +246,10 @@ __forceinline__ __device__ void warpgroup_fence_operand(float& reg) {
+     asm volatile("" : "+f"(reg) :: "memory");
+ }
+ 
++__forceinline__ __device__ void warpgroup_fence_operand(uint32_t& reg) {
++    asm volatile("" : "+r"(reg) :: "memory");
++}
++
+ template <int N>
+ __forceinline__ __device__ void warpgroup_wait() {
+     DG_STATIC_ASSERT(N >= 0 and N <= 7, "WGMMA wait: N must be in range [0, 7]");
+diff --git a/deep_gemm/include/deep_gemm/common/utils.cuh b/deep_gemm/include/deep_gemm/common/utils.cuh
+index 0b7ff11..183720a 100644
+--- a/deep_gemm/include/deep_gemm/common/utils.cuh
++++ b/deep_gemm/include/deep_gemm/common/utils.cuh
+@@ -136,6 +136,10 @@ __device__ __forceinline__ void st_shared(const float2* ptr, float2 val) {
+     asm volatile("st.shared.v2.f32 [%0], {%1, %2};" :: "l"(ptr), "f"(val.x), "f"(val.y));
+ }
+ 
++__device__ __forceinline__ void st_shared(const half2* ptr, half2 val) {
++    asm volatile("st.shared.u32 [%0], %1;" :: "l"(ptr), "r"(*reinterpret_cast<uint32_t*>(&val)));
++}
++
+ __device__ __forceinline__ void st_shared(const uint32_t* ptr, uint32_t val) {
+     asm volatile("st.shared.u32 [%0], %1;" :: "l"(ptr), "r"(val));
+ }
+diff --git a/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh b/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh
+index 4c57cbe..3a77215 100644
+--- a/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d1d.cuh
+@@ -3,8 +3,11 @@
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wunknown-attributes"
+ 
++#include <type_traits>
++
+ #include <cutlass/arch/barrier.h>
+ #include <cutlass/arch/reg_reconfig.h>
++#include <cutlass/epilogue/thread/activation.h>
+ 
+ #include <cute/arch/cluster_sm90.hpp>
+ #include <cute/arch/copy_sm90_desc.hpp>
+@@ -21,13 +24,16 @@ using namespace deep_gemm::sm90;
+ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+           uint32_t kNumGroups,
+           uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
++          uint32_t kSwizzleDMode,
+           uint32_t kNumStages,
+           uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+           uint32_t kNumTMAMulticast, bool kIsTMAMulticastOnA,
+           uint32_t kNumSMs,
+-          GemmType kGemmType, typename cd_dtype_t>
++          GemmType kGemmType, typename cd_dtype_t, bool kIsAdd, bool kHasBias, bool kApplyGelu,
++          bool kIsInt8 = false, int kSfChunkSize = 64>
+ __global__ __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+-sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
++sm90_fp8_gemm_1d1d_impl(std::conditional_t<kIsInt8, int8_t, __nv_fp8_e4m3>* gmem_a_ptr,
++                        std::conditional_t<kIsInt8, int8_t, __nv_fp8_e4m3>* gmem_b_ptr,
+                         int* grouped_layout,
+                         cute::TmaDescriptor* tensor_map_buffer,
+                         uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+@@ -35,17 +41,23 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                         const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
+-                        const __grid_constant__ cute::TmaDescriptor tensor_map_d) {
++                        const __grid_constant__ cute::TmaDescriptor tensor_map_d,
++                        const cd_dtype_t* gmem_bias_ptr) {
+ #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
+     // Scaling checks
+     DG_STATIC_ASSERT(kNumTMAThreads == 128 and kNumMathThreads % 128 == 0, "Invalid Threads");
+-    DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
+-    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>, "Invalid C/D data dtype");
++    DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8/INT8 scaling");
++    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, half>, "Invalid C/D data dtype");
+     DG_STATIC_ASSERT(kGemmType == GemmType::Normal or kGemmType == GemmType::KGroupedContiguous, "Invalid GEMM type");
+ 
+-    // Types
+-    using WGMMA = typename FP8MMASelector<BLOCK_N>::type;
++    // Types - select between FP8 and INT8 MMA
++    using WGMMA = std::conditional_t<kIsInt8, 
++                                     typename INT8MMASelector<BLOCK_N>::type,
++                                     typename FP8MMASelector<BLOCK_N>::type>;
+     using Barrier = cutlass::arch::ClusterTransactionBarrier;
++    using ab_dtype_t = std::conditional_t<kIsInt8, int8_t, __nv_fp8_e4m3>;
++    // INT8 WGMMA uses uint32_t for accumulator (CUTLASS interface requirement, stores signed int32)
++    using accum_dtype_t = std::conditional_t<kIsInt8, uint32_t, float>;
+     DG_STATIC_ASSERT(BLOCK_M % WGMMA::M == 0, "Invalid block size");
+ 
+     // Overwrite shape constants if the compiler gives
+@@ -53,13 +65,14 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
+     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
+     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
+ 
++    static constexpr uint32_t NUM_CHUNK = BLOCK_K / kSfChunkSize;
+     // Shared memory
+     static constexpr uint32_t SMEM_TENSOR_MAP_SIZE = (kGemmType == GemmType::KGroupedContiguous ? sizeof(cute::TmaDescriptor) * 4 : 0);
+-    static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(float);
+-    static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
+-    static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(__nv_fp8_e4m3);
+-    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
+-    static constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = BLOCK_N * sizeof(float);
++    static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(half);
++    static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(ab_dtype_t);
++    static constexpr uint32_t SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(ab_dtype_t);
++    static constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float) * NUM_CHUNK;
++    static constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = BLOCK_N * sizeof(float) * NUM_CHUNK;
+     static constexpr uint32_t ALIGNED_SMEM_SFB_SIZE_PER_STAGE = constexpr_align(SMEM_SFB_SIZE_PER_STAGE, 128u);
+     DG_STATIC_ASSERT(SMEM_SFA_SIZE_PER_STAGE % 128 == 0, "Invalid TMA alignment");
+ 
+@@ -92,12 +105,12 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
+     auto gmem_tensor_map_b = PatternVisitor([=](const uint32_t& i) { return tensor_map_buffer + blockIdx.x * 4 + 2 + i; });
+ 
+     // Data on shared memory
+-    auto smem_d = reinterpret_cast<float*>(smem_buffer + SMEM_TENSOR_MAP_SIZE);
++    auto smem_d = reinterpret_cast<half*>(smem_buffer + SMEM_TENSOR_MAP_SIZE);
+     auto smem_a = PatternVisitor([&](const uint32_t& i) {
+-        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + (SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE)); 
++        return reinterpret_cast<ab_dtype_t*>(smem_buffer + (SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + i * SMEM_A_SIZE_PER_STAGE)); 
+     });
+     auto smem_b = PatternVisitor([&](const uint32_t& i) {
+-        return reinterpret_cast<__nv_fp8_e4m3*>(smem_buffer + (SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE));
++        return reinterpret_cast<ab_dtype_t*>(smem_buffer + (SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE));
+     });
+     constexpr auto SMEM_SF_OFFSET = SMEM_TENSOR_MAP_SIZE + SMEM_D_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE);
+     auto smem_sfa = PatternVisitor([&](const uint32_t& i) {
+@@ -217,8 +230,8 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
+                     auto& full_barrier = *full_barriers[stage_idx];
+                     const uint32_t& k_idx = k_block_idx * BLOCK_K;
+                     const uint32_t& sf_k_idx = scheduler.current_sf_k_cumsum + k_block_idx;
+-                    tma_copy(&tensor_map_sfa, reinterpret_cast<uint64_t*>(&full_barrier), smem_sfa[stage_idx], m_idx, sf_k_idx, num_tma_multicast_a);
+-                    tma_copy(&tensor_map_sfb, reinterpret_cast<uint64_t*>(&full_barrier), smem_sfb[stage_idx], n_idx, sf_k_idx, num_tma_multicast_b);
++                    tma_copy(&tensor_map_sfa, reinterpret_cast<uint64_t*>(&full_barrier), smem_sfa[stage_idx], m_idx, sf_k_idx * NUM_CHUNK, num_tma_multicast_a);
++                    tma_copy(&tensor_map_sfb, reinterpret_cast<uint64_t*>(&full_barrier), smem_sfb[stage_idx], n_idx, sf_k_idx * NUM_CHUNK, num_tma_multicast_b);
+                     tma_copy(current_tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[stage_idx], k_idx, m_idx, num_tma_multicast_a);
+                     tma_copy(current_tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier), smem_b[stage_idx], k_idx, n_idx, num_tma_multicast_b);
+                     full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SFA_SIZE_PER_STAGE + SMEM_SFB_SIZE_PER_STAGE);
+@@ -250,7 +263,8 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
+             const uint32_t& current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
+             const uint32_t& current_group_idx = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_group_idx : 0);
+             const uint32_t& num_k_blocks = ceil_div(current_shape_k, BLOCK_K);
+-            float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
++            accum_dtype_t accum[WGMMA::kNumAccum];
++            float final_accum[WGMMA::kNumAccum] = {0};
+             float2 scales_b[WGMMA::kNumAccum / 4];
+ 
+             // Empty barrier arrival
+@@ -263,75 +277,190 @@ sm90_fp8_gemm_1d1d_impl(__nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
+                 }
+             };
+ 
++            cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+             #pragma unroll kNumPipelineUnrolls
+             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; ++ k_block_idx) {
+                 // Wait TMA arrivals
+                 CUTE_TIE_DECL(get_pipeline(iter_idx ++), stage_idx, phase);
+                 full_barriers[stage_idx]->wait(phase);
+ 
+-                // Read A scales
+-                // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+-                auto scale_a_0 = ld_shared(smem_sfa[stage_idx] + r_0);
+-                auto scale_a_1 = ld_shared(smem_sfa[stage_idx] + r_1);
+-
+-                // Read B scales
++                int counter = 0;
+                 #pragma unroll
+-                for (int i = 0; i < WGMMA::kNumAccum / 4; ++i)
+-                    scales_b[i] = ld_shared(reinterpret_cast<float2*>(smem_sfb[stage_idx] + i * 8 + col_idx * 2));
++                for (uint32_t k = 0; k < NUM_CHUNK; ++ k) {
++                    // Read A scales
++                    // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
++                    auto scale_a_0 = ld_shared(smem_sfa[stage_idx] + r_0 + k * BLOCK_M);
++                    auto scale_a_1 = ld_shared(smem_sfa[stage_idx] + r_1 + k * BLOCK_M);
++
++                    // Read B scales
++                    #pragma unroll
++                    for (int i = 0; i < WGMMA::kNumAccum / 4; ++i)
++                        scales_b[i] = ld_shared(reinterpret_cast<float2*>(smem_sfb[stage_idx] + i * 8 + col_idx * 2 + k * BLOCK_N));
++
++                    // Commit WGMMA instructions
++                    #pragma unroll
++                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
++                        warpgroup_fence_operand(accum[i]);
++                    warpgroup_arrive();
++                    // #pragma unroll
++                    for (uint32_t i = 0; i < kSfChunkSize / WGMMA::K; ++ i) {
++                        auto desc_a = make_smem_desc(smem_a[stage_idx] + math_wg_idx * WGMMA::M * BLOCK_K + counter * WGMMA::K, 1);
++                        auto desc_b = make_smem_desc(smem_b[stage_idx] + counter * WGMMA::K, 1);
++                        WGMMA::wgmma(desc_a, desc_b, accum, i);
++                        counter += 1;
++                    }
++                    warpgroup_commit_batch();
++                    #pragma unroll
++                    for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
++                        warpgroup_fence_operand(accum[i]);
++                    warpgroup_wait<0>();
++
++                    // Notify barrier arrival
++                    if (k == NUM_CHUNK - 1)
++                        empty_barrier_arrive(stage_idx);
++
++                    // Promote with scales
++                    #pragma unroll
++                    for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
++                        const float &scale_b_0 = scales_b[i].x;
++                        const float &scale_b_1 = scales_b[i].y;
++                        // For INT8: reinterpret uint32_t as signed int32_t before converting to float
++                        // For FP8: accum is already float, static_cast is a no-op
++                        auto to_float = [](accum_dtype_t v) {
++                            if constexpr (kIsInt8) {
++                                return static_cast<float>(reinterpret_cast<int32_t&>(v));
++                            } else {
++                                return v;  // already float
++                            }
++                        };
++                        final_accum[i * 4 + 0] += scale_a_0 * scale_b_0 * to_float(accum[i * 4 + 0]);
++                        final_accum[i * 4 + 1] += scale_a_0 * scale_b_1 * to_float(accum[i * 4 + 1]);
++                        final_accum[i * 4 + 2] += scale_a_1 * scale_b_0 * to_float(accum[i * 4 + 2]);
++                        final_accum[i * 4 + 3] += scale_a_1 * scale_b_1 * to_float(accum[i * 4 + 3]);
++                    }
++                }
++            }
+ 
+-                // Commit WGMMA instructions
+-                #pragma unroll
+-                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+-                    warpgroup_fence_operand(accum[i]);
+-                warpgroup_arrive();
++            // Apply bias in registers (if provided) before writing to shared memory
++            if constexpr (kHasBias) {
++                const uint32_t base_n = n_block_idx * BLOCK_N;
+                 #pragma unroll
+-                for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+-                    auto desc_a = make_smem_desc(smem_a[stage_idx] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
+-                    auto desc_b = make_smem_desc(smem_b[stage_idx] + k * WGMMA::K, 1);
+-                    WGMMA::wgmma(desc_a, desc_b, accum, k);
++                for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++i) {
++                    const uint32_t c0 = base_n + col_idx * 2 + i * 8;
++                    const half2& h2 = *reinterpret_cast<const half2*>(gmem_bias_ptr + c0);
++                    const float2 bf = __half22float2(h2);
++                    final_accum[i * 4 + 0] += bf.x;
++                    final_accum[i * 4 + 1] += bf.y;
++                    final_accum[i * 4 + 2] += bf.x;
++                    final_accum[i * 4 + 3] += bf.y;
+                 }
+-                warpgroup_commit_batch();
+-                #pragma unroll
+-                for (uint32_t i = 0; i < WGMMA::kNumAccum; ++ i)
+-                    warpgroup_fence_operand(accum[i]);
+-                warpgroup_wait<0>();
+-
+-                // Notify barrier arrival
+-                empty_barrier_arrive(stage_idx);
++            }
+ 
+-                // Promote with scales
++            // Optional GELU on final_accum (after bias)
++            if constexpr (kApplyGelu) {
++                using cutlass::Array;
++                using cutlass::epilogue::thread::GELU_taylor;
++                GELU_taylor<Array<float, 4>> gelu_vec;
+                 #pragma unroll
+                 for (uint32_t i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+-                    const float &scale_b_0 = scales_b[i].x;
+-                    const float &scale_b_1 = scales_b[i].y;
+-                    final_accum[i * 4 + 0] += scale_a_0 * scale_b_0 * accum[i * 4 + 0];
+-                    final_accum[i * 4 + 1] += scale_a_0 * scale_b_1 * accum[i * 4 + 1];
+-                    final_accum[i * 4 + 2] += scale_a_1 * scale_b_0 * accum[i * 4 + 2];
+-                    final_accum[i * 4 + 3] += scale_a_1 * scale_b_1 * accum[i * 4 + 3];
++                    Array<float, 4> &x = *reinterpret_cast<Array<float, 4>*>(final_accum + i * 4);
++                    x = gelu_vec(x);
+                 }
+             }
+ 
++            // TMA checks
++            constexpr uint32_t kNumElemBytes = sizeof(cd_dtype_t);
++            constexpr uint32_t TMA_D_BLOCK_N = kSwizzleDMode == 0 ? BLOCK_N : (kSwizzleDMode / kNumElemBytes);
++            constexpr uint32_t WGMMA_M_PER_WARP = WGMMA::M / 4;
++            DG_STATIC_ASSERT(BLOCK_M % 8 == 0, "Invalid swizzling atom");
++            DG_STATIC_ASSERT(BLOCK_N % TMA_D_BLOCK_N == 0 and BLOCK_N / TMA_D_BLOCK_N <= 32,
++                            "Unaligned TMA store or too many TMA store instructions");
++            DG_STATIC_ASSERT(TMA_D_BLOCK_N % 8 == 0, "Invalid TMA block N");
++
+             // Flush previous stores
+-            if (warp_idx % 4 == 0 and cute::elect_one_sync())
++            if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N)
+                 cute::tma_store_wait<0>();
+-            cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
++            cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+ 
+             // Store to D shared memory
+-            const auto& smem_d_0 = reinterpret_cast<float2*>(smem_d + r_0 * BLOCK_N + col_idx * 2);
+-            const auto& smem_d_1 = reinterpret_cast<float2*>(smem_d + r_1 * BLOCK_N + col_idx * 2);
+-            #pragma unroll
+-            for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
+-                st_shared(smem_d_0 + i * 4, {final_accum[i * 4 + 0], final_accum[i * 4 + 1]});
+-                st_shared(smem_d_1 + i * 4, {final_accum[i * 4 + 2], final_accum[i * 4 + 3]});
++            if constexpr (kSwizzleDMode > 0) {
++                // Use STSM for swizzle mode
++                DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
++                #pragma unroll
++                for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
++                    // Calculate the swizzling atom offset and in-atom offset
++                    constexpr uint32_t kNumBankGroupBytes = 16;
++                    auto atom_offset = i / (TMA_D_BLOCK_N / 8), in_atom_offset = i % (TMA_D_BLOCK_N / 8);
++
++                    // Calculate the index of the bank group to be written in the atom
++                    auto bank_group_index = in_atom_offset + lane_idx * (kSwizzleDMode / kNumBankGroupBytes);
++
++                    // Reshape the atom in another view and swizzle
++                    //  - original: `(BLOCK_M, kSwizzleDMode / kNumBankGroupBytes)`
++                    //  - new: `(BLOCK_M * kSwizzleDMode / kNumBankGroupBytes / 8, 8)`
++                    constexpr bool kHasShortcut = (kSwizzleDMode / kNumBankGroupBytes) == 8;
++                    auto row = kHasShortcut ? (in_atom_offset / 8 + lane_idx) : (bank_group_index / 8);
++                    auto col = kHasShortcut ? (in_atom_offset) : (bank_group_index % 8);
++                    col ^= row % (kSwizzleDMode / 16);
++
++                    // Add back into the base pointer
++                    // NOTES: think twice before modifying this, as changes may affect the number of instructions
++                    uint8_t* smem_ptr = reinterpret_cast<uint8_t*>(smem_d) +       // Base pointer
++                        warp_idx * (WGMMA_M_PER_WARP * kSwizzleDMode) +            // Warp offset
++                        atom_offset * BLOCK_M * kSwizzleDMode +                    // Swizzle atom offset (constants)
++                        row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes; // In-atom offset
++
++                    // NOTES: only 16 lanes' addresses are used
++                    if constexpr (std::is_same_v<cd_dtype_t, half>) {
++                        SM90_U32x2_STSM_N<half2>::copy(
++                            __floats2half2_rn(final_accum[i * 4 + 0], final_accum[i * 4 + 1]),
++                            __floats2half2_rn(final_accum[i * 4 + 2], final_accum[i * 4 + 3]),
++                            smem_ptr
++                        );
++                    } else if constexpr (std::is_same_v<cd_dtype_t, nv_bfloat16>) {
++                        SM90_U32x2_STSM_N<nv_bfloat162>::copy(
++                            __float22bfloat162_rn({final_accum[i * 4 + 0], final_accum[i * 4 + 1]}),
++                            __float22bfloat162_rn({final_accum[i * 4 + 2], final_accum[i * 4 + 3]}),
++                            smem_ptr
++                        );
++                    }
++                }
++            } else {
++                // Use simple st.shared for non-swizzle mode (original implementation)
++                #pragma unroll
++                for (auto i = 0; i < WGMMA::kNumAccum / 4; ++ i) {
++                    if constexpr (std::is_same_v<cd_dtype_t, half>) {
++                        const auto& smem_d_0 = reinterpret_cast<half2*>(smem_d + r_0 * BLOCK_N + col_idx * 2);
++                        const auto& smem_d_1 = reinterpret_cast<half2*>(smem_d + r_1 * BLOCK_N + col_idx * 2);
++                        st_shared(smem_d_0 + i * 4, __floats2half2_rn(final_accum[i * 4 + 0], final_accum[i * 4 + 1]));
++                        st_shared(smem_d_1 + i * 4, __floats2half2_rn(final_accum[i * 4 + 2], final_accum[i * 4 + 3]));
++                    } else if constexpr (std::is_same_v<cd_dtype_t, nv_bfloat16>) {
++                        const auto& smem_d_0 = reinterpret_cast<nv_bfloat162*>(smem_d + r_0 * BLOCK_N + col_idx * 2);
++                        const auto& smem_d_1 = reinterpret_cast<nv_bfloat162*>(smem_d + r_1 * BLOCK_N + col_idx * 2);
++                        st_shared(smem_d_0 + i * 4, __float22bfloat162_rn({final_accum[i * 4 + 0], final_accum[i * 4 + 1]}));
++                        st_shared(smem_d_1 + i * 4, __float22bfloat162_rn({final_accum[i * 4 + 2], final_accum[i * 4 + 3]}));
++                    }
++                }
+             }
+             cute::tma_store_fence();
+-            cutlass::arch::NamedBarrier::sync(128, math_wg_idx);
++            cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
+ 
+             // Use TMA store to write back to global memory
+-            if (warp_idx % 4 == 0 and cute::elect_one_sync()) {
+-                cute::SM90_TMA_REDUCE_ADD_2D::copy(
+-                    &tensor_map_d, smem_d_0, n_block_idx * BLOCK_N,
+-                    current_group_idx * shape_m + m_block_idx * BLOCK_M + r_0);
++            DG_STATIC_ASSERT(kNumMathThreads >= BLOCK_N / TMA_D_BLOCK_N, "Too many TMA blocks");
++            if (threadIdx.x < BLOCK_N / TMA_D_BLOCK_N) {
++                auto in_block_n_offset = threadIdx.x * TMA_D_BLOCK_N;
++                auto smem_ptr = smem_d + in_block_n_offset * BLOCK_M;
++                if constexpr (kIsAdd) {
++                    cute::SM90_TMA_REDUCE_ADD_2D::copy(
++                        &tensor_map_d, smem_ptr,
++                        n_block_idx * BLOCK_N + in_block_n_offset,
++                        current_group_idx * shape_m + m_block_idx * BLOCK_M);
++                } else {
++                    cute::SM90_TMA_STORE_2D::copy(
++                        &tensor_map_d, smem_ptr,
++                        n_block_idx * BLOCK_N + in_block_n_offset,
++                        current_group_idx * shape_m + m_block_idx * BLOCK_M);
++                }
+                 cute::tma_store_arrive();
+             }
+             __syncwarp();

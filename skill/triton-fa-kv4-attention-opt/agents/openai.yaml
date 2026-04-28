@@ -1,0 +1,4 @@
+interface:
+  display_name: "Triton FA KV4 Optimization"
+  short_description: "Fused 4-bit KV attention tuning"
+  default_prompt: "Use $triton-fa-kv4-attention-opt to optimize a fused 4-bit KV dequant FlashAttention decode path and validate it against FA2."
