@@ -9,10 +9,12 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
     from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, WorkerProc
+    from vllm_omni.diffusion.worker.submodule_worker import SubModuleWorker
 
 __all__ = [
     "DiffusionModelRunner",
     "DiffusionWorker",
+    "SubModuleWorker",
     "WorkerProc",
 ]
 
@@ -29,4 +31,8 @@ def __getattr__(name: str) -> Any:
             "DiffusionWorker": DiffusionWorker,
             "WorkerProc": WorkerProc,
         }[name]
+    if name == "SubModuleWorker":
+        from vllm_omni.diffusion.worker.submodule_worker import SubModuleWorker
+
+        return SubModuleWorker
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

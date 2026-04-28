@@ -554,15 +554,16 @@ async def omni_init_app_state(
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await _get_vllm_config(engine_client)
 
-    # Detect if it's pure Diffusion mode (single stage and is Diffusion)
-    is_pure_diffusion = False
+    # Diffusion API mode covers both monolithic diffusion and multi-stage
+    # diffusion/submodule pipelines. These engines do not expose a vLLM
+    # model_config, so they must use the lightweight diffusion serving path.
+    is_diffusion_mode = False
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
-        if len(stage_configs) == 1:
-            stage_type = get_stage_type(stage_configs[0])
-            if stage_type == "diffusion":
-                is_pure_diffusion = True
-                logger.info("Detected pure diffusion mode (single diffusion stage)")
+        stage_types = {get_stage_type(stage_cfg) for stage_cfg in stage_configs}
+        if "diffusion" in stage_types and stage_types.issubset({"diffusion", "submodule"}):
+            is_diffusion_mode = True
+            logger.info("Detected diffusion API mode with stage types: %s", sorted(stage_types))
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
@@ -582,8 +583,8 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
 
-    # Pure Diffusion mode: use simplified initialization logic
-    if is_pure_diffusion:
+    # Diffusion mode: use simplified initialization logic
+    if is_diffusion_mode:
         model_name = served_model_names[0] if served_model_names else args.model
         state.vllm_config = None
         state.diffusion_engine = engine_client

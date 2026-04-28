@@ -14,6 +14,8 @@ from vllm_omni.inputs.data import OmniSamplingParams
 
 logger = init_logger(__name__)
 
+DIFFUSION_REQUEST_STAGE_TYPES = {"diffusion", "submodule"}
+
 
 def clone_sampling_params(params: OmniSamplingParams) -> OmniSamplingParams:
     """Clone request sampling params without sharing mutable request state."""
@@ -49,7 +51,7 @@ def resolve_stage_sampling_params(
     if stage_index < len(default_sampling_params_list):
         return clone_sampling_params(default_sampling_params_list[stage_index])
 
-    if get_stage_type(stage_cfg) == "diffusion" and diffusion_params is not None:
+    if get_stage_type(stage_cfg) in DIFFUSION_REQUEST_STAGE_TYPES and diffusion_params is not None:
         return clone_sampling_params(diffusion_params)
 
     return SamplingParams()
@@ -64,14 +66,18 @@ def build_stage_sampling_params_list(
 ) -> list[OmniSamplingParams]:
     """Build effective sampling params for a multi-stage request.
 
-    When ``replace_diffusion_params`` is set, diffusion stages receive cloned
-    request-level diffusion params. That preserves existing image and video
-    endpoint behavior where request params replace diffusion defaults without
-    sharing mutable state across stages.
+    When ``replace_diffusion_params`` is set, diffusion-shaped stages receive
+    cloned request-level diffusion params. That preserves existing image and
+    video endpoint behavior where request params replace diffusion defaults
+    without sharing mutable state across stages.
     """
     sampling_params_list: list[OmniSamplingParams] = []
     for idx, stage_cfg in enumerate(stage_configs):
-        if replace_diffusion_params and get_stage_type(stage_cfg) == "diffusion" and diffusion_params is not None:
+        if (
+            replace_diffusion_params
+            and get_stage_type(stage_cfg) in DIFFUSION_REQUEST_STAGE_TYPES
+            and diffusion_params is not None
+        ):
             sampling_params_list.append(clone_sampling_params(diffusion_params))
         else:
             sampling_params_list.append(

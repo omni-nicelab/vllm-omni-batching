@@ -9,6 +9,7 @@ This section contains design documents and architecture specifications for vLLM-
 ## Feature Design Documents
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
+- [Qwen-Image Disaggregated VAE](feature/qwen_image_disaggregated_vae.md)
 - [Ray-based Execution](feature/ray_based_execution.md)
 
 ## Module Design Documents

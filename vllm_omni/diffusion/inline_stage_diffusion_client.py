@@ -50,6 +50,7 @@ class InlineStageDiffusionClient:
         self.default_sampling_params = metadata.default_sampling_params
         self.custom_process_input_func = metadata.custom_process_input_func
         self.engine_input_source = metadata.engine_input_source
+        self.model_stage = metadata.model_stage
         self.batch_size = batch_size
 
         self._enrich_config()
@@ -59,6 +60,7 @@ class InlineStageDiffusionClient:
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
         self._tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = False
+        self.engine_outputs: Any = None
 
         logger.info(
             "[InlineStageDiffusionClient] Stage-%s initialized inline (batch_size=%d)",
@@ -73,6 +75,10 @@ class InlineStageDiffusionClient:
     # ------------------------------------------------------------------
     # Request processing
     # ------------------------------------------------------------------
+
+    def set_engine_outputs(self, engine_outputs: Any) -> None:
+        """Cache this stage's latest outputs for downstream input processors."""
+        self.engine_outputs = engine_outputs
 
     async def add_request_async(
         self,

@@ -2207,7 +2207,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_args["target_h"] = int(height)
                 extra_args["target_w"] = int(width)
 
-            if stage_type == "diffusion":
+            if stage_type in ("diffusion", "submodule"):
                 self._set_if_supported(
                     default_stage_params,
                     height=height,

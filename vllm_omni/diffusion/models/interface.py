@@ -40,7 +40,10 @@ class SupportsStepExecution(Protocol):
     Pipelines should split request-level ``forward()`` into:
     ``prepare_encode()`` (one-time request setup), ``denoise_step()``
     (one denoise forward), ``step_scheduler()`` (one scheduler update),
-    and ``post_decode()`` (final decode).
+    and ``post_decode()`` (final decode). A pipeline may additionally expose
+    ``produces_intermediate_stage_output`` and ``post_intermediate_output()``
+    when a stepwise stage intentionally forwards intermediate tensors to a
+    downstream stage instead of returning a final decoded result.
     """
 
     supports_step_execution: ClassVar[bool] = True

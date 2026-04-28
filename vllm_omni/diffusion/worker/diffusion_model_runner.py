@@ -218,6 +218,32 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
         )
 
+    def _build_completed_step_output(self, state: DiffusionRequestState) -> DiffusionOutput:
+        post_intermediate_output = getattr(self.pipeline, "post_intermediate_output", None)
+        if getattr(self.pipeline, "produces_intermediate_stage_output", False) and callable(post_intermediate_output):
+            return post_intermediate_output(state)
+        return self.pipeline.post_decode(state)
+
+    def _execute_step_contract_to_completion(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Run a step-execution pipeline to completion for non-step scheduling."""
+        request_ids = getattr(req, "request_ids", None) or [getattr(req, "request_id", None) or ""]
+        state = DiffusionRequestState(
+            req_id=request_ids[0],
+            sampling=copy.deepcopy(req.sampling_params),
+            prompts=req.prompts,
+        )
+        self.pipeline.prepare_encode(state)
+        if state.total_steps <= 0:
+            raise ValueError("Step-contract execution produced an empty timestep schedule.")
+
+        while not state.denoise_completed:
+            noise_pred = self.pipeline.denoise_step(state)
+            if noise_pred is None and getattr(self.pipeline, "interrupt", False):
+                return DiffusionOutput(error="denoise interrupted")
+            self.pipeline.step_scheduler(state, noise_pred)
+
+        return self._build_completed_step_output(state)
+
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -273,7 +299,14 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
-                    output = self.pipeline.forward(req)
+                    if getattr(self.pipeline, "stage", "diffusion") != "diffusion" and self.supports_step_mode():
+                        execute_stage_model = getattr(self.pipeline, "execute_stage_model", None)
+                        if callable(execute_stage_model):
+                            output = execute_stage_model(req)
+                        else:
+                            output = self._execute_step_contract_to_completion(req)
+                    else:
+                        output = self.pipeline.forward(req)
 
             if is_primary:
                 self._record_peak_memory(output)
@@ -385,7 +418,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     self.pipeline.step_scheduler(state, noise_pred)
                     finished = state.denoise_completed
                     if finished:
-                        result = self.pipeline.post_decode(state)
+                        result = self._build_completed_step_output(state)
                     else:
                         result = None
 

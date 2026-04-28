@@ -246,7 +246,7 @@ class StageMetadata:
     """Lightweight stage attributes extracted from stage_config."""
 
     stage_id: int
-    stage_type: Literal["llm", "diffusion"]
+    stage_type: Literal["llm", "diffusion", "submodule"]
     engine_output_type: str | None
     is_comprehension: bool
     requires_multimodal_data: bool
@@ -278,7 +278,7 @@ class StartedLlmStage:
 def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     """Pure data extraction from a stage_config object."""
     stage_id: int = stage_config.stage_id
-    stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
+    stage_type: Literal["llm", "diffusion", "submodule"] = getattr(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
 
     if current_omni_platform.is_rocm():
@@ -321,10 +321,11 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
-    if stage_type == "diffusion":
+    if stage_type in ("diffusion", "submodule"):
+        model_stage = getattr(engine_args, "model_stage", None)
         return StageMetadata(
             stage_id=stage_id,
-            stage_type="diffusion",
+            stage_type=stage_type,
             engine_output_type=None,
             is_comprehension=False,
             requires_multimodal_data=False,
@@ -333,7 +334,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             final_output_type=final_output_type,
             default_sampling_params=default_sampling_params,
             custom_process_input_func=custom_process_input_func,
-            model_stage=None,
+            model_stage=model_stage,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
@@ -409,7 +410,7 @@ def build_engine_args_dict(
     if engine_args_dict.get("async_chunk", False):
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
-    if stage_type != "diffusion":
+    if stage_type == "llm":
         resolve_worker_cls(engine_args_dict)
 
     # Check whether the stage's default_sampling_params defines extra_args.
@@ -735,6 +736,21 @@ def _shutdown_or_close_resource(resource: Any, resource_name: str, stage_id: int
             )
 
 
+def initialize_submodule_stage(
+    stage_id: int,
+    model: str,
+    stage_cfg: Any,
+    metadata: StageMetadata,
+    batch_size: int = 1,
+) -> Any:
+    """Build a lightweight submodule stage client."""
+    from vllm_omni.diffusion.stage_submodule_client import StageSubModuleClient
+
+    del stage_id
+    od_config = build_diffusion_config(model, stage_cfg, metadata)
+    return StageSubModuleClient(model, od_config, metadata, batch_size=batch_size)
+
+
 def close_started_llm_stage(started: StartedLlmStage) -> None:
     """Release resources owned by a launched stage that never attached."""
     if started.proc is not None:
@@ -770,7 +786,7 @@ def finalize_initialized_stages(
     ]
 
     if not isinstance(input_processor, InputProcessor):
-        has_llm_stage = any(metadata.get("stage_type") != "diffusion" for metadata in stage_metadata)
+        has_llm_stage = any(metadata.get("stage_type") == "llm" for metadata in stage_metadata)
         if has_llm_stage:
             raise RuntimeError("Failed to initialize stage-0 InputProcessor for LLM pipeline")
 

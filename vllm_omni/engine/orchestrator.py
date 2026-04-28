@@ -37,6 +37,8 @@ from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
+REQUEST_OUTPUT_STAGE_TYPES = {"diffusion", "submodule"}
+
 
 def build_engine_core_request_from_tokens(
     request_id: str,
@@ -187,6 +189,56 @@ class Orchestrator:
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
 
+    @staticmethod
+    def _is_request_output_stage(stage_client: Any) -> bool:
+        """Stages that return OmniRequestOutput directly instead of EngineCoreOutputs."""
+        return getattr(stage_client, "stage_type", None) in REQUEST_OUTPUT_STAGE_TYPES
+
+    @staticmethod
+    def _request_output_stage_nowait(stage_client: Any) -> OmniRequestOutput | dict[str, Any] | None:
+        if getattr(stage_client, "stage_type", None) == "submodule":
+            return stage_client.get_submodule_output_nowait()
+        return stage_client.get_diffusion_output_nowait()
+
+    @staticmethod
+    async def _submit_request_output_stage(
+        stage_client: Any,
+        request_id: str,
+        prompt: Any,
+        params: Any,
+        *,
+        kv_sender_info: dict[int, dict[str, Any]] | None = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {}
+        if getattr(stage_client, "stage_type", None) == "diffusion":
+            kwargs["kv_sender_info"] = kv_sender_info
+
+        if isinstance(prompt, list):
+            await stage_client.add_batch_request_async(request_id, prompt, params, **kwargs)
+        else:
+            await stage_client.add_request_async(request_id, prompt, params, **kwargs)
+
+    async def _emit_request_output_stage_error(
+        self,
+        stage_id: int,
+        request_id: str,
+        error: str,
+    ) -> None:
+        error_output = OmniRequestOutput.from_error(request_id, error)
+        await self.output_async_queue.put(
+            {
+                "type": "output",
+                "request_id": request_id,
+                "stage_id": stage_id,
+                "engine_outputs": error_output,
+                "metrics": None,
+                "finished": True,
+            }
+        )
+        self._pd_kv_params.pop(request_id, None)
+        self._cfg_tracker.cleanup_parent(request_id)
+        self.request_states.pop(request_id, None)
+
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
@@ -275,51 +327,49 @@ class Orchestrator:
                 if self._shutdown_event.is_set():
                     return
 
-                # 1) Diffusion stage: poll non-blocking queue
-                # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
-                # which is different from EngineCoreOutputs (LLM stages). We may want to unify
-                # the output format in the future to simplify the processing logic in Orchestrator.
+                # 1) Diffusion/submodule stages return OmniRequestOutput directly.
+                # TODO (Peiqi): unify this with EngineCoreOutputs once runtime
+                # stage output contracts converge.
                 stage_client = self.stage_clients[stage_id]
-                if stage_client.stage_type == "diffusion":
-                    output = stage_client.get_diffusion_output_nowait()
+                if self._is_request_output_stage(stage_client):
+                    output = self._request_output_stage_nowait(stage_client)
                     if output is not None:
                         idle = False
 
+                        if isinstance(output, dict):
+                            if output.get("type") == "error":
+                                await self._emit_request_output_stage_error(
+                                    stage_id,
+                                    str(output.get("request_id") or ""),
+                                    str(output.get("error") or "request-output stage failed"),
+                                )
+                            else:
+                                logger.warning(
+                                    "[Orchestrator] Dropping unknown direct stage output from stage-%s: %s",
+                                    stage_id,
+                                    output,
+                                )
+                            continue
+
                         if getattr(output, "error", None) is not None:
-                            await self.output_async_queue.put(
-                                {
-                                    "type": "output",
-                                    "request_id": output.request_id,
-                                    "stage_id": stage_id,
-                                    "engine_outputs": output,
-                                    "metrics": None,
-                                    "finished": True,
-                                }
+                            await self._emit_request_output_stage_error(
+                                stage_id,
+                                output.request_id,
+                                output.error,
                             )
-                            self.request_states.pop(output.request_id, None)
                             continue
 
                         req_state = self.request_states.get(output.request_id)
-                        if req_state is not None:
-                            if getattr(output, "error", None) is not None:
-                                parent_id = self._companion_to_parent.get(output.request_id, output.request_id)
-                                await self.output_async_queue.put(
-                                    {
-                                        "type": "error",
-                                        "request_id": parent_id,
-                                        "stage_id": stage_id,
-                                        "error": output.error,
-                                    }
-                                )
-                                role_map = self._companion_map.get(parent_id, {})
-                                for cid in role_map.values():
-                                    self.request_states.pop(cid, None)
-                                self._cleanup_companion_state(parent_id)
-                                self.request_states.pop(parent_id, None)
-                                continue
+                        if req_state is None:
+                            logger.warning(
+                                "[Orchestrator] Dropping direct output for unknown req %s at stage-%s",
+                                output.request_id,
+                                stage_id,
+                            )
+                            continue
 
-                            stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
-                            await self._route_output(stage_id, output, req_state, stage_metrics)
+                        stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
+                        await self._route_output(stage_id, output, req_state, stage_metrics)
                     continue
 
                 # 1) Poll raw outputs from the stage
@@ -675,36 +725,44 @@ class Orchestrator:
         params = req_state.sampling_params_list[next_stage_id]
         next_stage_resumable = is_streaming_session and not is_final_update
 
-        if next_client.stage_type == "diffusion":
+        if self._is_request_output_stage(next_client):
             self.stage_clients[stage_id].set_engine_outputs([output])
+            next_prompt = req_state.prompt
             if next_client.custom_process_input_func is not None:
-                _t_ar2d = _time.perf_counter()
-                diffusion_prompt = next_client.custom_process_input_func(
+                _t_stage_input = _time.perf_counter()
+                next_prompt = next_client.custom_process_input_func(
                     self.stage_clients,
                     next_client.engine_input_source,
                     req_state.prompt,
                     False,
                 )
-                _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
-                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
+                _dt_stage_input = (_time.perf_counter() - _t_stage_input) * 1000
+                timing_key = (
+                    "ar2diffusion_ms"
+                    if getattr(next_client, "stage_type", None) == "diffusion"
+                    else f"stage_{stage_id}_to_{next_stage_id}_input_ms"
+                )
+                req_state.pipeline_timings[timing_key] = _dt_stage_input
                 logger.info(
-                    "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
+                    "[Orchestrator] request-output input req=%s wall_time=%.3fms stage=%d->%d",
                     req_id,
-                    _dt_ar2d,
+                    _dt_stage_input,
                     stage_id,
                     next_stage_id,
                 )
-                if isinstance(diffusion_prompt, list):
-                    if not diffusion_prompt:
+                if isinstance(next_prompt, list):
+                    if not next_prompt:
+                        next_stage_type = getattr(next_client, "stage_type", "stage")
                         error_output = OmniRequestOutput.from_error(
                             req_id,
-                            f"Stage-{stage_id} produced no valid inputs for diffusion stage-{next_stage_id}",
+                            f"Stage-{stage_id} produced no valid inputs for {next_stage_type} stage-{next_stage_id}",
                         )
                         logger.warning(
-                            "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                            "[Orchestrator] req=%s stage=%d produced empty %s inputs for stage=%d; "
                             "routing terminal error output",
                             req_id,
                             stage_id,
+                            next_stage_type,
                             next_stage_id,
                         )
                         await self.output_async_queue.put(
@@ -721,28 +779,20 @@ class Orchestrator:
                         self._cfg_tracker.cleanup_parent(req_id)
                         self.request_states.pop(req_id, None)
                         return
-                    diffusion_prompt = diffusion_prompt[0]
-            else:
-                diffusion_prompt = req_state.prompt
+                    next_prompt = next_prompt[0]
 
-            params = self._cfg_tracker.attach_cfg_request_ids(req_id, params)
-
-            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [stage_id])
-            kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
-            if isinstance(diffusion_prompt, list):
-                await next_client.add_batch_request_async(
-                    req_id,
-                    diffusion_prompt,
-                    params,
-                    kv_sender_info=kv_sender_info,
-                )
-            else:
-                await next_client.add_request_async(
-                    req_id,
-                    diffusion_prompt,
-                    params,
-                    kv_sender_info=kv_sender_info,
-                )
+            kv_sender_info = None
+            if getattr(next_client, "stage_type", None) == "diffusion":
+                params = self._cfg_tracker.attach_cfg_request_ids(req_id, params)
+                source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [stage_id])
+                kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
+            await self._submit_request_output_stage(
+                next_client,
+                req_id,
+                next_prompt,
+                params,
+                kv_sender_info=kv_sender_info,
+            )
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 
@@ -931,15 +981,8 @@ class Orchestrator:
         # (pre-processed by AsyncOmniEngine.add_request, output processor
         # already registered there) - submit directly.
         stage_client = self.stage_clients[stage_id]
-        if stage_client.stage_type == "diffusion":
-            if isinstance(prompt, list):
-                await stage_client.add_batch_request_async(
-                    request_id,
-                    prompt,
-                    params,
-                )
-            else:
-                await stage_client.add_request_async(request_id, prompt, params)
+        if self._is_request_output_stage(stage_client):
+            await self._submit_request_output_stage(stage_client, request_id, prompt, params)
         else:
             await stage_client.add_request_async(request)
 
@@ -969,9 +1012,9 @@ class Orchestrator:
 
         req_state.stage_submit_ts[stage_id] = _time.time()
         stage_client = self.stage_clients[stage_id]
-        if stage_client.stage_type == "diffusion":
+        if self._is_request_output_stage(stage_client):
             params = req_state.sampling_params_list[stage_id]
-            await stage_client.add_request_async(request_id, request, params)
+            await self._submit_request_output_stage(stage_client, request_id, request, params)
         else:
             await stage_client.add_request_async(request)
 
@@ -1016,10 +1059,13 @@ class Orchestrator:
             next_client = self.stage_clients[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 
-            if next_client.stage_type == "diffusion":
-                source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [next_stage_id - 1])
-                kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
-                await next_client.add_request_async(
+            if self._is_request_output_stage(next_client):
+                kv_sender_info = None
+                if getattr(next_client, "stage_type", None) == "diffusion":
+                    source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [next_stage_id - 1])
+                    kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
+                await self._submit_request_output_stage(
+                    next_client,
                     request_id,
                     req_state.prompt,
                     params,

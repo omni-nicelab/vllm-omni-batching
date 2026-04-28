@@ -126,6 +126,7 @@ class StageType(str, Enum):
     # TODO(@lishunyang12): remove once all models migrate to StageExecutionType
     LLM = "llm"
     DIFFUSION = "diffusion"
+    SUBMODULE = "submodule"
 
 
 class StageExecutionType(str, Enum):

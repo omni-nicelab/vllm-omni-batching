@@ -117,6 +117,7 @@ class StageDiffusionClient:
         self.default_sampling_params = metadata.default_sampling_params
         self.custom_process_input_func = metadata.custom_process_input_func
         self.engine_input_source = metadata.engine_input_source
+        self.model_stage = metadata.model_stage
         self._proc = proc
         self._owns_process = proc is not None
 
@@ -135,6 +136,7 @@ class StageDiffusionClient:
         self._tasks: dict[str, asyncio.Task] = {}
         self._shutting_down = False
         self._engine_dead: bool = False
+        self.engine_outputs: Any = None
 
         # Background thread to detect silent process death (SIGKILL, segfault)
         # where the subprocess cannot send the ZMQ death sentinel.
@@ -282,6 +284,10 @@ class StageDiffusionClient:
     # ------------------------------------------------------------------
     # Public API (matches the interface the Orchestrator expects)
     # ------------------------------------------------------------------
+
+    def set_engine_outputs(self, engine_outputs: Any) -> None:
+        """Cache this stage's latest outputs for downstream input processors."""
+        self.engine_outputs = engine_outputs
 
     async def add_request_async(
         self,

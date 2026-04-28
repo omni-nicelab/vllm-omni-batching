@@ -74,6 +74,7 @@ from vllm_omni.engine.stage_init_utils import (
     finalize_initialized_stages,
     get_stage_connector_spec,
     initialize_diffusion_stage,
+    initialize_submodule_stage,
     inject_kv_stage_info,
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
@@ -696,7 +697,7 @@ class AsyncOmniEngine:
         async_chunk = self.async_chunk
         prompt_expand_func = None
         llm_stage_count = sum(
-            1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
+            1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") == "llm"
         )
 
         prepare_engine_environment()
@@ -756,9 +757,10 @@ class AsyncOmniEngine:
 
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
 
-                    if metadata.stage_type == "diffusion":
+                    if metadata.stage_type in ("diffusion", "submodule"):
                         is_remote_diffusion_stage = (
-                            self.single_stage_mode
+                            metadata.stage_type == "diffusion"
+                            and self.single_stage_mode
                             and self._single_stage_id_filter is not None
                             and configured_stage_id != self._single_stage_id_filter
                         )
@@ -775,16 +777,26 @@ class AsyncOmniEngine:
                             previous_visible_devices = os.environ.get(device_control_env)
                             try:
                                 setup_stage_devices(configured_stage_id, metadata.runtime_cfg)
-                                omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-                                if omni_conn_cfg:
-                                    inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                                inject_kv_stage_info(stage_cfg, configured_stage_id, self.stage_configs)
-                                if self.single_stage_mode:
+                                if metadata.stage_type == "diffusion":
+                                    omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+                                    if omni_conn_cfg:
+                                        inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                                    inject_kv_stage_info(stage_cfg, configured_stage_id, self.stage_configs)
+
+                                if self.single_stage_mode and metadata.stage_type == "diffusion":
                                     assert self._omni_master_server is not None
                                     stage_clients[stage_idx] = self._launch_diffusion_stage(
                                         stage_cfg,
                                         metadata,
                                         self._omni_master_server,
+                                    )
+                                elif metadata.stage_type == "submodule":
+                                    stage_clients[stage_idx] = initialize_submodule_stage(
+                                        configured_stage_id,
+                                        self.model,
+                                        stage_cfg,
+                                        metadata,
+                                        batch_size=self.diffusion_batch_size,
                                     )
                                 else:
                                     use_inline = True if self.num_stages == 1 else False
@@ -798,8 +810,9 @@ class AsyncOmniEngine:
                                         use_inline=use_inline,
                                     )
                                 logger.info(
-                                    "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
+                                    "[AsyncOmniEngine] Stage %s initialized (%s, batch_size=%d)",
                                     configured_stage_id,
+                                    metadata.stage_type,
                                     self.diffusion_batch_size,
                                 )
                             finally:
@@ -1033,7 +1046,7 @@ class AsyncOmniEngine:
 
         stage_type = self.stage_metadata[0].get("stage_type")
         _preprocess_ms = 0.0
-        if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
+        if stage_type not in ("diffusion", "submodule") and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
                 _inject_global_id(prompt, request_id)
