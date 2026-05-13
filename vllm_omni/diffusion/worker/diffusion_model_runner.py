@@ -426,11 +426,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     ) -> list[RunnerOutput]:
         runner_outputs: list[RunnerOutput] = []
         if noise_pred is None:
-            error = (
-                "stepwise denoise interrupted"
-                if pipeline_interrupted
-                else "stepwise denoise returned None"
-            )
+            error = "stepwise denoise interrupted" if pipeline_interrupted else "stepwise denoise returned None"
             for state in states:
                 runner_outputs.append(
                     self._build_stepwise_output(
@@ -523,7 +519,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 return BatchRunnerOutput.from_list(runner_output_list)
             except Exception:
                 if dit_cache_manager is not None:
-                    dit_cache_manager.deactivate(states)
+                    dit_cache_manager.deactivate()
                 for state in states:
                     self.state_cache.pop(state.req_id, None)
                     if dit_cache_manager is not None:
