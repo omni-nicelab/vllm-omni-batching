@@ -916,6 +916,10 @@ async def omni_init_app_state(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
+    # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
+    # real user request is fast instead of paying a 100s compilation tax.
+    await state.openai_serving_speech.warmup()
+
     state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
@@ -1602,7 +1606,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         request_id = f"img_gen-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
 
-        logger.info(f"Generating {request.n} image(s) {size_str}")
+        logger.debug(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
         result = await _generate_with_async_omni(
@@ -1622,7 +1626,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # Extract images from result
         images = _extract_images_from_result(result)
 
-        logger.info(f"Successfully generated {len(images)} image(s)")
+        logger.debug(f"Successfully generated {len(images)} image(s)")
 
         # Determine output format (default to png)
         output_format = _choose_output_format(request.output_format or "png", None)
@@ -1850,7 +1854,7 @@ async def edit_images(
         # 4. Generate images
         request_id = f"img_edit-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
-        logger.info(f"Generating {n} image(s) {size_str}")
+        logger.debug(f"Generating {n} image(s) {size_str}")
 
         if len(stage_configs) > 1:
             # Multi-stage pipeline (e.g. GLM-Image AR+Diffusion): route through
@@ -1928,7 +1932,7 @@ async def edit_images(
             )
             images = _extract_images_from_result(result)
 
-        logger.info(f"Successfully generated {len(images)} image(s)")
+        logger.debug(f"Successfully generated {len(images)} image(s)")
 
         # Encode images to base64
         image_data = [
