@@ -150,7 +150,6 @@ class StageDiffusionProc:
         request = OmniDiffusionRequest(
             prompts=[prompt],
             sampling_params=sampling_params,
-            request_ids=[request_id],
             request_id=request_id,
             kv_sender_info=kv_sender_info,
         )
@@ -180,7 +179,6 @@ class StageDiffusionProc:
         request = OmniDiffusionRequest(
             prompts=prompts,
             sampling_params=sampling_params,
-            request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
             request_id=request_id,
             kv_sender_info=kv_sender_info,
         )

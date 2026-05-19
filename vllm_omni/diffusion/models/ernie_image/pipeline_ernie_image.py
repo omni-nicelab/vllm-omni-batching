@@ -247,8 +247,7 @@ class ErnieImagePipeline(
 
     @staticmethod
     def _is_warmup_request(req: OmniDiffusionRequest) -> bool:
-        request_ids = getattr(req, "request_ids", None) or ()
-        return len(request_ids) == 1 and request_ids[0] == "dummy_req_id"
+        return getattr(req, "request_id", None) == "dummy_req_id"
 
     @staticmethod
     def _should_apply_pe(req: OmniDiffusionRequest) -> bool:

@@ -15,7 +15,32 @@ def _make_request() -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompts=[{"prompt": "a cup of coffee on a table"}],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        request_id="request-test",
     )
+
+
+def test_request_id_is_required():
+    with pytest.raises(TypeError, match="request_id"):
+        OmniDiffusionRequest(
+            prompts=[{"prompt": "a cup of coffee on a table"}],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+        )
+
+
+def test_request_ids_identity_list_is_removed():
+    req = _make_request()
+
+    assert req.request_id == "request-test"
+    assert not hasattr(req, "request_ids")
+
+
+def test_request_id_must_be_non_empty():
+    with pytest.raises(ValueError, match="request_id must be a non-empty string"):
+        OmniDiffusionRequest(
+            prompts=[{"prompt": "a cup of coffee on a table"}],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_id="",
+        )
 
 
 def test_tp_seed_same_across_ranks_and_varies_across_requests():

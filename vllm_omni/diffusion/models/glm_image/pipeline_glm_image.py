@@ -689,14 +689,13 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
 
         # NOTE: DiffusionEngine does an internal warmup "dummy run" during
-        # initialization. That request has no request_id and does not carry
+        # initialization. That request carries the fixed dummy request_id and does not carry
         # Stage-0 (AR) outputs via req.extra. For GLM-Image, we allow that
         # specific warmup request to proceed by synthesizing minimal prior
         # tokens, while still raising a clear error for real requests.
+        request_id = getattr(req, "request_id", None)
         is_dummy_warmup = (
-            not getattr(req, "request_id", None)
-            and prompt == "dummy run"
-            and (req.sampling_params.num_inference_steps == 1)
+            request_id == "dummy_req_id" and prompt == "dummy run" and (req.sampling_params.num_inference_steps == 1)
         )
 
         # Get pre-computed prompt embeddings if provided

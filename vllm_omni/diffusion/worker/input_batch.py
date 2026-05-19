@@ -82,7 +82,7 @@ def _select_states(
 
 
 def _prepare_req_ids(states: Sequence[DiffusionRequestState]) -> list[str]:
-    return [state.req_id for state in states]
+    return [state.request_id for state in states]
 
 
 def _prepare_prompt_field_on_state(
@@ -192,11 +192,13 @@ def _get_request_prompt_seq_lens(
         mask_attr=mask_attr,
     )
     if embeds is None:
-        raise ValueError(f"{embeds_attr} is not initialized on request {state.req_id}.")
+        raise ValueError(f"{embeds_attr} is not initialized on request {state.request_id}.")
 
     if mask is not None:
         if mask.shape[0] != embeds.shape[0]:
-            raise ValueError(f"{mask_attr} batch dimension does not match {embeds_attr} for request {state.req_id}.")
+            raise ValueError(
+                f"{mask_attr} batch dimension does not match {embeds_attr} for request {state.request_id}."
+            )
         return _get_seq_lens_from_mask(mask)
 
     seq_lens = getattr(state, seq_lens_attr)
@@ -220,7 +222,7 @@ def _prepare_request_prompt_field(
         mask_attr=mask_attr,
     )
     if embeds is None:
-        raise ValueError(f"{embeds_attr} is not initialized on request {state.req_id}.")
+        raise ValueError(f"{embeds_attr} is not initialized on request {state.request_id}.")
 
     actual_seq_lens = _get_request_prompt_seq_lens(
         state,
@@ -248,7 +250,7 @@ def _prepare_request_prompt_field(
     if current_seq_len > target_seq_len:
         if max_actual_seq_len > target_seq_len:
             raise ValueError(
-                f"{embeds_attr} for request {state.req_id} requires seq_len "
+                f"{embeds_attr} for request {state.request_id} requires seq_len "
                 f"{max_actual_seq_len}, got target {target_seq_len}."
             )
         return embeds[:, :target_seq_len], None if mask is None else mask[:, :target_seq_len]
@@ -349,7 +351,7 @@ def _require_state_latents(
 ) -> torch.Tensor:
     latents = state.latents
     if latents is None:
-        raise ValueError(f"Request {state.req_id} has no latents while preparing {for_field}.")
+        raise ValueError(f"Request {state.request_id} has no latents while preparing {for_field}.")
     return latents
 
 
