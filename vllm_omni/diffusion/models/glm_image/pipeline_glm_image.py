@@ -693,10 +693,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # Stage-0 (AR) outputs via req.extra. For GLM-Image, we allow that
         # specific warmup request to proceed by synthesizing minimal prior
         # tokens, while still raising a clear error for real requests.
-        request_id = getattr(req, "request_id", None)
-        is_dummy_warmup = (
-            request_id == "dummy_req_id" and prompt == "dummy run" and (req.sampling_params.num_inference_steps == 1)
-        )
+        is_dummy_warmup = req.is_dummy_run()
 
         # Get pre-computed prompt embeddings if provided
         if isinstance(first_prompt, str):

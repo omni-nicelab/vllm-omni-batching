@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
+DUMMY_DIFFUSION_REQUEST_ID = "dummy_req_id"
+
 
 @dataclass
 class OmniDiffusionRequest:
@@ -57,3 +59,10 @@ class OmniDiffusionRequest:
         # so downstream code always has a valid value.
         if self.sampling_params.guidance_scale_2 is None:
             self.sampling_params.guidance_scale_2 = self.sampling_params.guidance_scale
+
+    def is_dummy_run(self) -> bool:
+        return self.is_dummy_run_request_id(self.request_id)
+
+    @classmethod
+    def is_dummy_run_request_id(cls, request_id: str | None) -> bool:
+        return request_id == DUMMY_DIFFUSION_REQUEST_ID

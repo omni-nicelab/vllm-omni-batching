@@ -30,7 +30,7 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_post_process_func,
     get_diffusion_pre_process_func,
 )
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
@@ -693,7 +693,7 @@ class DiffusionEngine:
 
         req = OmniDiffusionRequest(
             prompts=[prompt],
-            request_id="dummy_req_id",
+            request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,

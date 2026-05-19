@@ -12,6 +12,8 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+
 from .factory import OmniConnectorFactory
 from .utils.config import TRANSFER_ENGINE_CONNECTOR_NAMES, ConnectorSpec
 from .utils.env import expand_env_int
@@ -1014,7 +1016,7 @@ class OmniKVTransferManager:
             return None, 0
 
         # Skip during warmup dummy run — no sender is available.
-        if request_id == "dummy_req_id":
+        if OmniDiffusionRequest.is_dummy_run_request_id(request_id):
             logger.info("Skip receiving KV cache for dummy warmup request")
             return None, 0
 
