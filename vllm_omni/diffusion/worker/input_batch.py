@@ -81,7 +81,7 @@ def _select_states(
     return selected_states, idx_mapping, idx_mapping.detach().cpu().numpy()
 
 
-def _prepare_req_ids(states: Sequence[DiffusionRequestState]) -> list[str]:
+def _prepare_request_ids(states: Sequence[DiffusionRequestState]) -> list[str]:
     return [state.request_id for state in states]
 
 
@@ -528,12 +528,12 @@ def _prepare_negative_prompt_embeds(
 
 def _same_composition(
     cached_batch: InputBatch | None,
-    req_ids: list[str],
+    request_ids: list[str],
     idx_mapping_np: np.ndarray,
 ) -> bool:
     if cached_batch is None:
         return False
-    if cached_batch.req_ids != req_ids:
+    if cached_batch.request_ids != request_ids:
         return False
     return np.array_equal(cached_batch.idx_mapping_np, idx_mapping_np)
 
@@ -583,7 +583,7 @@ class InputBatch:
     unchanged.
     """
 
-    req_ids: list[str]
+    request_ids: list[str]
     num_reqs: int
     num_reqs_after_padding: int
     idx_mapping: torch.Tensor
@@ -606,9 +606,9 @@ class InputBatch:
     negative_txt_seq_lens: list[int] | None = None
 
     def __post_init__(self) -> None:
-        if len(self.req_ids) != int(self.idx_mapping.numel()):
-            raise ValueError("`req_ids` and `idx_mapping` must have the same length.")
-        if self.num_reqs != len(self.req_ids):
+        if len(self.request_ids) != int(self.idx_mapping.numel()):
+            raise ValueError("`request_ids` and `idx_mapping` must have the same length.")
+        if self.num_reqs != len(self.request_ids):
             raise ValueError("`num_reqs` must match the number of request ids.")
         if self.num_reqs_after_padding < self.num_reqs:
             raise ValueError("`num_reqs_after_padding` must be >= `num_reqs`.")
@@ -655,11 +655,11 @@ class InputBatch:
         selected_states: Sequence[DiffusionRequestState],
         idx_mapping: torch.Tensor,
         idx_mapping_np: np.ndarray,
-        req_ids: list[str],
+        request_ids: list[str],
     ) -> InputBatch:
-        self.req_ids = req_ids
-        self.num_reqs = len(req_ids)
-        self.num_reqs_after_padding = len(req_ids)
+        self.request_ids = request_ids
+        self.num_reqs = len(request_ids)
+        self.num_reqs_after_padding = len(request_ids)
         self.idx_mapping = idx_mapping
         self.idx_mapping_np = idx_mapping_np
         self.latents = _prepare_latents(selected_states, out=self.latents)
@@ -677,9 +677,9 @@ class InputBatch:
     ) -> InputBatch:
         """Build a temporary step-local batch view from request states."""
         selected_states, idx_mapping, idx_mapping_np = _select_states(states, idx_mapping)
-        req_ids = _prepare_req_ids(selected_states)
+        request_ids = _prepare_request_ids(selected_states)
 
-        if _same_composition(cached_batch, req_ids, idx_mapping_np):
+        if _same_composition(cached_batch, request_ids, idx_mapping_np):
             assert cached_batch is not None
             cached_batch._repack_dynamic_fields(selected_states)
             return cached_batch
@@ -689,14 +689,14 @@ class InputBatch:
                 selected_states,
                 idx_mapping,
                 idx_mapping_np,
-                req_ids,
+                request_ids,
             )
 
         prompt_embeds, prompt_embeds_mask = _prepare_prompt_embeds(selected_states)
         negative_prompt_embeds, negative_prompt_embeds_mask = _prepare_negative_prompt_embeds(selected_states)
         do_true_cfg, true_cfg_scale, cfg_normalize = _prepare_cfg_scalars(selected_states)
         return cls(
-            req_ids=req_ids,
+            request_ids=request_ids,
             num_reqs=len(selected_states),
             num_reqs_after_padding=len(selected_states),
             idx_mapping=idx_mapping,
