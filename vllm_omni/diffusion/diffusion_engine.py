@@ -368,10 +368,9 @@ class DiffusionEngine:
             # Split images based on num_outputs_per_prompt for each request
             results = []
             output_idx = 0
+            request_id = request.request_id
 
             for i, prompt in enumerate(request.prompts):
-                request_id = request.request_id
-
                 # Get images for this request
                 num_outputs = request.sampling_params.num_outputs_per_prompt
                 start_idx = output_idx
