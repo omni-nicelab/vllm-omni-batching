@@ -1117,8 +1117,8 @@ class TestDeployConfigLoading:
         from vllm_omni.config.stage_config import DeployConfig, merge_pipeline_deploy
 
         pipeline = PipelineConfig(
-            model_type="qwen_image_3stage",
-            model_arch="QwenImagePipeline",
+            model_type="generic_diffusion_submodule",
+            model_arch="GenericDiffusionPipeline",
             stages=(
                 StagePipelineConfig(
                     stage_id=0,

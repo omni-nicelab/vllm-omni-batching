@@ -129,7 +129,7 @@ def test_submodule_model_stage_survives_config_filtering():
     assert not hasattr(cfg, "ignored_unknown_field")
 
 
-def test_qwen_image_diffusion_and_denoise_model_stages_are_distinct():
+def test_qwen_image_stage_components_are_model_specific():
     all_components = {"scheduler", "text_encoder", "tokenizer", "vae", "transformer"}
 
     assert QwenImagePipeline._STAGE_COMPONENTS["diffusion"] == all_components
@@ -137,7 +137,7 @@ def test_qwen_image_diffusion_and_denoise_model_stages_are_distinct():
     assert QwenImagePipeline._STAGE_COMPONENTS["denoise"] == {"scheduler", "transformer"}
 
 
-def test_qwen_image_denoise_dummy_run_request_uses_stage_payload():
+def test_qwen_image_denoise_dummy_run_request_uses_intermediate_payload():
     od_config = SimpleNamespace(
         model="/path/that/does/not/exist",
         model_stage="denoise",
@@ -270,6 +270,7 @@ def test_execute_model_uses_optimized_stage_model_hook(monkeypatch):
 
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     monkeypatch.setattr(model_runner_module, "cache_summary", lambda pipeline, details: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
 
     output = DiffusionModelRunner.execute_model(runner, req)
 
@@ -309,7 +310,7 @@ def test_execute_stepwise_uses_denoise_stage_intermediate_output(monkeypatch):
     assert runner.pipeline.post_decode_calls == 0
 
 
-def test_stage_submodule_proc_uses_submodule_worker(monkeypatch):
+def test_diffusion_submodule_proc_uses_submodule_worker(monkeypatch):
     calls: list[tuple[str, object]] = []
 
     class FakeSubModuleWorker:

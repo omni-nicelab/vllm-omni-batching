@@ -23,7 +23,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.worker.vae_model_runner import VAEModelRunner
+from vllm_omni.diffusion.worker.diffusion_submodule_runner import DiffusionSubmoduleRunner
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
@@ -44,10 +44,10 @@ class SubModuleWorker:
         self.od_config = od_config
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
-        self.model_runner: VAEModelRunner | None = None
+        self.model_runner: DiffusionSubmoduleRunner | None = None
 
         self.init_device()
-        self.model_runner = VAEModelRunner(
+        self.model_runner = DiffusionSubmoduleRunner(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
             device=self.device,
@@ -120,7 +120,7 @@ class SubModuleWorker:
             init_workspace_manager(self.device)
 
     def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None:
-        """Load the submodule pipeline through ``VAEModelRunner``."""
+        """Load the submodule pipeline through ``DiffusionSubmoduleRunner``."""
         assert self.model_runner is not None, "Model runner not initialized"
         with (
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),

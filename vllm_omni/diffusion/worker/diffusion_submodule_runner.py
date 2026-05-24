@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Lightweight runner for QwenImage VAE/text submodule stages."""
+"""Lightweight runner for diffusion submodule stages."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 logger = init_logger(__name__)
 
 
-class VAEModelRunner:
-    """Single-forward runner for QwenImage encode/decode submodule stages."""
+class DiffusionSubmoduleRunner:
+    """Single-forward runner for diffusion submodule stages."""
 
     def __init__(
         self,
@@ -67,7 +67,7 @@ class VAEModelRunner:
                 )
 
         logger.info(
-            "VAEModelRunner[stage=%s]: loaded in %.3fs, %.3f GiB GPU",
+            "DiffusionSubmoduleRunner[stage=%s]: loaded in %.3fs, %.3f GiB GPU",
             self.od_config.model_stage,
             time.perf_counter() - t0,
             mem.consumed_memory / GiB_bytes,
@@ -76,11 +76,11 @@ class VAEModelRunner:
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if not req.prompts:
-            raise ValueError("Cannot execute VAE runner on an empty request.")
+            raise ValueError("Cannot execute diffusion submodule runner on an empty request.")
 
         stage = getattr(self.od_config, "model_stage", None)
         if stage not in ("encode", "decode"):
-            raise ValueError(f"VAEModelRunner requires model_stage encode/decode, got {stage!r}.")
+            raise ValueError(f"DiffusionSubmoduleRunner requires model_stage encode/decode, got {stage!r}.")
 
         sampling = req.sampling_params
         if sampling.generator is None and sampling.seed is not None:
