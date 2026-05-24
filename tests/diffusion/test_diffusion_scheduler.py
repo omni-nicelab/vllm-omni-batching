@@ -166,7 +166,7 @@ class TestGetSamplingParamsKey:
         return OmniDiffusionRequest(
             prompts=["prompt"],
             sampling_params=sp,
-            request_ids=[f"req-{lora_int_id}-{lora_scale}"],
+            request_id=f"req-{lora_int_id}-{lora_scale}",
         )
 
     def test_distinguishes_lora_id(self) -> None:
