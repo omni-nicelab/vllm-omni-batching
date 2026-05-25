@@ -1023,6 +1023,11 @@ class AsyncOmniEngine:
                             inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
                         inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self.stage_configs)
                         if getattr(plan.stage_cfg, "worker_type", None) == "submodule":
+                            if self.single_stage_mode:
+                                raise NotImplementedError(
+                                    "Diffusion submodule stages do not support single_stage_mode yet. "
+                                    "Use normal multi-stage startup for worker_type='submodule'."
+                                )
                             client = initialize_diffusion_stage(
                                 plan.metadata.stage_id,
                                 self.model,

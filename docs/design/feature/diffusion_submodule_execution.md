@@ -132,6 +132,8 @@ denoise, and VAE decode inside the same diffusion stage.
 ## Limitations
 
 - Tensor transfer is still inline ZMQ/msgpack, not connector-backed D2D.
+- Submodule stages currently use the normal multi-stage startup path; the
+  distributed `single_stage_mode` startup path is not supported yet.
 - Submodule stages currently support stage-pool replicas, not intra-replica
   model parallelism.
 - The Qwen-Image reference topology is a fixed linear 1 encode : 1 denoise :

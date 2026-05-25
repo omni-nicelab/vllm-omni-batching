@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import torch
 from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
+from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
 from vllm.transformers_utils.config import get_config, get_hf_text_config
 from vllm.utils.mem_utils import GiB_bytes
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -25,6 +26,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.diffusion_submodule_runner import DiffusionSubmoduleRunner
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
@@ -45,6 +47,7 @@ class SubModuleWorker:
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
         self.model_runner: DiffusionSubmoduleRunner | None = None
+        self.profiler: WorkerProfiler | None = None
 
         self.init_device()
         self.model_runner = DiffusionSubmoduleRunner(
@@ -52,6 +55,7 @@ class SubModuleWorker:
             od_config=self.od_config,
             device=self.device,
         )
+        self.profiler = self._create_profiler()
         logger.info("SubModuleWorker %d initialized.", self.rank)
 
     def init_device(self) -> None:
@@ -79,7 +83,7 @@ class SubModuleWorker:
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
-        vllm_config.profiler_config = self.od_config.profiler_config
+        vllm_config.profiler_config = getattr(self.od_config, "profiler_config", None)
         try:
             hf_config = get_config(
                 self.od_config.model,
@@ -140,10 +144,44 @@ class SubModuleWorker:
                 process_memory / GiB_bytes,
             )
 
+    def _create_profiler(self) -> WorkerProfiler | None:
+        profiler_config = getattr(self.od_config, "profiler_config", None)
+        profiler_type = getattr(profiler_config, "profiler", None)
+        if profiler_type == "torch":
+            return create_omni_profiler(
+                profiler_config=profiler_config,
+                worker_name=f"diffusion_submodule_rank{self.rank}",
+                local_rank=self.local_rank,
+            )
+        if profiler_type == "cuda":
+            return CudaProfilerWrapper(profiler_config)
+        if profiler_type is not None:
+            logger.warning("Unknown profiler backend %r on submodule worker %s", profiler_type, self.rank)
+        return None
+
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        profiler = self.profiler
+        if profiler is None:
+            return
+
+        if is_start:
+            if isinstance(profiler, OmniTorchProfilerWrapper):
+                filename = profile_prefix or f"diffusion_submodule_rank{self.rank}"
+                profiler.set_trace_filename(filename)
+            profiler.start()
+        else:
+            profiler.stop()
+
     def execute_submodule(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """Execute one submodule request and return a submodule-shaped output."""
         assert self.model_runner is not None, "Model runner not initialized"
-        return self.model_runner.execute_model(req)
+        profiler = self.profiler
+        ctx = profiler.annotate_context_manager("diffusion_submodule_forward") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_model(req)
+        if profiler:
+            profiler.step()
+        return output
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         if self.od_config.enable_sleep_mode:
