@@ -3,6 +3,8 @@
 # Stage 0 encode  (GPU 0): tokenizer + text_encoder + latent/timestep prep.
 # Stage 1 denoise (GPU 1): transformer + scheduler step loop.
 # Stage 2 decode  (GPU 0): VAE decode + image postprocess.
+#
+# TODO: Migrate this legacy stage config to deploy config.
 
 stage_args:
   - stage_id: 0
@@ -14,7 +16,6 @@ stage_args:
     engine_args:
       model_class_name: QwenImagePipeline
       model_stage: encode
-      gpu_memory_utilization: 0.55
       enforce_eager: true
       trust_remote_code: true
       max_num_seqs: 1
@@ -35,7 +36,6 @@ stage_args:
     engine_args:
       model_class_name: QwenImagePipeline
       model_stage: denoise
-      gpu_memory_utilization: 0.85
       enforce_eager: false
       trust_remote_code: true
       distributed_executor_backend: "mp"
@@ -61,7 +61,6 @@ stage_args:
     engine_args:
       model_class_name: QwenImagePipeline
       model_stage: decode
-      gpu_memory_utilization: 0.40
       enforce_eager: true
       trust_remote_code: true
       max_num_seqs: 1

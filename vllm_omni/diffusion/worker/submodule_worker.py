@@ -93,6 +93,7 @@ class SubModuleWorker:
             hf_config = None
             logger.info("Skipping hf_config loading for diffusion model %r", self.od_config.model_class_name)
         hf_text_config = get_hf_text_config(hf_config) if hf_config is not None else None
+        # Minimal config for current submodules; refine if encoder/VAE stages need broader model_config support.
         vllm_config.model_config = SimpleNamespace(
             hf_config=hf_config,
             hf_text_config=hf_text_config,

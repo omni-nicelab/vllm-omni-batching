@@ -1294,6 +1294,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             sampling=copy.deepcopy(req.sampling_params),
             prompts=req.prompts,
         )
+        # Request-mode denoise runs one request at a time, so sharing the scheduler is safe here.
         self._prepare_denoise_stage_state(state, copy_scheduler=False)
 
         latents = self.diffuse(
