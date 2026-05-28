@@ -1289,9 +1289,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
         from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
-        request_ids = getattr(req, "request_ids", None) or [getattr(req, "request_id", None) or ""]
         state = DiffusionRequestState(
-            request_id=request_ids[0],
+            request_id=req.request_id,
             sampling=copy.deepcopy(req.sampling_params),
             prompts=req.prompts,
         )
