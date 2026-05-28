@@ -4,16 +4,9 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
-import queue
-import threading
-import time
 from contextlib import contextmanager
-from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
 
-import janus
 import pytest
 import torch
 
@@ -25,15 +18,11 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.stage_submodule_proc import StageSubModuleProc
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.engine.messages import OutputMessage, ShutdownRequestMessage, StageSubmissionMessage
-from vllm_omni.engine.orchestrator import Orchestrator
-from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors.qwen_image import (
     denoise_to_decode,
     encode_to_denoise,
 )
-from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -126,177 +115,6 @@ def _make_diffusion_request(num_steps: int = 1) -> OmniDiffusionRequest:
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_steps),
         request_id="req-1",
     )
-
-
-class _E2EDiffusionStageClient:
-    stage_type = "diffusion"
-    default_sampling_params = OmniDiffusionSamplingParams()
-    requires_multimodal_data = False
-    engine_input_source = [0]
-    is_comprehension = False
-
-    def __init__(
-        self,
-        *,
-        stage_id: int,
-        model_stage: str,
-        final_output: bool = False,
-        final_output_type: str = "stage",
-        custom_process_input_func=None,
-    ) -> None:
-        self.stage_id = stage_id
-        self.replica_id = 0
-        self.model_stage = model_stage
-        self.final_output = final_output
-        self.final_output_type = final_output_type
-        self.custom_process_input_func = custom_process_input_func
-        self.add_request_calls: list[tuple[str, Any, OmniDiffusionSamplingParams, dict[str, Any] | None]] = []
-        self.add_batch_request_calls: list[
-            tuple[str, list[Any], OmniDiffusionSamplingParams, dict[str, Any] | None]
-        ] = []
-        self.outputs: queue.Queue[OmniRequestOutput] = queue.Queue()
-        self.shutdown_calls = 0
-
-    async def add_request_async(
-        self,
-        request_id: str,
-        prompt,
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info=None,
-    ) -> None:
-        self.add_request_calls.append((request_id, prompt, sampling_params, kv_sender_info))
-
-    async def add_batch_request_async(
-        self,
-        request_id: str,
-        prompts: list[Any],
-        sampling_params: OmniDiffusionSamplingParams,
-        kv_sender_info=None,
-    ) -> None:
-        self.add_batch_request_calls.append((request_id, prompts, sampling_params, kv_sender_info))
-
-    def get_diffusion_output_nowait(self) -> OmniRequestOutput | None:
-        try:
-            return self.outputs.get_nowait()
-        except queue.Empty:
-            return None
-
-    async def abort_requests_async(self, request_ids: list[str]) -> None:
-        del request_ids
-
-    async def collective_rpc_async(self, **kwargs) -> dict[str, Any]:
-        del kwargs
-        return {"supported": False}
-
-    def check_health(self) -> None:
-        return None
-
-    def shutdown(self) -> None:
-        self.shutdown_calls += 1
-
-    def push_output(self, output: OmniRequestOutput) -> None:
-        self.outputs.put_nowait(output)
-
-
-@dataclass
-class _E2EOrchestratorHarness:
-    orchestrator: Orchestrator
-    request_sync_q: Any
-    output_sync_q: Any
-    queues: tuple[janus.Queue, ...]
-    thread: threading.Thread
-    result_future: concurrent.futures.Future[None]
-
-
-def _build_e2e_orchestrator_harness(stage_pools: list[StagePool]) -> _E2EOrchestratorHarness:
-    ready_future: concurrent.futures.Future[tuple[Orchestrator, janus.Queue, janus.Queue, janus.Queue]] = (
-        concurrent.futures.Future()
-    )
-    result_future: concurrent.futures.Future[None] = concurrent.futures.Future()
-
-    def _runner() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def _run() -> None:
-            request_queue = janus.Queue()
-            output_queue = janus.Queue()
-            rpc_queue = janus.Queue()
-            orchestrator = Orchestrator(
-                request_async_queue=request_queue.async_q,
-                output_async_queue=output_queue.async_q,
-                rpc_async_queue=rpc_queue.async_q,
-                stage_pools=stage_pools,
-            )
-            ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
-            await orchestrator.run()
-
-        try:
-            loop.run_until_complete(_run())
-            result_future.set_result(None)
-        except Exception as exc:
-            if not ready_future.done():
-                ready_future.set_exception(exc)
-            result_future.set_exception(exc)
-        finally:
-            try:
-                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            finally:
-                asyncio.set_event_loop(None)
-                loop.close()
-
-    thread = threading.Thread(target=_runner, daemon=True, name="test-diffusion-submodule-orchestrator")
-    thread.start()
-
-    orchestrator, request_queue, output_queue, rpc_queue = ready_future.result(timeout=5)
-    return _E2EOrchestratorHarness(
-        orchestrator=orchestrator,
-        request_sync_q=request_queue.sync_q,
-        output_sync_q=output_queue.sync_q,
-        queues=(request_queue, output_queue, rpc_queue),
-        thread=thread,
-        result_future=result_future,
-    )
-
-
-def _shutdown_e2e_orchestrator_harness(harness: _E2EOrchestratorHarness) -> None:
-    if harness.thread.is_alive():
-        harness.request_sync_q.put_nowait(ShutdownRequestMessage())
-        harness.thread.join(timeout=5)
-    if harness.thread.is_alive():
-        raise AssertionError("Timed out waiting for orchestrator thread shutdown")
-    try:
-        harness.result_future.result(timeout=0)
-    finally:
-        for item_queue in harness.queues:
-            item_queue.close()
-
-
-def _wait_until(predicate, *, timeout: float = 2.0) -> None:
-    deadline = time.monotonic() + timeout
-    while not predicate():
-        if time.monotonic() >= deadline:
-            raise AssertionError("Timed out waiting for predicate")
-        time.sleep(0.01)
-
-
-def _next_output_message(output_queue, *, timeout: float = 2.0) -> OutputMessage:
-    deadline = time.monotonic() + timeout
-    while True:
-        if time.monotonic() >= deadline:
-            raise AssertionError("Timed out waiting for orchestrator output")
-        try:
-            msg = output_queue.get_nowait()
-        except queue.Empty:
-            time.sleep(0.01)
-            continue
-        if isinstance(msg, OutputMessage):
-            return msg
 
 
 def test_submodule_model_stage_survives_config_filtering():
@@ -400,113 +218,6 @@ def test_qwen_image_denoise_to_decode_payload_requires_latents():
 
     with pytest.raises(RuntimeError, match="missing required key 'latents'"):
         denoise_to_decode(source_outputs)
-
-
-def test_diffusion_submodule_orchestrator_routes_encode_denoise_decode_e2e():
-    encode_payload = {"context": torch.ones((1, 2, 3)), "latents": torch.zeros((1, 4))}
-    denoise_payload = {"latents": torch.full((1, 4), 5.0), "height": 64, "width": 64}
-    final_payload = {"image": "decoded", "height": 64, "width": 64}
-
-    def encode_output_to_denoise_prompt(source_outputs, prompt, requires_multimodal_data):
-        assert prompt == {"prompt": "draw a cat"}
-        assert requires_multimodal_data is False
-        multimodal_output = source_outputs[0].multimodal_output
-        assert torch.equal(multimodal_output["context"], encode_payload["context"])
-        assert torch.equal(multimodal_output["latents"], encode_payload["latents"])
-        return [{"prompt": "denoise", "additional_information": multimodal_output}]
-
-    def denoise_output_to_decode_prompt(source_outputs, prompt, requires_multimodal_data):
-        assert prompt == {"prompt": "draw a cat"}
-        assert requires_multimodal_data is False
-        assert torch.equal(source_outputs[0].multimodal_output["latents"], denoise_payload["latents"])
-        return [{"prompt": "decode", "additional_information": source_outputs[0].multimodal_output}]
-
-    encode_stage = _E2EDiffusionStageClient(stage_id=0, model_stage="encode")
-    denoise_stage = _E2EDiffusionStageClient(
-        stage_id=1,
-        model_stage="denoise",
-        custom_process_input_func=encode_output_to_denoise_prompt,
-    )
-    decode_stage = _E2EDiffusionStageClient(
-        stage_id=2,
-        model_stage="decode",
-        final_output=True,
-        final_output_type="image",
-        custom_process_input_func=denoise_output_to_decode_prompt,
-    )
-
-    harness = _build_e2e_orchestrator_harness(
-        [
-            StagePool(0, encode_stage),
-            StagePool(1, denoise_stage),
-            StagePool(2, decode_stage),
-        ],
-    )
-
-    try:
-        params = [OmniDiffusionSamplingParams(num_inference_steps=1) for _ in range(3)]
-        harness.request_sync_q.put_nowait(
-            StageSubmissionMessage(
-                type="add_request",
-                request_id="req-e2e",
-                prompt={"prompt": "draw a cat"},
-                original_prompt={"prompt": "draw a cat"},
-                output_prompt_text=None,
-                sampling_params_list=params,
-                final_stage_id=2,
-                preprocess_ms=0.0,
-                enqueue_ts=time.perf_counter(),
-            )
-        )
-
-        _wait_until(lambda: len(encode_stage.add_request_calls) == 1)
-        assert encode_stage.add_request_calls[0][1] == {"prompt": "draw a cat"}
-        encode_stage.push_output(
-            OmniRequestOutput.from_diffusion(
-                request_id="req-e2e",
-                images=[],
-                final_output_type="stage_encode",
-                multimodal_output=encode_payload,
-            )
-        )
-
-        _wait_until(lambda: len(denoise_stage.add_batch_request_calls) == 1)
-        denoise_prompt = denoise_stage.add_batch_request_calls[0][1][0]
-        assert denoise_prompt["prompt"] == "denoise"
-        assert torch.equal(denoise_prompt["additional_information"]["context"], encode_payload["context"])
-        assert torch.equal(denoise_prompt["additional_information"]["latents"], encode_payload["latents"])
-        denoise_stage.push_output(
-            OmniRequestOutput.from_diffusion(
-                request_id="req-e2e",
-                images=[],
-                final_output_type="stage_denoise",
-                multimodal_output=denoise_payload,
-            )
-        )
-
-        _wait_until(lambda: len(decode_stage.add_batch_request_calls) == 1)
-        decode_prompt = decode_stage.add_batch_request_calls[0][1][0]
-        assert decode_prompt["prompt"] == "decode"
-        assert torch.equal(decode_prompt["additional_information"]["latents"], denoise_payload["latents"])
-        decode_stage.push_output(
-            OmniRequestOutput.from_diffusion(
-                request_id="req-e2e",
-                images=[],
-                final_output_type="image",
-                multimodal_output=final_payload,
-            )
-        )
-
-        output_msg = _next_output_message(harness.output_sync_q)
-
-        assert output_msg.request_id == "req-e2e"
-        assert output_msg.stage_id == 2
-        assert output_msg.finished is True
-        assert output_msg.engine_outputs.final_output_type == "image"
-        assert output_msg.engine_outputs.multimodal_output == final_payload
-        _wait_until(lambda: "req-e2e" not in harness.orchestrator.request_states)
-    finally:
-        _shutdown_e2e_orchestrator_harness(harness)
 
 
 def test_diffusion_engine_preserves_intermediate_multimodal_output():

@@ -1291,7 +1291,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
         request_ids = getattr(req, "request_ids", None) or [getattr(req, "request_id", None) or ""]
         state = DiffusionRequestState(
-            req_id=request_ids[0],
+            request_id=request_ids[0],
             sampling=copy.deepcopy(req.sampling_params),
             prompts=req.prompts,
         )
