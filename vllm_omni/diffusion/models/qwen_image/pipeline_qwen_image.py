@@ -35,7 +35,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
 )
@@ -396,7 +396,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         if stage == "diffusion":
             return OmniDiffusionRequest(
                 prompts=[{"prompt": "dummy run"}],
-                request_ids=["dummy_req_id"],
+                request_id=DUMMY_DIFFUSION_REQUEST_ID,
                 sampling_params=OmniDiffusionSamplingParams(
                     height=height,
                     width=width,
@@ -442,7 +442,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                     mm_processor_kwargs=None,
                 )
             ],
-            request_ids=["dummy_req_id"],
+            request_id=DUMMY_DIFFUSION_REQUEST_ID,
             sampling_params=OmniDiffusionSamplingParams(
                 height=height,
                 width=width,

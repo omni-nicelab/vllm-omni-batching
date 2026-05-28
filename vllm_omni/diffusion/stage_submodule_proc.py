@@ -78,7 +78,7 @@ class _SubModuleEngine:
         if output.error:
             raise RuntimeError(output.error)
 
-        request_id = request.request_ids[0] if request.request_ids else request.request_id or ""
+        request_id = request.request_id
         prompt = request.prompts[0] if request.prompts else None
         output_data = output.output
         images: list[Image.Image] = []

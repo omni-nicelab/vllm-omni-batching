@@ -124,7 +124,7 @@ def _make_diffusion_request(num_steps: int = 1) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(
         prompts=[{"prompt": "a prompt", "additional_information": {}}],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_steps),
-        request_ids=["req-1"],
+        request_id="req-1",
     )
 
 
@@ -335,7 +335,7 @@ def test_qwen_image_denoise_dummy_run_request_uses_intermediate_payload():
     )
 
     assert request is not None
-    assert request.request_ids == ["dummy_req_id"]
+    assert request.request_id == "dummy_req_id"
     info = request.prompts[0]["additional_information"]
     assert info["context"].shape == (1, 1, 3584)
     assert info["context_mask"].shape == (1, 1)
@@ -357,7 +357,7 @@ def test_qwen_image_diffusion_dummy_run_uses_safe_engine_prompt():
 
     assert request is not None
     assert request.prompts == [{"prompt": "dummy run"}]
-    assert request.request_ids == ["dummy_req_id"]
+    assert request.request_id == "dummy_req_id"
     assert request.sampling_params.num_inference_steps == 2
     assert request.sampling_params.true_cfg_scale == 1.0
 
@@ -522,7 +522,7 @@ def test_diffusion_engine_preserves_intermediate_multimodal_output():
     request = OmniDiffusionRequest(
         prompts=[{"prompt": "a cup of coffee"}],
         sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
-        request_ids=["req-1"],
+        request_id="req-1",
     )
     output = DiffusionOutput(
         output=None,
@@ -577,7 +577,7 @@ def test_execute_stepwise_uses_denoise_stage_intermediate_output(monkeypatch):
     req = _make_diffusion_request(num_steps=1)
     scheduler_output = DiffusionSchedulerOutput(
         step_id=0,
-        scheduled_new_reqs=[NewRequestData(sched_req_id="req-1", req=req)],
+        scheduled_new_reqs=[NewRequestData(request_id="req-1", req=req)],
         scheduled_cached_reqs=CachedRequestData.make_empty(),
         finished_req_ids=set(),
         num_running_reqs=1,
@@ -590,7 +590,7 @@ def test_execute_stepwise_uses_denoise_stage_intermediate_output(monkeypatch):
     output = batch_output["req-1"]
 
     assert output is not None
-    assert output.req_id == "req-1"
+    assert output.request_id == "req-1"
     assert output.finished is True
     assert output.result is not None
     assert output.result.output is None
