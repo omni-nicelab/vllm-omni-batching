@@ -327,7 +327,6 @@ class TestCFGParallelForwardPath:
         video_latents = torch.tensor([[[1.0, -2.0]]])
         audio_latents = torch.tensor([[[0.5, 3.0]]])
         req = OmniDiffusionRequest(
-            request_id="ltx23-cfg-forward",
             prompts=[{"prompt": "prompt", "negative_prompt": "negative"}],
             sampling_params=OmniDiffusionSamplingParams(
                 height=32,
@@ -340,6 +339,7 @@ class TestCFGParallelForwardPath:
                 audio_latents=audio_latents,
                 output_type="latent",
             ),
+            request_id="ltx23-cfg-forward",
         )
 
         output = pipe.forward(req)
