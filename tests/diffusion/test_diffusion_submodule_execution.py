@@ -98,6 +98,7 @@ def _make_runner() -> DiffusionModelRunner:
     runner.device = torch.device("cpu")
     runner.cache_backend = None
     runner.offload_backend = None
+    runner.prompt_embed_cache = None
     runner.od_config = SimpleNamespace(
         cache_backend="none",
         enable_cache_dit_summary=False,
