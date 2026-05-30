@@ -11,13 +11,16 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
+import vllm_omni.diffusion.worker.diffusion_submodule_runner as submodule_runner_module
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
+from vllm_omni.diffusion.stage_submodule_client import StageSubModuleClient
 from vllm_omni.diffusion.stage_submodule_proc import StageSubModuleProc
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.diffusion_submodule_runner import DiffusionSubmoduleRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors.qwen_image import (
     denoise_to_decode,
@@ -90,6 +93,23 @@ class _OptimizedStagePipeline(_StepContractPipeline):
                 "step_index": 7,
             },
         )
+
+
+class _SubmodulePipeline:
+    context = torch.ones((1, 2, 4))
+    image = object()
+
+    def __init__(self, empty: bool = False):
+        self.empty = empty
+        self.calls: list[tuple[str, list[OmniDiffusionRequest]]] = []
+
+    def execute_encode(self, requests: list[OmniDiffusionRequest]) -> list[dict]:
+        self.calls.append(("encode", requests))
+        return [] if self.empty else [{"req_id": "req-1", "context": self.context, "metadata": {}, "unused": None}]
+
+    def execute_decode(self, requests: list[OmniDiffusionRequest]) -> list[dict]:
+        self.calls.append(("decode", requests))
+        return [] if self.empty else [{"req_id": "req-1", "image": self.image, "output_type": "pil", "metadata": {}}]
 
 
 def _make_runner() -> DiffusionModelRunner:
@@ -183,16 +203,22 @@ def test_qwen_image_diffusion_dummy_run_uses_safe_engine_prompt():
 
 def test_qwen_image_encode_to_denoise_payload():
     latents = torch.zeros((1, 4096, 64), dtype=torch.bfloat16)
+    context_null = torch.zeros((1, 4, 8), dtype=torch.bfloat16)
+    image_latents = torch.ones((1, 4096, 64), dtype=torch.bfloat16)
     source_outputs = [
         SimpleNamespace(
             multimodal_output={
                 "context": torch.ones((1, 4, 8), dtype=torch.bfloat16),
                 "context_mask": torch.ones((1, 4), dtype=torch.long),
+                "context_null": context_null,
                 "latents": latents,
                 "timesteps": torch.arange(2),
                 "height": 1024,
                 "width": 1024,
                 "img_shapes": [[(1, 64, 64)]],
+                "true_cfg_scale": 4.0,
+                "do_true_cfg": True,
+                "image_latents": image_latents,
             }
         )
     ]
@@ -205,6 +231,22 @@ def test_qwen_image_encode_to_denoise_payload():
     assert info["latents"] is latents
     assert info["height"] == 1024
     assert info["width"] == 1024
+    assert info["context_null"] is context_null
+    assert info["image_latents"] is image_latents
+    assert info["true_cfg_scale"] == 4.0
+    assert info["do_true_cfg"] is True
+
+
+def test_qwen_image_denoise_to_decode_payload():
+    latents = torch.ones((1, 4, 8))
+    prompts = denoise_to_decode([SimpleNamespace(multimodal_output={"latents": latents, "height": 512, "width": 768})])
+
+    assert prompts[0]["additional_information"] == {
+        "latents": latents,
+        "height": 512,
+        "width": 768,
+        "output_type": "pil",
+    }
 
 
 def test_qwen_image_denoise_to_decode_payload_requires_latents():
@@ -219,6 +261,45 @@ def test_qwen_image_denoise_to_decode_payload_requires_latents():
 
     with pytest.raises(RuntimeError, match="missing required key 'latents'"):
         denoise_to_decode(source_outputs)
+
+
+def test_stage_submodule_client_batch_contract():
+    client = object.__new__(StageSubModuleClient)
+    sampling_params = OmniDiffusionSamplingParams(seed=123)
+    kv_sender_info = {1: {"addr": "stage-1"}}
+    calls = []
+
+    async def fake_add_request_async(request_id, prompt, sampling_params_arg, kv_sender_info=None):
+        calls.append((request_id, prompt, sampling_params_arg, kv_sender_info))
+
+    client.add_request_async = fake_add_request_async
+
+    asyncio.run(
+        StageSubModuleClient.add_batch_request_async(
+            client,
+            "req-1",
+            [{"prompt": "single"}],
+            sampling_params,
+            kv_sender_info=kv_sender_info,
+        )
+    )
+
+    assert calls == [("req-1", {"prompt": "single"}, sampling_params, kv_sender_info)]
+
+    client._output_queue = asyncio.Queue()
+    client.check_health = lambda: None
+    asyncio.run(
+        StageSubModuleClient.add_batch_request_async(
+            client,
+            "req-batch",
+            [{"prompt": "first"}, {"prompt": "second"}],
+            sampling_params,
+        )
+    )
+
+    output = client._output_queue.get_nowait()
+    assert output.request_id == "req-batch"
+    assert output.error == "StageSubModuleClient only supports single-prompt batches, got 2 prompts."
 
 
 def test_diffusion_engine_preserves_intermediate_multimodal_output():
@@ -280,6 +361,59 @@ def test_execute_model_uses_optimized_stage_model_hook(monkeypatch):
     assert torch.equal(output.multimodal_output["latents"], torch.full((1, 1), 7.0))
     assert runner.pipeline.execute_stage_model_calls == 1
     assert runner.pipeline.post_decode_calls == 0
+
+
+@pytest.mark.parametrize("model_stage", ["encode", "decode"])
+def test_diffusion_submodule_runner_dispatches_stage_and_shapes_output(monkeypatch, model_stage):
+    pipeline = _SubmodulePipeline()
+    runner = DiffusionSubmoduleRunner(
+        vllm_config=object(),
+        od_config=SimpleNamespace(model_stage=model_stage),
+        device=torch.device("cpu"),
+    )
+    runner.pipeline = pipeline
+    req = _make_diffusion_request(num_steps=1)
+    req.sampling_params.seed = 123
+
+    monkeypatch.setattr(submodule_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = runner.execute_model(req)
+
+    assert pipeline.calls == [(model_stage, [req])]
+    assert req.sampling_params.generator is not None
+    assert req.sampling_params.generator.initial_seed() == 123
+    assert output.output is (None if model_stage == "encode" else pipeline.image)
+    assert output.multimodal_output == (
+        {"context": pipeline.context} if model_stage == "encode" else {"image": pipeline.image, "output_type": "pil"}
+    )
+
+
+def test_diffusion_submodule_runner_returns_error_for_empty_stage_result(monkeypatch):
+    runner = DiffusionSubmoduleRunner(
+        vllm_config=object(),
+        od_config=SimpleNamespace(model_stage="encode"),
+        device=torch.device("cpu"),
+    )
+    runner.pipeline = _SubmodulePipeline(empty=True)
+
+    monkeypatch.setattr(submodule_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = runner.execute_model(_make_diffusion_request(num_steps=1))
+
+    assert output.error == "encode stage returned no outputs"
+
+
+@pytest.mark.parametrize("model_stage", [None, "denoise"])
+def test_diffusion_submodule_runner_rejects_non_encode_decode_stage(model_stage):
+    runner = DiffusionSubmoduleRunner(
+        vllm_config=object(),
+        od_config=SimpleNamespace(model_stage=model_stage),
+        device=torch.device("cpu"),
+    )
+    runner.pipeline = _SubmodulePipeline()
+
+    with pytest.raises(ValueError, match="requires model_stage encode/decode"):
+        runner.execute_model(_make_diffusion_request(num_steps=1))
 
 
 def test_execute_stepwise_uses_denoise_stage_intermediate_output(monkeypatch):
